@@ -24,6 +24,16 @@ pnpm install
 git config core.hooksPath   # should print .husky/_
 ```
 
+## Running unit tests
+
+Unit tests run on Node's built-in test runner (`node:test`, `node:assert`); no test dependency is installed:
+
+```sh
+pnpm test:unit
+```
+
+The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It currently contains only a deliberate placeholder suite that validates the harness itself: it asserts nothing about application code and provides no application coverage. Add real unit tests there as application code lands; they are picked up by the same command.
+
 ## Commit messages
 
 Commits must follow [Conventional Commits](https://www.conventionalcommits.org/). A `commit-msg` hook validates every commit message locally with commitlint using the standard Conventional Commits configuration.
