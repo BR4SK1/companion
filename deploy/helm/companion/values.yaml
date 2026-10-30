@@ -1,0 +1,59 @@
+# Default values for the companion application chart.
+#
+# Defaults are deliberately generic and publishable: registry paths, image
+# tags, ingress hostnames, middleware names, and model ids are
+# environment-specific configuration supplied through a per-environment values
+# file, which this repository keeps outside version control (see
+# ../environments/README.md). Secret values are never accepted here; the
+# worker reads them from an existing Kubernetes Secret referenced by name.
+
+web:
+  enabled: true
+  image:
+    # Registry path up to but excluding the tag, e.g. <registry-host>/<project>/web.
+    repository: ""
+    # Immutable candidate tag (for example the deployed commit's short SHA).
+    tag: ""
+  replicas: 1
+  containerPort: 3000
+  service:
+    port: 3000
+  ingress:
+    enabled: true
+    # Fully qualified hostname for this environment.
+    host: ""
+    # Optional Traefik middlewares, referenced the way the target cluster
+    # expects (for example "<name>@kubernetescrd").
+    middlewares: []
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+worker:
+  enabled: true
+  image:
+    repository: ""
+    tag: ""
+  replicas: 1
+  # Name of an existing Secret in the release namespace that must provide the
+  # keys WORKER_DATABASE_URL and OPENROUTER_API_KEY. The chart never creates
+  # or templates secrets.
+  existingSecret: ""
+  # Non-secret worker environment configuration (for example model ids).
+  # Empty values are skipped so a missing required variable fails in the
+  # worker's own startup validation with a named-variable error.
+  env: {}
+  # The worker finishes its in-flight turn (including publication) before
+  # exiting on SIGTERM; allow a full cycle with the default chat timeout.
+  terminationGracePeriodSeconds: 180
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi

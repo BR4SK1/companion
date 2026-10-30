@@ -15,10 +15,9 @@ What the preview includes:
 
 What the preview deliberately does **not** include:
 
-- No backend, BFF, API routes, database, queue, or live chat of any kind. Messages typed into the composer are appended to in-memory state for the current page load and are never sent or stored.
+- No backend, BFF, API routes, database, queue, or live chat of any kind. Messages typed into the composer are appended to in-memory state for the current page load and are never sent or stored. Containerization and Kubernetes packaging for the app live in [`../../deploy`](../../deploy/README.md); they add no backend behavior.
 - No authentication or authorization. Real owner-only authorization belongs to the future BFF edge (see [AGENTS.md](AGENTS.md)).
 - No uploads, voice, or image-generation integration. Fixture images are static assets served by the app itself.
-- No deployment, container, or Kubernetes configuration.
 
 The preview is clearly labeled in the UI (a persistent notice plus the page title) so the fixture thread cannot be mistaken for live chat.
 

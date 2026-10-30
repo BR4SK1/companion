@@ -1,11 +1,43 @@
-# Companion application chart (planned)
+# Companion application chart
 
-This directory reserves a future Helm chart boundary for the application deployables that run on K3s, initially the web/BFF and one worker. It must not include PostgreSQL or Keycloak: both are existing services outside K3s. External service credentials and endpoints must come from environment-specific secret/configuration channels, never public chart defaults.
+The `companion` chart describes the application deployables that run on K3s:
+the web client and the worker. It must not include PostgreSQL or Keycloak:
+both are existing services outside K3s. Their endpoints arrive through
+environment-specific configuration, and credentials are referenced from
+existing Kubernetes Secrets — never chart defaults, never committed values.
 
-## Planned responsibilities
+## What the chart contains
 
-A future chart may describe application workloads, service exposure, probes, resource settings, and references to externally managed dependencies. Keep deployment concerns separate from application/domain behavior. Environment documentation is under [`../environments`](../environments/README.md).
+- `templates/web.yaml` — web Deployment (HTTP readiness/liveness probes on
+  `/`) and ClusterIP Service.
+- `templates/ingress.yaml` — optional Traefik Ingress; hostname and
+  middlewares are per-environment values.
+- `templates/worker.yaml` — worker Deployment only (no Service, no HTTP
+  probes; the worker has no HTTP listener). Secrets come from an existing
+  Secret referenced by `worker.existingSecret`; see
+  [`examples/companion-secrets.example.yaml`](examples/companion-secrets.example.yaml)
+  for the expected keys (`WORKER_DATABASE_URL`, `OPENROUTER_API_KEY`). The
+  example must be copied to a local version-control-excluded location and
+  filled in before enabling the worker.
+- [`templates/README.md`](templates/README.md) — template boundary details.
 
-## Scope and open questions
+Default values are generic and publishable. Registry paths, image tags,
+ingress hostnames, middleware names, and model ids are environment-specific
+and supplied through a per-environment values file that this repository keeps
+outside version control (see [`../environments/README.md`](../environments/README.md)).
+Missing required values fail rendering instead of producing broken resources.
 
-This directory is README-only and is not a usable Helm chart: no chart metadata, values, YAML templates, resources, or deployment code are present. Decide chart ownership, workload settings, ingress/network boundaries, secret references, resource policies, and promotion mechanism before authoring manifests. Do not infer production access or provisioning authorization.
+## Scope and boundaries
+
+- One Helm release per environment, installed into that environment's own
+  namespace. The chart does not manage namespaces; the release namespace is
+  chosen at install time.
+- The worker uses a `Recreate` rollout strategy: conversation claims are
+  serialized by design, so at most one worker should run at a time.
+- No production values file exists in this repository. Production
+  configuration, approval binding, and promotion are still open (see
+  [`../environments/production/README.md`](../environments/production/README.md)).
+- The chart creates no deployment automation: there is no trigger or
+  controller, and installs are performed manually from the local-only
+  per-environment procedure.
+- Container image definitions live in [`../../docker/`](../../docker/).

@@ -1,0 +1,20 @@
+# Never enter the image build context: version-control metadata, local-only
+# planning and secret files, agent tooling, documentation, tests, deployment
+# configuration, and build caches. The images need only the package manifests
+# plus `apps/` and `libraries/`.
+.git
+.github
+.husky
+.opencode
+.private
+.secrets
+docs
+tests
+deploy
+node_modules
+**/node_modules
+.next
+**/.next
+*.tsbuildinfo
+**/*.tsbuildinfo
+*.log

@@ -1,0 +1,57 @@
+{{- if .Values.worker.enabled }}
+{{- $repository := required "worker.image.repository is required when worker is enabled" .Values.worker.image.repository -}}
+{{- $tag := required "worker.image.tag is required when worker is enabled" .Values.worker.image.tag -}}
+{{- $secret := required "worker.existingSecret is required when worker is enabled (must provide WORKER_DATABASE_URL and OPENROUTER_API_KEY keys)" .Values.worker.existingSecret -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "companion.workerName" . }}
+  labels:
+    {{- include "companion.labels" . | nindent 4 }}
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/component: worker
+spec:
+  {{- /* One worker at a time: claims are serialized by design. Recreate
+  avoids a window where a terminating and a starting worker run together. */}}
+  strategy:
+    type: Recreate
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: worker
+  template:
+    metadata:
+      labels:
+        {{- include "companion.labels" . | nindent 8 }}
+        app.kubernetes.io/name: worker
+        app.kubernetes.io/component: worker
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
+      containers:
+        - name: worker
+          image: "{{ $repository }}:{{ $tag }}"
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: WORKER_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: WORKER_DATABASE_URL
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: OPENROUTER_API_KEY
+            {{- range $key, $value := .Values.worker.env }}
+            {{- if $value }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
+          {{- /* No HTTP probes: the worker runs no HTTP listener. Liveness is
+          process supervision (restartPolicy: Always); a failed startup exits
+          with a named-variable configuration error. */}}
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+{{- end }}

@@ -1,0 +1,23 @@
+# Companion worker image. Built from the repository ROOT:
+#   docker build -f deploy/docker/Dockerfile.worker -t <registry>/companion/worker:<tag> .
+# Startup requires WORKER_DATABASE_URL, OPENROUTER_API_KEY, WORKER_CHAT_MODEL,
+# and WORKER_DECISION_MODEL from the runtime environment (see
+# apps/worker/src/config.ts). Credentials are never baked into the image.
+FROM node:22-alpine
+
+RUN corepack enable
+
+WORKDIR /app
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY libraries ./libraries
+COPY apps ./apps
+
+# pnpm v10 blocks dependency build scripts in non-interactive builds
+# (ERR_PNPM_IGNORED_BUILDS). The worker's dependency tree (pg, workspace
+# libraries) has no required postinstalls, so install with --ignore-scripts.
+RUN corepack pnpm install --frozen-lockfile --ignore-scripts
+
+# The worker runs its TypeScript entrypoint directly with Node's built-in
+# type stripping (node >= 22.12); there is no separate build step.
+CMD ["corepack", "pnpm", "--filter", "@companion/worker", "start"]
