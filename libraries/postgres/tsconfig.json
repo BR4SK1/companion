@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "noEmit": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2023",
+    "lib": ["es2023"],
+    "types": [],
+    // The pnpm virtual store hoists a second @types/node copy (from the web
+    // graph); skipLibCheck avoids duplicate-declaration noise inside .d.ts
+    // files while keeping full checking of project sources.
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -1,0 +1,22 @@
+{
+  "name": "@companion/worker",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "First worker slice: durable grouped conversation work on PostgreSQL, with OpenRouter response-pattern decisions preceding chat generation.",
+  "scripts": {
+    "start": "node --experimental-strip-types src/main.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@companion/openrouter": "workspace:*",
+    "@companion/postgres": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "pnpm@10.18.1"
+}

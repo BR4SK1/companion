@@ -1,0 +1,16 @@
+{
+  "name": "@companion/postgres",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared PostgreSQL integration boundary: connection lifecycle, transaction mechanics, and a minimal SQL migration runner. Domain schemas and queries stay with their owning domains.",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1"
+  }
+}

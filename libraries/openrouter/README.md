@@ -2,7 +2,21 @@
 
 ## Responsibilities
 
-This library area is the home for OpenRouter integration code. Shared provider transport — connection-level concerns such as request transport, common error translation, and provider configuration — is future work and stays separate from the typed capability adapters; shared transport does not collapse distinct capability contracts.
+This library area is the home for OpenRouter integration code. Shared provider transport — connection-level concerns such as request transport, common error translation, and provider configuration — is kept separate from the typed capability adapters; shared transport does not collapse distinct capability contracts.
+
+### Shared transport (`src/transport.ts`)
+
+`postJson` performs one JSON POST with optional bearer authentication and a timeout, and translates failures into typed `OpenRouterTransportError` errors (`network`, `timeout`, `http_status`, `invalid_json`). It knows nothing about capability contracts: payloads stay opaque, response validation belongs to the capability modules or the composing application. No retries, backoff, fallback routing, model/provider selection, or credential storage are included; the caller injects credentials and (for tests) the fetch implementation.
+
+### Chat contract (`src/chat.ts`)
+
+The typed Chat Completions contract (`POST /api/v1/chat/completions`, non-streaming, OpenAI-compatible) validates requests and responses without transport or policy:
+
+- Requests require `model` and at least one message with role `system`, `user`, or `assistant` and string content; multimodal content-part arrays are outside this contract's text-only scope and are rejected explicitly rather than silently dropped. Optional `temperature` (finite number) and `max_tokens` (integer ≥ 1) stay optional and are never invented or defaulted.
+- Responses require `model` and at least one choice whose message role is `assistant` with string content; `id`, `finish_reason`, and `usage` are optional and are read through presence checks, never fabricated. Unknown extra properties are accepted but not surfaced.
+- Tool calls, streaming deltas, logprobs, and image inputs are outside the approved contract scope and are rejected as invalid rather than approximated. No normalization is applied: content and counts are preserved as returned.
+
+### Decisions contract (`src/decisions.ts`)
 
 The Decisions contract is implemented in [`src/decisions.ts`](src/decisions.ts): the typed request and answer variants of OpenRouter's Decisions API (`POST /api/alpha/decisions`, same body as `/api/v1/systemone`), validated against the published schema without defaults or coercion.
 
@@ -19,13 +33,13 @@ The `box` primitive (image questions, Jev 1.14) is outside the approved contract
 
 ## Boundaries and dependencies
 
-Applications supply decision inputs and own application policy; this library defines transport and typed capability contracts only. No transport, credentials, client, endpoint configuration, model IDs, provider selection, capability probing, retries, or network calls are included. The contract tests are deterministic and run against inline fake payloads with no network.
+Applications supply decision inputs and own application policy; this library defines transport and typed capability contracts only. No credentials, client construction, endpoint defaults-as-policy, model IDs, provider selection, capability probing, retries, or fallback are included. The contract tests are deterministic and run against inline fake payloads with no network; transport tests inject `fetch` and make no network calls.
 
 ## Verification
 
-- `pnpm test:unit` runs the contract tests ([`tests/unit/openrouter-decisions.test.mjs`](../../tests/unit/openrouter-decisions.test.mjs)) on Node's built-in test runner; they import the TypeScript source directly through Node's built-in type stripping, so no build step is needed for tests.
-- `pnpm typecheck` type-checks the contract sources with `tsc` (`libraries/openrouter/tsconfig.json`, strict, `--noEmit`).
+- `pnpm test:unit` runs the contract tests ([`tests/unit/openrouter-decisions.test.mjs`](../../tests/unit/openrouter-decisions.test.mjs), [`tests/unit/openrouter-chat.test.mjs`](../../tests/unit/openrouter-chat.test.mjs)) and the transport tests ([`tests/unit/openrouter-transport.test.mjs`](../../tests/unit/openrouter-transport.test.mjs)) on Node's built-in test runner; they import the TypeScript source directly through Node's built-in type stripping, so no build step is needed for tests.
+- `pnpm typecheck` type-checks the contract and transport sources with `tsc` (`libraries/openrouter/tsconfig.json`, strict, `--noEmit`).
 
 ## Open questions
 
-Which provider/model combinations support the required typed decision flow remains unverified — live-provider capability checks are separate from this contract, and schema-constrained chat output is not automatically equivalent to native decision probabilities. Whether the `box` primitive or later schema additions should join the contract is open. Whether parsed values should retain unknown extra response fields (currently accepted but not surfaced) is open. Application policy for unusable answers, fallback and calibration, timeout/retry/partial-failure behavior, and diagnostic retention are also unresolved.
+Which provider/model combinations support the required typed decision flow remains unverified — live-provider capability checks are separate from these contracts, and schema-constrained chat output is not automatically equivalent to native decision probabilities. Whether the `box` primitive or later schema additions should join the contracts is open. Whether parsed values should retain unknown extra response fields (currently accepted but not surfaced) is open. Application policy for unusable answers, fallback and calibration, timeout/retry/partial-failure behavior, and diagnostic retention are also unresolved. Streaming and multimodal chat content remain outside the chat contract's scope; extending it is a separate decision.

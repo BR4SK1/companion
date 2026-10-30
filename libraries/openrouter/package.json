@@ -3,8 +3,13 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "OpenRouter integration boundary: typed capability contracts without transport.",
+  "description": "OpenRouter integration boundary: shared transport plus typed capability contracts (Decisions, Chat Completions) without application policy.",
   "exports": {
-    ".": "./src/decisions.ts"
+    ".": "./src/decisions.ts",
+    "./chat": "./src/chat.ts",
+    "./transport": "./src/transport.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22"
   }
 }

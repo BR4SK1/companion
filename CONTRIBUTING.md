@@ -4,7 +4,7 @@ This repository is a single-user, self-hosted project maintained by its owner. T
 
 ## Repository state
 
-The repository is an architecture scaffold with early implementation: architecture documentation, the OpenRouter shared-library contract code (`libraries/openrouter`), and a first web-client slice in `apps/web` — a local-only, fixture-backed messenger preview (Next.js, React, MUI) with no backend, authentication, or live chat. Nothing is deployed. Contribution tooling (package manager, commit hooks) is installed at the repository root and applies to documentation and code alike.
+The repository has early implementation beyond the scaffold: architecture documentation; shared-library code (`libraries/openrouter` — transport plus typed Decisions and Chat contracts; `libraries/postgres` — connection lifecycle, transactions, migration runner over `pg`); a first worker slice in `apps/worker` — durable grouped conversation work on PostgreSQL with OpenRouter response-pattern decisions preceding chat generation (no web/BFF connection, no deployment); and a first web-client slice in `apps/web` — a local-only, fixture-backed messenger preview with no backend, authentication, or live chat. Nothing is deployed. Contribution tooling (package manager, commit hooks) is installed at the repository root and applies to documentation and code alike.
 
 ## Tooling setup
 
@@ -34,17 +34,17 @@ Unit tests run on Node's built-in test runner (`node:test`, `node:assert`); no t
 pnpm test:unit
 ```
 
-The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It contains the deliberate placeholder harness suite, the OpenRouter Decisions contract tests, and the web preview's pure-logic tests (thread grouping, scroll anchoring, time labels, fixture sanity); the contract and preview tests make no network calls. Add real unit tests there as more application code lands; they are picked up by the same command.
+The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It contains the deliberate placeholder harness suite, the OpenRouter Decisions and Chat contract tests, the transport tests, the worker's pure turn-logic tests, and the web preview's pure-logic tests (thread grouping, scroll anchoring, time labels, fixture sanity); they make no network calls and need no database. Database-backed worker coverage lives in [`tests/integration`](tests/integration/README.md), which is skipped unless an isolated non-production database is explicitly provided via `WORKER_TEST_DATABASE_URL`.
 
 ## Type checking
 
-Shared-library sources are TypeScript. Type-check the OpenRouter contract with:
+Shared-library sources are TypeScript. Type-check the OpenRouter library, the PostgreSQL library, and the worker with:
 
 ```sh
 pnpm typecheck
 ```
 
-This runs `tsc` (`--noEmit`, strict) over `libraries/openrouter` via its `tsconfig.json`. It is a separate command, not part of `pnpm test:unit`; the unit tests run the TypeScript source directly through Node's type stripping (the command passes `--experimental-strip-types` explicitly, which is required on Node 22.12–22.17 and still accepted where stripping is on by default), so no build step is required.
+This runs `tsc` (`--noEmit`, strict) over `libraries/openrouter`, `libraries/postgres`, and `apps/worker`. It is a separate command, not part of `pnpm test:unit`; the unit tests run the TypeScript source directly through Node's type stripping (the command passes `--experimental-strip-types` explicitly, which is required on Node 22.12–22.17 and still accepted where stripping is on by default), so no build step is required.
 
 ## Commit messages
 
