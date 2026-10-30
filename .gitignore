@@ -1,0 +1,24 @@
+# Local-only planning notes and credentials
+/.private/
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+.secrets/
+**/.secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local caches, test output, and generated build artifacts
+node_modules/
+.next/
+dist/
+coverage/
+playwright-report/
+test-results/
+*.log
+.DS_Store
