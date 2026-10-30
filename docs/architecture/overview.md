@@ -19,7 +19,7 @@ These are documentation boundaries, not implemented services. pnpm and Drizzle w
 
 PostgreSQL is the relational system of record and is external to K3s. Do not add document compatibility. Durable grouped messaging is required: work survives browser disconnects and process restarts, and consecutive user messages from the same sender are grouped rather than processing a stale backlog one message at a time.
 
-OpenRouter shared transport must remain separate from typed chat and decision adapters. Decision results are relative probabilities over offered alternatives, not independent scores. Shared libraries define capability contracts and transport; application-owned choices and deployment-configured policy are outside this public infrastructure description. Provider/model support, fallback behavior, error handling, and diagnostics remain to be settled.
+OpenRouter shared transport must remain separate from typed chat and decision adapters. The decision contract is defined and implemented in [`libraries/openrouter`](../../libraries/openrouter/README.md): it uses OpenRouter's native typed question and answer variants — `choice`, `noul`, and `score` — and preserves them as returned. Choice answers carry the selected option with optional per-option probabilities; score answers carry the probability-weighted position on an ordered scale with the optional level legend and distribution; a noul probability stays a number and is never coerced to a Boolean. Optional fields stay optional and validation adds no defaults, normalization, thresholds, or fallback. Shared libraries define capability contracts and transport; application-owned choices and deployment-configured policy are outside this public infrastructure description. Provider/model support, fallback behavior, error handling, and diagnostics remain to be settled.
 
 Image generation is an independent asynchronous capability and must not block ordinary chat. The existing shared ComfyUI rendering backend is external to this application; no integration is implemented here. Design durable request/result states, restart reconciliation, context association, and late-result presentation before implementation. Voice and uploads are out of scope.
 
@@ -48,7 +48,7 @@ The runner-free trigger/controller for this flow is unresolved and is not runnin
 
 - Queue technology and turn behavior during in-flight responses: cancellation, retries, ordering, idempotency, and restart recovery.
 - Image-generation request/result lifecycle, context snapshot, reconciliation, and late-result UI behavior.
-- Provider/model support and contracts for typed decisions; fallback and calibration for failures or unusable distributions.
+- Provider/model support for typed decisions; fallback and calibration for failures or unusable answers.
 - Whether to retain decision diagnostics, and what/for how long.
 - Database access/migration approach and recovery strategy.
 - How shared infrastructure libraries map to deployment ownership.

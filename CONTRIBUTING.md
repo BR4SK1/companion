@@ -4,7 +4,7 @@ This repository is a single-user, self-hosted project maintained by its owner. T
 
 ## Repository state
 
-The repository is a documentation-only architecture scaffold. There is no application code and nothing is deployed. Contribution tooling (package manager, commit hooks) is installed at the repository root and applies to documentation and future code alike.
+The repository is an architecture scaffold: architecture documentation plus early shared-library contract code (`libraries/openrouter`). Nothing is deployed. Contribution tooling (package manager, commit hooks) is installed at the repository root and applies to documentation and code alike.
 
 ## Tooling setup
 
@@ -32,7 +32,17 @@ Unit tests run on Node's built-in test runner (`node:test`, `node:assert`); no t
 pnpm test:unit
 ```
 
-The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It currently contains only a deliberate placeholder suite that validates the harness itself: it asserts nothing about application code and provides no application coverage. Add real unit tests there as application code lands; they are picked up by the same command.
+The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It contains the deliberate placeholder harness suite plus the OpenRouter Decisions contract tests; the contract tests exercise `libraries/openrouter` source and make no network calls. Add real unit tests there as more application code lands; they are picked up by the same command.
+
+## Type checking
+
+Shared-library sources are TypeScript. Type-check the OpenRouter contract with:
+
+```sh
+pnpm typecheck
+```
+
+This runs `tsc` (`--noEmit`, strict) over `libraries/openrouter` via its `tsconfig.json`. It is a separate command, not part of `pnpm test:unit`; the unit tests run the TypeScript source directly through Node's type stripping (the command passes `--experimental-strip-types` explicitly, which is required on Node 22.12–22.17 and still accepted where stripping is on by default), so no build step is required.
 
 ## Commit messages
 
