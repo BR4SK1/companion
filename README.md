@@ -7,7 +7,7 @@ A single-user, self-hosted conversational companion project. This repository beg
 - [`apps/web`](apps/web/README.md) — planned Next.js, React, and MUI web client with a backend-for-frontend (BFF).
 - [`apps/worker`](apps/worker/README.md) — planned single deployable for durable background work.
 - [`libraries`](libraries/README.md) — shared infrastructure libraries for OpenRouter and PostgreSQL.
-- [`tests`](tests/README.md) — planned Vitest integration and Playwright end-to-end coverage.
+- [`tests`](tests/README.md) — a Node built-in unit-test harness (`tests/unit`, currently a placeholder only) plus planned Vitest integration and Playwright end-to-end coverage.
 - [`docs/architecture`](docs/architecture/README.md) — system boundaries, data and work-flow direction, and open decisions.
 - [`deploy/helm`](deploy/helm/README.md) — documentation for a future application Helm chart and environment configuration.
 - [`.opencode`](.opencode/README.md) — project-local reusable review skills.
