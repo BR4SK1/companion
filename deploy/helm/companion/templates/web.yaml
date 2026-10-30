@@ -1,0 +1,65 @@
+{{- if .Values.web.enabled }}
+{{- $repository := required "web.image.repository is required when web is enabled" .Values.web.image.repository -}}
+{{- $tag := required "web.image.tag is required when web is enabled" .Values.web.image.tag -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "companion.webName" . }}
+  labels:
+    {{- include "companion.labels" . | nindent 4 }}
+    app.kubernetes.io/name: web
+    app.kubernetes.io/component: web
+spec:
+  replicas: {{ .Values.web.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/name: web
+  template:
+    metadata:
+      labels:
+        {{- include "companion.labels" . | nindent 8 }}
+        app.kubernetes.io/name: web
+        app.kubernetes.io/component: web
+    spec:
+      containers:
+        - name: web
+          image: "{{ $repository }}:{{ $tag }}"
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ .Values.web.containerPort }}
+          env:
+            - name: PORT
+              value: {{ .Values.web.containerPort | quote }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "companion.webName" . }}
+  labels:
+    {{- include "companion.labels" . | nindent 4 }}
+    app.kubernetes.io/name: web
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: web
+  ports:
+    - name: http
+      port: {{ .Values.web.service.port }}
+      targetPort: http
+{{- end }}

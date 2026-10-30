@@ -1,0 +1,6 @@
+apiVersion: v2
+name: companion
+description: Companion application workloads (web preview and worker) for K3s. PostgreSQL and Keycloak are existing external services and are never chart dependencies; their endpoints and credentials arrive through environment-specific values and existing Secrets.
+type: application
+version: 0.1.0
+appVersion: "0.0.0"

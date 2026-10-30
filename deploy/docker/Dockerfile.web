@@ -1,0 +1,31 @@
+# Companion web client image (Next.js). Built from the repository ROOT:
+#   docker build -f deploy/docker/Dockerfile.web -t <registry>/companion/web:<tag> .
+# The preview is a static client surface with no backend and no environment
+# secrets; nothing is baked in beyond the build itself.
+FROM node:22-alpine
+
+RUN corepack enable
+
+WORKDIR /app
+
+COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
+COPY libraries ./libraries
+COPY apps ./apps
+
+# pnpm v10 blocks dependency build scripts in non-interactive builds
+# (ERR_PNPM_IGNORED_BUILDS). All native binaries this workspace needs ship as
+# platform optional-deps, so install with --ignore-scripts; none of the build
+# paths run postinstalls.
+RUN corepack pnpm install --frozen-lockfile --ignore-scripts
+RUN corepack pnpm --filter @companion/web build
+
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3000
+ENV HOSTNAME=0.0.0.0
+
+EXPOSE 3000
+
+# Run through pnpm: pnpm does not hoist workspace-package bins to the root
+# node_modules/.bin, so the --filter form resolves `next` from
+# apps/web/node_modules/.bin and runs with cwd=apps/web next to the .next build.
+CMD ["corepack", "pnpm", "--filter", "@companion/web", "start"]
