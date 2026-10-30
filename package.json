@@ -2,7 +2,7 @@
   "name": "companion",
   "version": "0.0.0",
   "private": true,
-  "description": "Repository tooling for the Companion project. The repository contains architecture documentation, early shared-library contract code, and a local-only web-client preview; this root package exists for contribution tooling.",
+  "description": "Repository tooling for the Companion project. The repository contains architecture documentation, shared-library code (OpenRouter transport and typed contracts; PostgreSQL connection and migration infrastructure), a first worker slice for durable conversation work, and a local-only web-client preview; this root package exists for contribution tooling.",
   "packageManager": "pnpm@10.18.1",
   "engines": {
     "node": ">=22.12.0"
@@ -10,7 +10,7 @@
   "scripts": {
     "prepare": "husky",
     "test:unit": "node --experimental-strip-types --test \"tests/unit/**/*.test.mjs\"",
-    "typecheck": "tsc -p libraries/openrouter"
+    "typecheck": "tsc -p libraries/openrouter && tsc -p libraries/postgres && tsc -p apps/worker"
   },
   "devDependencies": {
     "@commitlint/cli": "21.2.4",
