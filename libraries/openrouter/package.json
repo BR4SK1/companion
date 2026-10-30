@@ -1,0 +1,10 @@
+{
+  "name": "@companion/openrouter",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "OpenRouter integration boundary: typed capability contracts without transport.",
+  "exports": {
+    ".": "./src/decisions.ts"
+  }
+}

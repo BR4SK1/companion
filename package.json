@@ -2,18 +2,20 @@
   "name": "companion",
   "version": "0.0.0",
   "private": true,
-  "description": "Repository tooling for the Companion project. The repository remains a documentation-only architecture scaffold; this package exists only for contribution tooling.",
+  "description": "Repository tooling for the Companion project. The repository is an architecture scaffold with early shared-library contract code; this root package exists for contribution tooling.",
   "packageManager": "pnpm@10.18.1",
   "engines": {
     "node": ">=22.12.0"
   },
   "scripts": {
     "prepare": "husky",
-    "test:unit": "node --test \"tests/unit/**/*.test.mjs\""
+    "test:unit": "node --experimental-strip-types --test \"tests/unit/**/*.test.mjs\"",
+    "typecheck": "tsc -p libraries/openrouter"
   },
   "devDependencies": {
     "@commitlint/cli": "21.2.4",
     "@commitlint/config-conventional": "21.2.4",
-    "husky": "9.1.7"
+    "husky": "9.1.7",
+    "typescript": "^7.0.2"
   }
 }
