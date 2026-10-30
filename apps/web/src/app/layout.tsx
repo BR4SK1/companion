@@ -13,10 +13,10 @@ import {
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Companion — local preview",
+  title: "Companion",
   description:
-    "Local-only fixture-backed preview of the Companion messenger client. No backend, no authentication, nothing is sent or saved.",
-  // A local preview is not meant to be indexed or shared as a page.
+    "Private companion conversation. Owner sign-in required; the thread is served only to the authenticated owner.",
+  // A private single-owner app is not meant to be indexed or shared as a page.
   robots: { index: false, follow: false },
 };
 

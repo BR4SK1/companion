@@ -26,6 +26,19 @@ export interface WorkerConfig {
   readonly leaseSeconds: number;
   readonly pollSeconds: number;
   readonly contextMessageLimit: number;
+  /**
+   * Private service-to-service API bearer token. Required, never optional:
+   * the HTTP API fails closed rather than serving unauthenticated traffic.
+   * The web BFF holds the same value (`WEB_WORKER_TOKEN`).
+   */
+  readonly apiToken: string;
+  /** Private HTTP API listener (cluster-internal only; no public ingress). */
+  readonly http: WorkerHttpConfig;
+}
+
+export interface WorkerHttpConfig {
+  readonly host: string;
+  readonly port: number;
 }
 
 export class WorkerConfigError extends Error {
@@ -42,6 +55,8 @@ const DEFAULT_POLL_SECONDS = 1;
 const DEFAULT_CONTEXT_MESSAGE_LIMIT = 50;
 const DEFAULT_CHAT_TIMEOUT_MS = 120_000;
 const DEFAULT_DECISION_TIMEOUT_MS = 30_000;
+const DEFAULT_HTTP_HOST = "0.0.0.0";
+const DEFAULT_HTTP_PORT = 8080;
 
 function requireString(
   env: Record<string, string | undefined>,
@@ -112,6 +127,30 @@ function optionalNumber(
   return value;
 }
 
+function optionalHttpHost(
+  env: Record<string, string | undefined>,
+  name: string,
+  fallback: string,
+): string {
+  const value = env[name];
+  if (value === undefined || value.length === 0) {
+    return fallback;
+  }
+  return value;
+}
+
+function optionalPort(
+  env: Record<string, string | undefined>,
+  name: string,
+  fallback: number,
+): number {
+  const value = optionalNumber(env, name, fallback, { integer: true, positive: true });
+  if (value > 65_535) {
+    throw new WorkerConfigError(`${name} must be at most 65535: ${String(value)}`);
+  }
+  return value;
+}
+
 /**
  * Build the worker configuration from an environment-like record. Throws
  * `WorkerConfigError` with the offending variable name on any violation.
@@ -123,6 +162,9 @@ export function loadWorkerConfig(
   const apiKey = requireString(env, "OPENROUTER_API_KEY");
   const chatModel = requireString(env, "WORKER_CHAT_MODEL");
   const decisionModel = requireString(env, "WORKER_DECISION_MODEL");
+  // The private HTTP API has no unauthenticated mode: without a configured
+  // service credential the worker must fail at startup, not serve openly.
+  const apiToken = requireString(env, "WORKER_API_TOKEN");
 
   return {
     databaseUrl,
@@ -165,5 +207,10 @@ export function loadWorkerConfig(
       DEFAULT_CONTEXT_MESSAGE_LIMIT,
       { integer: true, positive: true },
     ),
+    apiToken,
+    http: {
+      host: optionalHttpHost(env, "WORKER_HTTP_HOST", DEFAULT_HTTP_HOST),
+      port: optionalPort(env, "WORKER_HTTP_PORT", DEFAULT_HTTP_PORT),
+    },
   };
 }

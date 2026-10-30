@@ -11,12 +11,15 @@ tests cannot silently switch versions.
 The non-production configuration is applied with the `companion` chart into a
 dedicated non-production namespace. It uses a database, credentials, storage,
 and external side-effect boundaries separate from production. External
-PostgreSQL and Keycloak are not provisioned by this project; the worker
-requires a dedicated non-production database to be provided before it can
-run, and its credentials arrive through a Kubernetes Secret applied locally
-(see [`../../companion/examples/companion-secrets.example.yaml`](../../companion/examples/companion-secrets.example.yaml)).
-Keep model/resource use and costs bounded and coordinated with shared
-capacity.
+PostgreSQL and Keycloak are not provisioned by this project: the deployables
+require a dedicated non-production database and an OIDC confidential client
+(redirect URI `${WEB_PUBLIC_URL}/api/auth/callback`) to be provided before
+they can run, and credentials arrive through Kubernetes Secrets applied
+locally (see
+[`../../companion/examples/companion-secrets.example.yaml`](../../companion/examples/companion-secrets.example.yaml)
+for the expected keys, including the worker/web shared service token and the
+owner subject allowlist). Keep model/resource use and costs bounded and
+coordinated with shared capacity.
 
 ## Current state
 

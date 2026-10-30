@@ -1,6 +1,20 @@
 {{- if .Values.web.enabled }}
 {{- $repository := required "web.image.repository is required when web is enabled" .Values.web.image.repository -}}
 {{- $tag := required "web.image.tag is required when web is enabled" .Values.web.image.tag -}}
+{{- $secret := required "web.existingSecret is required when web is enabled (must provide WEB_OIDC_CLIENT_SECRET, WEB_SESSION_SECRET, and WEB_WORKER_TOKEN keys)" .Values.web.existingSecret -}}
+{{- $workerUrl := "" -}}
+{{- if .Values.worker.enabled -}}
+{{- $workerUrl = printf "http://%s:%v" (include "companion.workerName" .) .Values.worker.service.port -}}
+{{- else -}}
+{{- $workerUrl = required "web.env.WEB_WORKER_URL is required when web is enabled without the worker" (index .Values.web.env "WEB_WORKER_URL" | default "") -}}
+{{- end -}}
+{{- /* The BFF fails closed when its configuration is incomplete, so a
+missing non-secret value would deploy an app that only ever reports
+"unavailable"; require the values at render time instead. */}}
+{{- $requirePublicUrl := required "web.env.WEB_PUBLIC_URL is required when web is enabled" (index .Values.web.env "WEB_PUBLIC_URL" | default "") -}}
+{{- $requireIssuerUrl := required "web.env.WEB_OIDC_ISSUER_URL is required when web is enabled" (index .Values.web.env "WEB_OIDC_ISSUER_URL" | default "") -}}
+{{- $requireClientId := required "web.env.WEB_OIDC_CLIENT_ID is required when web is enabled" (index .Values.web.env "WEB_OIDC_CLIENT_ID" | default "") -}}
+{{- $requireOwnerSubjects := required "web.env.WEB_OWNER_SUBJECTS is required when web is enabled" (index .Values.web.env "WEB_OWNER_SUBJECTS" | default "") -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,6 +46,37 @@ spec:
           env:
             - name: PORT
               value: {{ .Values.web.containerPort | quote }}
+            - name: WEB_PUBLIC_URL
+              value: {{ index .Values.web.env "WEB_PUBLIC_URL" | quote }}
+            - name: WEB_OIDC_ISSUER_URL
+              value: {{ index .Values.web.env "WEB_OIDC_ISSUER_URL" | quote }}
+            - name: WEB_OIDC_CLIENT_ID
+              value: {{ index .Values.web.env "WEB_OIDC_CLIENT_ID" | quote }}
+            - name: WEB_OWNER_SUBJECTS
+              value: {{ index .Values.web.env "WEB_OWNER_SUBJECTS" | quote }}
+            - name: WEB_WORKER_URL
+              value: {{ $workerUrl | quote }}
+            - name: WEB_OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: WEB_OIDC_CLIENT_SECRET
+            - name: WEB_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: WEB_SESSION_SECRET
+            - name: WEB_WORKER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: WEB_WORKER_TOKEN
+            {{- range $key, $value := .Values.web.env }}
+            {{- if and $value (ne $key "WEB_WORKER_URL") (ne $key "WEB_PUBLIC_URL") (ne $key "WEB_OIDC_ISSUER_URL") (ne $key "WEB_OIDC_CLIENT_ID") (ne $key "WEB_OWNER_SUBJECTS") }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /

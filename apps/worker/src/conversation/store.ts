@@ -139,8 +139,27 @@ const TURN_COLUMNS =
 
 export interface AppendUserMessageParams {
   readonly content: string;
-  /** Idempotency key; re-ingesting the same key returns the existing message. */
+  /**
+   * Idempotency key; re-ingesting the same key with the same content
+   * returns the existing message, and reuse with different content raises
+   * `ClientKeyConflictError`.
+   */
   readonly clientKey?: string;
+}
+
+/**
+ * A caller reused an idempotency key with different content. This is a
+ * caller contract violation (each key belongs to exactly one logical
+ * message), surfaced to callers so it can be rejected instead of silently
+ * associating two different messages with one key.
+ */
+export class ClientKeyConflictError extends Error {
+  constructor(clientKey: string) {
+    super(
+      `client key is already used with different content: ${clientKey}`,
+    );
+    this.name = "ClientKeyConflictError";
+  }
 }
 
 export type ClaimOutcome =
@@ -195,6 +214,52 @@ export interface ThreadContextParams {
   readonly limit: number;
 }
 
+/**
+ * Generic thread-level work status; deliberately free of internal detail
+ * (no turn ids, lease state, or error text leaves the domain this way).
+ */
+export interface ThreadStatus {
+  /** User messages not yet grouped into a turn. */
+  readonly queuedUserMessages: number;
+  /** True while a turn is being processed (reply not yet published). */
+  readonly generating: boolean;
+  /**
+   * Highest `seq` value the thread's identity sequence has allocated, whether
+   * or not the message has committed (or ever will — a rolled-back insert
+   * burns its seq). Because allocation is contiguous from 1, this bounds
+   * what can exist below any page: every seq in `[1..highestAllocatedSeq]`
+   * is either committed and visible, in flight (its transaction has drawn
+   * the seq but not committed), or burned (rolled back) — never simply
+   * absent. See the paged-history notes on `getThreadPage`.
+   */
+  readonly highestAllocatedSeq: number;
+  /**
+   * True when the thread's trailing state includes a failed turn: a failed
+   * turn claimed after the most recently completed one (or any failure when
+   * nothing has completed yet). Durable (derived from turn state on every
+   * read) and sanitized — it never carries the underlying error text.
+   */
+  readonly hasRecentFailure: boolean;
+}
+
+export interface ThreadPageParams {
+  readonly limit: number;
+  /**
+   * Exclusive upper `seq` bound for a history page; omit for the newest
+   * page of the thread.
+   */
+  readonly before?: number;
+}
+
+/** One bounded page of the thread in persisted `seq` order. */
+export interface ThreadPage {
+  readonly messages: readonly ConversationMessage[];
+  /** Smallest `seq` in the page; null when the page is empty. */
+  readonly oldestSeq: number | null;
+  /** True when committed messages exist below this page. */
+  readonly hasMore: boolean;
+}
+
 export interface ConversationStore {
   appendUserMessage(
     params: AppendUserMessageParams,
@@ -208,6 +273,9 @@ export interface ConversationStore {
   getThreadContext(params: ThreadContextParams): Promise<
     readonly ConversationMessage[]
   >;
+  /** Bounded page of the thread in `seq` order (see the notes below). */
+  getThreadPage(params: ThreadPageParams): Promise<ThreadPage>;
+  getThreadStatus(): Promise<ThreadStatus>;
 }
 
 export function createConversationStore(pool: PostgresPool): ConversationStore {
@@ -258,6 +326,11 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
         throw new Error(
           `idempotent re-ingest failed: no message for client key ${params.clientKey}`,
         );
+      }
+      // A key is bound to exactly one logical message. Reuse with different
+      // content is a caller contract violation, not an idempotent replay.
+      if (found.content !== params.content) {
+        throw new ClientKeyConflictError(params.clientKey);
       }
       return mapMessage(found);
     });
@@ -526,6 +599,142 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     return result.rows.map(mapMessage).reverse();
   }
 
+  /**
+   * One bounded page of the whole thread, oldest first, in persisted `seq`
+   * order — the read model for client history loading and reconciliation.
+   *
+   * Why pages instead of an incremental `seq > watermark` read: a reply's
+   * `seq` is drawn at insert time inside the publication transaction, but
+   * the row only becomes visible at commit. A user message ingested between
+   * those moments commits first with a higher `seq`, so a poller that
+   * already observed that message and later polls with `seq > watermark`
+   * would never see the reply committed behind its watermark (its `seq` is
+   * lower). Pages read a bounded seq range and let the consumer reconcile
+   * by message `id`, which is immune to that ordering.
+   *
+   * Page selection: without `before`, the newest `limit` messages; with
+   * `before`, the `limit` messages with the highest `seq` strictly below
+   * that bound. Walking `before = oldestSeq` from the newest page therefore
+   * pages backwards through the whole history, and `hasMore` (false once a
+   * page reaches the bottom) terminates the walk.
+   *
+   * Concurrency: page rows and the `hasMore`/`oldestSeq` bounds are computed
+   * in ONE statement, so they come from one read-committed snapshot — the
+   * flag cannot disagree with the page it describes. A message whose
+   * transaction commits during the read is simply absent from both; a
+   * consumer that re-derives the gaps between its loaded seqs each cycle
+   * (see `ThreadStatus` for the allocation invariant) recovers it on a
+   * later read.
+   */
+  async function getThreadPage(params: ThreadPageParams): Promise<ThreadPage> {
+    if (!(Number.isInteger(params.limit) && params.limit > 0)) {
+      throw new Error("limit must be a positive integer");
+    }
+    if (
+      params.before !== undefined &&
+      !(Number.isInteger(params.before) && params.before >= 1)
+    ) {
+      throw new Error("before must be a positive integer seq bound");
+    }
+    const result = await pool.query<
+      MessageRow & { page_oldest_seq: string | null; has_more: boolean }
+    >(
+      `WITH page AS (
+         SELECT id, seq, role, content, turn_id, client_key, created_at
+         FROM conversation_message
+         WHERE ($2::bigint IS NULL OR seq < $2::bigint)
+         ORDER BY seq DESC
+         LIMIT $1
+       ), bounds AS (
+         SELECT
+           (SELECT min(seq) FROM page) AS page_oldest_seq,
+           EXISTS (
+             SELECT 1 FROM conversation_message
+             WHERE seq < COALESCE(
+               (SELECT min(seq) FROM page), $2::bigint
+             )
+           ) AS has_more
+       )
+       SELECT p.id, p.seq, p.role, p.content, p.turn_id, p.client_key,
+              p.created_at, b.page_oldest_seq, b.has_more
+       FROM page p CROSS JOIN bounds b
+       ORDER BY p.seq ASC`,
+      [params.limit, params.before ?? null],
+    );
+    const firstRow = result.rows[0];
+    const oldestSeq =
+      firstRow !== undefined && firstRow.page_oldest_seq !== null
+        ? Number(firstRow.page_oldest_seq)
+        : null;
+    return {
+      messages: result.rows.map(mapMessage),
+      oldestSeq,
+      hasMore: firstRow !== undefined ? firstRow.has_more : false,
+    };
+  }
+
+  /**
+   * Generic thread-level work status for polling consumers, in one
+   * statement so its parts describe one consistent moment:
+   *
+   * - how many user messages are still unassigned (queued for a future
+   *   turn);
+   * - whether a turn is currently in flight (reply not yet published);
+   * - the highest allocated `seq` (see `ThreadStatus`) — the identity
+   *   sequence this domain owns is read directly, without consuming a
+   *   value; it includes seqs of in-flight and burned (rolled-back)
+   *   inserts, and its contiguity (drawing seq N draws 1..N) is what lets
+   *   consumers reason soundly about the seqs below any page;
+   * - whether the trailing state includes a failed turn. Scope: a failed
+   *   turn counts as recent while it is claimed after the most recently
+   *   completed turn (turn order equals first-message `seq` order — see
+   *   `getThreadContext` — so the comparison is deterministic), or when
+   *   nothing has completed yet. Once a later turn completes, the earlier
+   *   failure is history and the flag clears. The error text itself never
+   *   leaves the domain through this method.
+   */
+  async function getThreadStatus(): Promise<ThreadStatus> {
+    const result = await pool.query<{
+      queued: string;
+      generating: boolean;
+      allocated_high: string;
+      has_recent_failure: boolean;
+    }>(
+      `SELECT
+         (SELECT count(*) FROM conversation_message
+          WHERE role = 'user' AND turn_id IS NULL) AS queued,
+         EXISTS (SELECT 1 FROM conversation_turn WHERE status = 'in_flight')
+           AS generating,
+         (SELECT CASE WHEN s.is_called THEN s.last_value ELSE 0 END
+            FROM conversation_message_seq_seq s) AS allocated_high,
+         EXISTS (
+           SELECT 1 FROM conversation_turn f
+           WHERE f.status = 'failed'
+             AND (SELECT min(m.seq) FROM conversation_message m
+                  WHERE m.turn_id = f.id)
+               > COALESCE((
+                   SELECT max(c.first_seq) FROM (
+                     SELECT min(cm.seq) AS first_seq
+                     FROM conversation_turn ct
+                     JOIN conversation_message cm ON cm.turn_id = ct.id
+                     WHERE ct.status = 'completed'
+                     GROUP BY ct.id
+                   ) c
+                 ), 0)
+         ) AS has_recent_failure`,
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new Error("thread status query returned no row");
+    }
+    return {
+      queuedUserMessages: Number(row.queued),
+      generating: row.generating,
+      highestAllocatedSeq: Number(row.allocated_high),
+      hasRecentFailure: row.has_recent_failure,
+    };
+  }
+
   return {
     appendUserMessage,
     claimNextTurn,
@@ -535,5 +744,7 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     failTurn,
     getEnabledResponsePatterns,
     getThreadContext,
+    getThreadPage,
+    getThreadStatus,
   };
 }

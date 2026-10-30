@@ -1,56 +1,48 @@
-"use client";
-
 import Box from "@mui/material/Box";
-import { useCallback, useState } from "react";
 
-import { AppHeader } from "@/components/app-header";
-import { Composer } from "@/components/composer";
-import { MessageImageLightbox } from "@/components/message-images";
-import { PreviewNotice } from "@/components/preview-notice";
-import { Thread } from "@/components/thread";
-import { fixtureThread } from "@/lib/fixtures";
-import { nextLocalMessageId } from "@/lib/local-ids";
-import type { Message, MessageImage } from "@/lib/messages";
+import { LiveThread } from "@/components/live-thread";
+import { SignInView, UnavailableView } from "@/components/gate-views";
+import { loadWebConfigSafe } from "@/lib/server/config";
+import { nowSeconds } from "@/lib/server/respond";
+import { SESSION_COOKIE_NAME, verifySessionToken } from "@/lib/server/session";
+import { cookies } from "next/headers";
 
 /**
- * First web-client slice: a local-only, fixture-backed messenger preview.
+ * The single continuous conversation, behind the BFF's owner-only edge.
  *
- * - The thread is static fixture data; messages typed here are appended to
- *   in-memory state for this page load only. Nothing is sent, stored, or
- *   fetched — there is no backend behind this screen.
- * - No authentication flow exists here; real owner authorization belongs to
- *   the future BFF edge (apps/web/AGENTS.md).
+ * Server-rendered decision, fail-closed in both directions: without valid
+ * BFF configuration the page renders a generic unavailability view rather
+ * than any conversation surface, and without a verified session it renders
+ * the sign-in view. Only a verified owner session reaches the live thread.
+ * The `?auth=` query parameter (set by the sign-in flow on failure) toggles
+ * the one generic retry notice; its value is never interpreted further.
  */
+export const dynamic = "force-dynamic";
 
-export default function HomePage() {
-  const [messages, setMessages] = useState<readonly Message[]>(fixtureThread);
-  const [lightboxImage, setLightboxImage] = useState<MessageImage | null>(null);
+export default async function HomePage({
+  searchParams,
+}: {
+  readonly searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  const params = await searchParams;
+  const authNotice = typeof params.auth === "string" && params.auth.length > 0;
 
-  const handleSend = useCallback((text: string) => {
-    setMessages((previous) => [
-      ...previous,
-      {
-        id: nextLocalMessageId(),
-        role: "user",
-        text,
-        sentAt: new Date().toISOString(),
-      },
-    ]);
-    // No imperative scroll here: the thread follows the newest message only
-    // when the reader is already near the bottom. Scrolled up into history,
-    // the viewport stays put and the jump-to-latest button appears instead.
-  }, []);
-
+  const configResult = loadWebConfigSafe(process.env);
+  if (!configResult.ok) {
+    return <UnavailableView />;
+  }
+  const config = configResult.config;
+  const session = verifySessionToken(
+    (await cookies()).get(SESSION_COOKIE_NAME)?.value,
+    config.sessionSecret,
+    nowSeconds(),
+  );
+  if (session === null) {
+    return <SignInView notice={authNotice} />;
+  }
   return (
     <Box className="app-shell" sx={{ display: "flex", flexDirection: "column" }}>
-      <AppHeader />
-      <PreviewNotice />
-      <Thread messages={messages} onOpenImage={setLightboxImage} />
-      <Composer onSend={handleSend} />
-      <MessageImageLightbox
-        image={lightboxImage}
-        onClose={() => setLightboxImage(null)}
-      />
+      <LiveThread />
     </Box>
   );
 }

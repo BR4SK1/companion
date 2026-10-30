@@ -4,7 +4,7 @@ This repository is a single-user, self-hosted project maintained by its owner. T
 
 ## Repository state
 
-The repository has early implementation beyond the scaffold: architecture documentation; shared-library code (`libraries/openrouter` — transport plus typed Decisions and Chat contracts; `libraries/postgres` — connection lifecycle, transactions, migration runner over `pg`); a first worker slice in `apps/worker` — durable grouped conversation work on PostgreSQL with OpenRouter response-pattern decisions preceding chat generation (no web/BFF connection, no deployment); and a first web-client slice in `apps/web` — a local-only, fixture-backed messenger preview with no backend, authentication, or live chat. Nothing is deployed. Contribution tooling (package manager, commit hooks) is installed at the repository root and applies to documentation and code alike.
+The repository has early implementation beyond the scaffold: architecture documentation; shared-library code (`libraries/openrouter` — transport plus typed Decisions and Chat contracts; `libraries/postgres` — connection lifecycle, transactions, migration runner over `pg`); an implemented worker slice in `apps/worker` — durable grouped conversation work on PostgreSQL with OpenRouter response-pattern decisions preceding chat generation, plus a private bearer-token HTTP ingest/read API; and the authenticated web client with its BFF edge in `apps/web` — owner-only Keycloak OIDC sign-in and authenticated routes wired to the worker. Nothing is deployed with this wiring. Contribution tooling (package manager, commit hooks) is installed at the repository root and applies to documentation and code alike.
 
 ## Tooling setup
 
@@ -34,7 +34,7 @@ Unit tests run on Node's built-in test runner (`node:test`, `node:assert`); no t
 pnpm test:unit
 ```
 
-The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It contains the deliberate placeholder harness suite, the OpenRouter Decisions and Chat contract tests, the transport tests, the worker's pure turn-logic tests, and the web preview's pure-logic tests (thread grouping, scroll anchoring, time labels, fixture sanity); they make no network calls and need no database. Database-backed worker coverage lives in [`tests/integration`](tests/integration/README.md), which is skipped unless an isolated non-production database is explicitly provided via `WORKER_TEST_DATABASE_URL`.
+The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It contains the deliberate placeholder harness suite, the OpenRouter Decisions and Chat contract tests, the transport tests, the worker's pure turn-logic and HTTP API contract tests, and the web app's pure-logic tests (thread grouping, scroll anchoring, time labels, thread-state merging, BFF session/configuration/origin guards); they make no network calls and need no database. Database-backed worker coverage lives in [`tests/integration`](tests/integration/README.md), which is skipped unless a disposable isolated non-production database is explicitly provided via `WORKER_TEST_DATABASE_URL` (never a real application database — the suites truncate the domain tables).
 
 ## Type checking
 

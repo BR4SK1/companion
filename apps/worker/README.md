@@ -2,13 +2,19 @@
 
 ## Status
 
-First implemented slice: durable grouped conversation work on PostgreSQL, with response-pattern selection through OpenRouter's native typed Decisions API preceding chat generation. One deployable, modular responsibilities; no image-generation integration, voice, uploads, or web/BFF connection in this slice — the web preview stays disconnected from the worker.
+Implemented slice: durable grouped conversation work on PostgreSQL, with response-pattern selection through OpenRouter's native typed Decisions API preceding chat generation, plus the private HTTP ingest/read API the web BFF calls. One deployable, modular responsibilities; no image-generation integration, voice, or uploads in this slice. The worker holds no identity concept: it authenticates callers with one service-to-service credential and knows nothing about users.
 
 ## Responsibilities
 
 Implemented in this slice:
 
-- **Durable message ingestion contract.** User messages are appended to PostgreSQL; a caller-supplied idempotency key makes re-ingestion (e.g. a retried request) a no-op returning the existing message.
+- **Private HTTP API.** A cluster-internal HTTP listener (`api/server.ts`) exposes the ingest and read boundary the web BFF calls:
+  - `GET /healthz` — liveness (process health only; unauthenticated).
+  - `GET /readyz` — readiness (database ping; unauthenticated).
+  - `POST /v1/messages` — idempotent user-message ingest. Body `{text, clientKey}`; the same key with the same content returns the existing message (idempotent replay), and the same key with different content is rejected with `409 conflict`.
+  - `GET /v1/thread?limit=N[&before=seq]` — one bounded page of the thread in persisted `seq` order (default 100, maximum 500). Without `before` this is the newest page; with `before` it is the page immediately below that exclusive bound, so a caller walks the full durable history backwards via `page.oldestSeq` until `page.hasMore` is false. The response also carries a generic status object (`{queued, generating, highestAllocatedSeq, hasRecentFailure}`) with no turn, lease, key, or error internals. `highestAllocatedSeq` is the highest `seq` the thread's identity sequence has allocated — committed-visible, in-flight, or burned (a rolled-back insert never becomes visible) — and, because allocation is contiguous, it bounds what can exist below any page. Consumers reconcile by re-deriving the gaps between their loaded seqs and walking pages downward from each gap's top; the web client does this with a bounded per-cycle budget and no timing assumption (an in-flight seq and a burned seq look identical at any single snapshot, so an unresolved gap keeps its bounded share of probing instead of being discarded on a deadline). `hasRecentFailure` is a durable, sanitized trailing-failure flag — a failed turn claimed after the most recently completed one, or any failure before the first completion; the underlying error text never crosses this boundary.
+  - Every API endpoint requires the `WORKER_API_TOKEN` bearer credential (constant-time comparison); there is no unauthenticated mode — the worker fails closed at startup without it. Failures are generic and sanitized (`bad_request`, `conflict`, `unauthorized`, …); internal details are logged server-side only.
+- **Durable message ingestion contract.** User messages are appended to PostgreSQL; a caller-supplied idempotency key makes re-ingestion (e.g. a retried request) a no-op returning the existing message, and reuse of a key with different content raises a typed conflict (`ClientKeyConflictError`) instead of silently rebinding the key.
 - **Claim-time grouping.** All pending (unassigned) user messages form a trailing run of the thread; claiming groups the entire run into one turn with one snapshot — never one message at a time.
 - **Snapshot semantics.** A claimed turn processes exactly the messages grouped at claim time. Messages that arrive while the turn is in flight stay unassigned and are grouped into the next turn.
 - **Prior-turn context snapshot.** The decision state and chat request are built from one coherent snapshot of prior work: the messages of every turn claimed before the processed one, in conversation order — for each turn, its grouped user messages followed by its published reply. Conversation order differs from raw `seq` order exactly where a reply was published after a later user message arrived (that message joins the next turn, so its `seq` is lower than the reply's): the reply still precedes it in context. Unassigned messages (future turns), the processed turn's own messages, and any later turns' messages are excluded — no leakage and no duplication. Because exclusion and ordering are keyed by turn association rather than a raw-`seq` cutoff or lease state, the snapshot is identical on every attempt of the same turn, including after a lease reclaim. A failed turn is terminal in this slice, but its user messages stay part of the visible thread and appear in later context without a reply.
@@ -19,18 +25,20 @@ Implemented in this slice:
 - **Response-pattern decision.** When enabled `response_pattern` records exist, one `choice` question is asked through the OpenRouter Decisions API (`POST /api/alpha/decisions`): options are pattern ids, each described by its **selection description**. The returned top choice selects the pattern. The choice answer is preserved as returned (including optional probabilities/confidence) and recorded on the turn as diagnostics; an answer that does not name an offered pattern is an error, not a silent fallback. With no enabled patterns, the decision step is skipped and chat runs without guidance.
 - **Chat generation.** The selected pattern's **response guidance** (a separate text, never sent to the decider) is sent as the leading system message, followed by the prior-turn context snapshot (see below) and the turn's grouped messages, to OpenRouter's Chat Completions API (non-streaming).
 
-Not implemented in this slice (by design): image generation, engagement/segmentation timers, proactive follow-up, a BFF-facing HTTP ingest API, retries for failed turns, and multi-conversation support.
+Not implemented in this slice (by design): image generation, engagement/segmentation timers, proactive follow-up, retries for failed turns, and multi-conversation support.
 
 ## Module layout
 
 ```
 src/
-  main.ts                  composition edge: config → pool → migrations → engine loop
+  main.ts                  composition edge: config → pool → migrations → private API → engine loop
   config.ts                environment parsing and validation (no secret values here)
+  api/
+    server.ts              private HTTP API: bearer auth, ingest, paged thread reads, health
   conversation/
     types.ts               domain types (messages, turns, response patterns)
     migrations.ts          domain-owned SQL migrations (applied via @companion/postgres)
-    store.ts               domain-owned queries: ingest, claim/group, lease, publish, fail
+    store.ts               domain-owned queries: ingest, claim/group, lease, publish, fail, thread reads
   work/
     decision.ts            pattern-choice decision build/select (pure)
     chat.ts                chat request assembly (pure)
@@ -54,7 +62,7 @@ Turn states: `in_flight` → `completed` | `failed`.
 Domain-owned migration `0001_conversation_work`:
 
 - `conversation_turn` — id, status, attempt, lease owner/expiry, selected pattern id, decision diagnostics (jsonb), error, timestamps.
-- `conversation_message` — id, identity-based `seq` thread position, role (`user`/`assistant`), content, nullable idempotency `client_key` (unique), nullable `turn_id` reference. At most one assistant reply per turn (partial unique index).
+- `conversation_message` — id, identity-based `seq` thread position, role (`user`/`assistant`), content, nullable idempotency `client_key` (unique; a key is bound to exactly one content — reuse with different content is rejected as a conflict), nullable `turn_id` reference. At most one assistant reply per turn (partial unique index).
 - `response_pattern` — id, enabled, `selection_description` (for the decider), `response_guidance` (for chat), presentation `position`.
 
 The schema is relational PostgreSQL only. No identity-provider subjects, user ids, or tenant identifiers appear in any table.
@@ -69,6 +77,9 @@ Environment variables (secrets are supplied at runtime, never committed):
 | `OPENROUTER_API_KEY` | yes | — | OpenRouter API key |
 | `WORKER_CHAT_MODEL` | yes | — | Model id used for chat generation |
 | `WORKER_DECISION_MODEL` | yes | — | Model id used for the response-pattern decision |
+| `WORKER_API_TOKEN` | yes | — | Bearer credential for the private HTTP API; the web BFF holds the same value as `WEB_WORKER_TOKEN`. No unauthenticated mode exists. |
+| `WORKER_HTTP_HOST` | no | `0.0.0.0` | Private API listener host (cluster-internal only) |
+| `WORKER_HTTP_PORT` | no | `8080` | Private API listener port |
 | `WORKER_OPENROUTER_CHAT_URL` | no | `https://openrouter.ai/api/v1/chat/completions` | Chat endpoint |
 | `WORKER_OPENROUTER_DECISIONS_URL` | no | `https://openrouter.ai/api/alpha/decisions` | Decisions endpoint |
 | `WORKER_LEASE_SECONDS` | no | `60` | Turn lease duration (minimum `3`: the engine heartbeat renews at lease/3, at least 1000ms, and a shorter lease would expire before its first renewal) |
@@ -77,7 +88,7 @@ Environment variables (secrets are supplied at runtime, never committed):
 | `WORKER_CHAT_TIMEOUT_MS` | no | `120000` | Chat call timeout |
 | `WORKER_DECISION_TIMEOUT_MS` | no | `30000` | Decision call timeout |
 
-The numeric defaults are provisional operating points for this slice, not settled policy; all are configurable.
+The numeric defaults are provisional operating points for this slice, not settled policy; all are configurable. Message input bounds (20,000-character content, 64 KiB bodies, client-key shape) are contract constants in `api/server.ts`, not configuration.
 
 ## Running
 
@@ -85,12 +96,12 @@ The numeric defaults are provisional operating points for this slice, not settle
 pnpm --filter @companion/worker start
 ```
 
-Startup validates configuration, connects to PostgreSQL, applies domain migrations (idempotent, advisory-locked), and runs the engine loop until `SIGINT`/`SIGTERM`. Shutdown is graceful: the in-flight cycle finishes (including publication) before exit. Missing configuration exits with a named-variable error.
+Startup validates configuration, connects to PostgreSQL, applies domain migrations (idempotent, advisory-locked), starts the private HTTP API (which requires its service credential), and runs the engine loop until `SIGINT`/`SIGTERM`. Shutdown is graceful and ordered: the engine loop stops taking new claims and finishes the in-flight cycle (including publication), the HTTP listener drains in-flight requests, and only then is the connection pool closed. Missing configuration exits with a named-variable error.
 
 ## Verification
 
-- `pnpm test:unit` — deterministic unit tests with no database and no network: chat contract, transport (injected fetch), decision build/selection (including the no-silent-fallback rule and guidance/selection separation), chat assembly, and configuration parsing.
-- `tests/integration/worker-postgres.test.mjs` — runs only against an explicitly provided isolated non-production database (`WORKER_TEST_DATABASE_URL`) and is skipped otherwise: migration idempotency, ingest idempotency, grouping, snapshot/next-turn behavior, prior-turn context snapshots in conversation order (replies published after later messages arrived, unclaimed/current-turn exclusions, bounded tail, failed-turn messages, lease-reclaim coherence, and full decision/chat context when messages arrive during generation), ingest/claim serialization under concurrency (commit order matches `seq` order), reply ordering, lease renewal/reclaim, fencing of a stale owner, duplicate-publication no-op, and full engine cycles with fake provider calls.
+- `pnpm test:unit` — deterministic unit tests with no database and no external network: chat contract, transport (injected fetch), decision build/selection (including the no-silent-fallback rule and guidance/selection separation), chat assembly, configuration parsing (including fail-closed API-token handling), and the private HTTP API contract over an ephemeral loopback listener with a fake store (auth, ingest idempotency and conflict mapping, cursor-paged thread reads with cursor validation, sanitized status including the trailing-failure flag, sanitized errors, route/method rules).
+- `tests/integration/worker-postgres.test.mjs` and `tests/integration/worker-http.test.mjs` — run only against an explicitly provided disposable isolated non-production database (`WORKER_TEST_DATABASE_URL`; the suites truncate the domain tables, so never point that variable at a real application database) and are skipped otherwise: migration idempotency, ingest idempotency and conflicting-key rejection, grouping, snapshot/next-turn behavior, prior-turn context snapshots in conversation order, ingest/claim serialization under concurrency, reply ordering, lease renewal/reclaim, fencing, duplicate-publication no-op, full engine cycles with fake provider calls, and the same flows end to end through the HTTP API — including cursor-paged history walks, allocated-seq reconciliation with in-flight and burned seqs, and the scoped trailing-failure flag.
 - The transport/contract level is verified with fakes only; no live OpenRouter call has been made from this code, and no provider/model capability for the typed decision flow has been confirmed live.
 
 ## Open questions
@@ -98,7 +109,7 @@ Startup validates configuration, connects to PostgreSQL, applies domain migratio
 - Retry policy for failed turns (currently terminal: `failed` turns are not retried) and whether transient errors should re-queue.
 - Decision fallback/calibration: thresholds, top-N ranking, behavior for unusable or low-confidence answers.
 - Diagnostics retention: what is kept in `conversation_turn.decision` and for how long.
-- How ingestion reaches the worker when the web BFF is implemented (the store contract is the current ingest path).
-- Whether response patterns and the conversation schema should move to a shared domain home when the BFF needs the same tables.
+- Whether response patterns and the conversation schema should move to a shared domain home as more of the thread surface needs the same tables.
 - Lease/reclaim refinements: persisted worker identity for immediate self-reclaim after restart, bounded reclaim attempts.
 - Queue technology and context-window policy remain open; this slice uses PostgreSQL-backed leasing and a configurable fixed history limit.
+- TLS between the BFF and the worker's private listener (currently plain HTTP inside the cluster boundary, guarded by the bearer token) if that boundary ever leaves the cluster network.
