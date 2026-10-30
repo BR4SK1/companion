@@ -46,10 +46,36 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
      currently contains only the placeholder harness test, say that it
      verifies the harness, not application behavior. Future unit tests belong
      in the same command — do not improvise a substitute runner or gate.)
-5. **Branch and commit per repo convention.** Use the repo's branch naming,
-   Conventional Commits style, and hooks. Let hooks run; never skip them
-   (`--no-verify`) unless the user explicitly asks. Never push to a protected
-   or default branch (e.g. `main`) — create or use a feature branch. Never
+5. **Check the branch before shipping, then branch and commit per repo
+   convention.** Always check which branch the working tree is currently on
+   before committing or pushing. Decide from evidence (current branch, its
+   upstream, its ancestry relative to the intended base, and any PR already
+   open or previously filed for it) whether that branch is the right home for
+   this work:
+   - **Reuse the current branch** only when it is actually for this work: not
+     the default or a protected branch, no merged or closed PR already
+     attached to it, an intended base and clean ancestry for this change, and
+     no unrelated work mixed into its history or working tree.
+   - **Create (or switch to) a new feature branch** when the current branch is
+     the default or otherwise protected, is for different work, already has a
+     merged or closed PR, or has unsuitable upstream or ancestry for this
+     change (e.g. it was branched off another feature branch rather than the
+     intended base). Determine the intended base branch first and create the
+     new branch from it, per repo naming convention.
+   - Remember that a branch carries its full ancestry: pushing or opening a PR
+     from the wrong base can expose unrelated history. Verify what would
+     actually be outgoing (`git log`/`git diff` against the intended base)
+     before pushing.
+   - Never switch branches by overwriting, discarding, or stashing unrelated
+     changes, and never move or rewrite others' work to make a branch fit. If
+     committing here would mix unrelated changes, or the safe transition, base
+     branch, or scope is uncertain, stop and ask the user before branching or
+     committing.
+   Creating a feature branch is a normal operation and does not by itself
+   authorize rewriting, rebasing, or force-pushing history.
+   Then use the repo's branch naming, Conventional Commits style, and hooks.
+   Let hooks run; never skip them (`--no-verify`) unless the user explicitly
+   asks. Never push to a protected or default branch (e.g. `main`). Never
    force-push.
 6. **Push the branch to its remote with a normal push** (e.g. `git push -u
    origin <branch>`), after the test gate and before opening the pull request.
