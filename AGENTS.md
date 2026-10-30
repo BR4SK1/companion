@@ -1,6 +1,6 @@
 # Repository working guardrails
 
-This repository contains an architecture scaffold — architecture documentation plus the first shared-library contract code — and a private root contribution-tooling package (pnpm, Husky, commitlint; see [`CONTRIBUTING.md`](CONTRIBUTING.md)). No application code, controllers, or infrastructure are present. That describes the current state, not a permanent implementation ban. Do not infer authorization for future implementation from documented designs or scaffold contents: proceed only within the scope explicitly authorized for the current task. Keep unresolved choices explicit and update relevant documentation when a decision is actually made.
+This repository contains architecture documentation, the first shared-library contract code, a private root contribution-tooling package (pnpm, Husky, commitlint; see [`CONTRIBUTING.md`](CONTRIBUTING.md)), and a first local-only web-client preview in [`apps/web`](apps/web/README.md) — a fixture-backed messenger UI with no backend, authentication, or infrastructure behind it. No backend code, controllers, or infrastructure are present. That describes the current state, not a permanent implementation ban. Do not infer authorization for future implementation from documented designs or scaffold contents: proceed only within the scope explicitly authorized for the current task. Keep unresolved choices explicit and update relevant documentation when a decision is actually made.
 
 ## Boundaries
 

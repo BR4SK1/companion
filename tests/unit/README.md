@@ -14,4 +14,6 @@ The command runs `node --test "tests/unit/**/*.test.mjs"`, so any future test fi
 
 `harness.test.mjs` is a deliberate placeholder: it asserts only that the harness discovers and runs test files. It validates no application behavior beyond the harness itself. It remains so the publication test gate has a real, runnable suite even if the contract tests move.
 
+`web-thread-*.test.mjs` cover the pure presentation logic of the web preview slice in [`../../apps/web`](../../apps/web/README.md): `grouping.ts` (cluster construction and UTC day-change dividers for the visible thread), `scroll.ts` (the "never pull the reader away from older messages" anchoring rule), `time.ts` (deterministic UTC labels and day keys so prerendered HTML and hydrated clients agree), `local-ids.ts` (unique in-session ids for locally composed preview messages), and `fixtures.ts` (fixture sanity: chronological, unique ids, no identity-like fields, local-only image assets that exist). They import the TypeScript sources directly like the contract tests, make no network calls, and need no browser; component behavior is verified separately when running the app.
+
 Integration and end-to-end coverage remain documentation-only; see [`../README.md`](../README.md).
