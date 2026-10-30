@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1000" width="800" height="1000" role="img" aria-label="Abstract fixture image: aurora bands over a dark mountain ridge">
+  <defs>
+    <linearGradient id="night" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b1026"/>
+      <stop offset="1" stop-color="#182a4a"/>
+    </linearGradient>
+    <linearGradient id="aurora" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#57e6b1" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#57e6b1" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#4f8ff7" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="1000" fill="url(#night)"/>
+  <g fill="#ffffff" opacity="0.8">
+    <circle cx="120" cy="120" r="2"/>
+    <circle cx="300" cy="80" r="1.5"/>
+    <circle cx="520" cy="140" r="2"/>
+    <circle cx="680" cy="90" r="1.5"/>
+    <circle cx="220" cy="220" r="1.5"/>
+    <circle cx="600" cy="260" r="2"/>
+  </g>
+  <path d="M0 420 C 200 300 300 480 420 380 C 560 260 640 420 800 340 L 800 620 L 0 620 Z" fill="url(#aurora)"/>
+  <path d="M0 760 L 180 640 L 340 760 L 520 620 L 700 760 L 800 680 L 800 1000 L 0 1000 Z" fill="#0a0e1d"/>
+  <path d="M0 780 L 200 680 L 400 790 L 620 690 L 800 780 L 800 1000 L 0 1000 Z" fill="#070a14"/>
+</svg>

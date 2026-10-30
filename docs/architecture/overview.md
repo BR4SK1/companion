@@ -8,7 +8,7 @@ Owner-only authorization belongs at the web BFF edge and is separate from domain
 
 ## Component boundaries
 
-- **Web/BFF:** planned Next.js, React, and MUI client and authenticated request boundary. It presents the continuous thread and enforces owner-only access.
+- **Web/BFF:** Next.js, React, and MUI client and future authenticated request boundary. It presents the continuous thread and will enforce owner-only access at the BFF edge. A local-only, fixture-backed client preview exists in `apps/web`; the BFF itself is not implemented.
 - **Worker:** one initial deployable for durable background responsibilities. Keep logical capabilities modular without prematurely creating multiple service placeholders.
 - **Shared libraries:** reusable OpenRouter transport/capability adapters and PostgreSQL access concerns. Domain types, schemas, and queries stay with their domain owners; there is no generic shared-types library.
 - **Tests:** planned Vitest-oriented integration coverage and Playwright-oriented end-to-end coverage, isolated from production.

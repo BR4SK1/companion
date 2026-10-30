@@ -1,0 +1,41 @@
+/* Base document styles for the preview app. MUI's CssBaseline handles reset
+   and theming; these rules cover what CssBaseline does not: document height,
+   scroll behavior, the pre-hydration theme-icon visibility (so the toggle
+   renders the correct icon without a hydration mismatch), and mobile
+   safe-area helpers. */
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  /* The app owns vertical scrolling inside the thread; stop chained pull-to
+     refresh / back-swipe gestures from fighting the message list. */
+  overscroll-behavior-y: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Full-viewport app shell: 100vh everywhere, 100dvh where the dynamic
+   viewport unit exists so mobile browser chrome does not clip the composer. */
+.app-shell {
+  height: 100vh;
+}
+
+@supports (height: 100dvh) {
+  .app-shell {
+    height: 100dvh;
+  }
+}
+
+/* Rendered pre-hydration by InitColorSchemeScript; defaults to light when
+   script has not run (no-JS visitors) so content stays readable. */
+html:not([data-mui-color-scheme="dark"]) .theme-icon-dark {
+  display: none;
+}
+
+[data-mui-color-scheme="dark"] .theme-icon-light {
+  display: none;
+}
+

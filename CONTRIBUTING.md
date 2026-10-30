@@ -4,13 +4,15 @@ This repository is a single-user, self-hosted project maintained by its owner. T
 
 ## Repository state
 
-The repository is an architecture scaffold: architecture documentation plus early shared-library contract code (`libraries/openrouter`). Nothing is deployed. Contribution tooling (package manager, commit hooks) is installed at the repository root and applies to documentation and code alike.
+The repository is an architecture scaffold with early implementation: architecture documentation, the OpenRouter shared-library contract code (`libraries/openrouter`), and a first web-client slice in `apps/web` — a local-only, fixture-backed messenger preview (Next.js, React, MUI) with no backend, authentication, or live chat. Nothing is deployed. Contribution tooling (package manager, commit hooks) is installed at the repository root and applies to documentation and code alike.
 
 ## Tooling setup
 
 The package manager is [pnpm](https://pnpm.io/). The exact version is pinned in the root `package.json` via the `packageManager` field and recorded in the committed `pnpm-lock.yaml`. Node.js `>= 22.12.0` is required, as declared in the root `package.json` `engines` field; this matches the strictest engine requirement among the dependencies (the commitlint packages declare `>=22.12.0`).
 
 The pinned pnpm version is activated as follows: install any pnpm 10.x by your preferred method (standalone installer, `npm install -g pnpm`, or a system package). From pnpm 10 onward, `manage-package-manager-versions` defaults to `true`, so pnpm honors the `packageManager` pin and switches to exactly that version, fetching it once if it differs from the installed one. Corepack is not required and is not assumed to be available on this machine.
+
+The repository is a pnpm workspace (`pnpm-workspace.yaml` covers `apps/*`). `pnpm install` at the root installs the root tooling package and every workspace package's dependencies in one shared lockfile. Workspace application packages (currently `apps/web`) are named `@companion/<app>` so `pnpm --filter` commands address them individually; see [`apps/web/README.md`](apps/web/README.md) for its commands.
 
 Hook tooling is installed locally with the repository dependencies. The `commit-msg` hook runs commitlint from those locally installed dependencies (`pnpm exec` resolves the repository's `node_modules`); it installs nothing when it runs. Separately, invoking pnpm itself can fetch the pinned pnpm release once via pnpm's version manager if the invoked pnpm differs from the `packageManager` pin — a one-time setup occurrence, not hook-time behavior.
 
@@ -32,7 +34,7 @@ Unit tests run on Node's built-in test runner (`node:test`, `node:assert`); no t
 pnpm test:unit
 ```
 
-The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It contains the deliberate placeholder harness suite plus the OpenRouter Decisions contract tests; the contract tests exercise `libraries/openrouter` source and make no network calls. Add real unit tests there as more application code lands; they are picked up by the same command.
+The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It contains the deliberate placeholder harness suite, the OpenRouter Decisions contract tests, and the web preview's pure-logic tests (thread grouping, scroll anchoring, time labels, fixture sanity); the contract and preview tests make no network calls. Add real unit tests there as more application code lands; they are picked up by the same command.
 
 ## Type checking
 

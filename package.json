@@ -2,7 +2,7 @@
   "name": "companion",
   "version": "0.0.0",
   "private": true,
-  "description": "Repository tooling for the Companion project. The repository is an architecture scaffold with early shared-library contract code; this root package exists for contribution tooling.",
+  "description": "Repository tooling for the Companion project. The repository contains architecture documentation, early shared-library contract code, and a local-only web-client preview; this root package exists for contribution tooling.",
   "packageManager": "pnpm@10.18.1",
   "engines": {
     "node": ">=22.12.0"
