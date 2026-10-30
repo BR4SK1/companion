@@ -1,0 +1,21 @@
+---
+name: repository-publication-review
+description: Review Companion's public repository content and artifacts before an intended push, pull request, release, upload, or other publication. Assess exposure; do not publish or clean up files.
+---
+
+# Repository publication review
+
+Review the intended outbound material and exposure context for this public Companion repository. A scan is evidence, not proof of safety, and this workflow does not authorize publication or repository changes.
+
+## Workflow
+
+1. **Establish destination and scope.** Identify the intended audience, destination/remote, publication action, relevant commit/branch range, and comparison point. Read applicable repository instructions and public-content policy. If the destination, comparison point, or scope cannot be determined, report that uncertainty and do not claim a complete review.
+2. **Enumerate everything that may leave.** Inspect the whole outgoing history in scope, not merely the latest diff. Review commit contents and metadata as well as the final tree, including additions, modifications, renames, and deletions. Check the working-tree state for tracked, staged, and untracked material that could be included. Inspect public feature-branch exposure and ancestry as relevant before a pull request is approved; do not assume a branch is private or that a pull request exposes only its final diff. Include relevant filenames, paths, metadata, generated artifacts, archives, container/build outputs, and other packaged material when applicable. If publication scope includes attachments, metadata, or test traces, inspect those too. Do not assume ignored files are harmless or that a prior unstaged review covers what a later command will publish.
+3. **Apply Companion's neutral public-content policy.** Public documentation must be standalone, generic, and safe to publish; it must not depend on non-public context or contain private infrastructure identifiers, personal or sensitive information, credentials, private links, copied material, or unsafe examples. Local planning, configuration, and data; credentials; database dumps and logs; generated images and fixtures; and private verification output must not be published. Review private artifacts locally only when necessary to assess exposure, and never repeat or reveal their values in findings. Check paths, names, metadata, and surrounding context, not only visible prose. Ignore rules are not a security boundary.
+4. **Use checks cautiously.** Inspect relevant diffs, history, tree states, and artifacts directly. Automated search or scanning may help when available, but do not invent a scanner, script, or workflow that is not present. A pre-push content/exposure check is distinct from the production merge gate: owner merge is intended production approval, not a substitute for inspecting what a public branch or pull request exposes. A clean scan does not establish that content is safe, authorized, or legally publishable. Never promise that a scanner can guarantee safety.
+5. **Report and escalate.** Summarize the reviewed scope, destination, comparison point, and evidence actually examined; list findings by severity with concrete paths/commit references and safe, redacted evidence. Distinguish confirmed exposure from possible exposure and identify unavailable or excluded material. If exposure, authorization, or publication scope is materially unclear, stop the affected review and report the blocker to the active primary agent for resolution; as a delegated reviewer, do not start a separate user conversation.
+6. **Do not perform publication or cleanup actions.** Do not stage, commit, push, open a pull request, release, merge, rewrite history, delete, or clean files as part of this review. Do not bypass denied access. These actions require separate explicit authorization and applicable permissions. This skill does not grant credentials or imply that publication is approved.
+
+## Output
+
+State the exact commits/branches, paths, artifact classes, destination context, and comparison point examined, plus anything excluded or unavailable. Give severity-ranked findings with safe evidence and recommended action. If no issue is found, qualify the conclusion to the inspected scope; never describe the review as proof that content is risk-free.
