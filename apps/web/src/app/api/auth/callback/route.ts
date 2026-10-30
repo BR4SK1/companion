@@ -24,6 +24,7 @@ import {
   verifyAuthFlowToken,
 } from "@/lib/server/session";
 import {
+  authorizationResponseCallbackUrl,
   discoverOidcConfiguration,
   exchangeAuthorizationCode,
 } from "@/lib/server/oidc";
@@ -72,7 +73,13 @@ export async function GET(request: NextRequest) {
     const configuration = await discoverOidcConfiguration(config);
     const exchange = await exchangeAuthorizationCode(
       configuration,
-      request.nextUrl,
+      // Rebuilt from the trusted configured public origin and the
+      // registered callback path — never the request host (behind a
+      // reverse proxy it can be an internal address, which would mismatch
+      // the registered redirect URI). The authorization-response query
+      // parameters travel over unchanged for the exchange's state, code,
+      // and iss validation.
+      authorizationResponseCallbackUrl(config, request.nextUrl),
       {
         state: flow.state,
         nonce: flow.nonce,

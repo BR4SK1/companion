@@ -73,6 +73,29 @@ export function redirectUriOf(config: WebConfig): string {
   return `${config.publicOrigin}/api/auth/callback`;
 }
 
+/**
+ * The callback URL handed to the authorization-code exchange: the trusted
+ * configured public origin and the exact registered callback path, carrying
+ * the authorization-response query parameters (code, state, iss) for the
+ * exchange's validation.
+ *
+ * The request's own host is never trusted: behind a reverse proxy the
+ * server-side request URL can carry an internal origin, and the code
+ * exchange derives the token request's `redirect_uri` from the origin and
+ * path of the URL it is given. Rebuilding the URL from the configuration
+ * keeps that `redirect_uri` identical to the one in the authorization
+ * request and registered with the provider; only the response parameters
+ * travel over from the actual request.
+ */
+export function authorizationResponseCallbackUrl(
+  config: WebConfig,
+  requestUrl: URL,
+): URL {
+  const callbackUrl = new URL(redirectUriOf(config));
+  callbackUrl.search = requestUrl.search;
+  return callbackUrl;
+}
+
 export interface LoginChallenge {
   readonly authorizationUrl: URL;
   readonly state: string;
