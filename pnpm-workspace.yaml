@@ -1,6 +1,7 @@
 packages:
   - apps/*
   - libraries/*
+  - tests/e2e
 
 ignoredBuiltDependencies:
   - sharp

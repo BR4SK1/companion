@@ -1,0 +1,19 @@
+{
+  "name": "@companion/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Playwright end-to-end suite for the Companion web/BFF/worker slice. Runs only against a disposable, run-owned local test stack with a throwaway PostgreSQL and a local fake provider; never against a real application database or a live model provider.",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "test:stack": "node --test stack-ops.test.mjs",
+    "test:smoke": "node --test deployed-smoke.test.mjs",
+    "show-report": "playwright show-report"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.57.0"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
