@@ -4,14 +4,16 @@
  *
  * The page bound (`limit`) is a BFF constant, not a client-controlled
  * value; the optional `before` cursor only selects which history page is
- * read and is validated to the safe-integer seq range. Errors are generic;
- * worker details never pass through. No identity information is forwarded
- * to the worker.
+ * read and is validated to the safe-integer seq range. Messages are reduced
+ * from the worker's domain shape to the client-facing shape (see
+ * `client-contract.ts`). Errors are generic; worker details never pass
+ * through. No identity information is forwarded to the worker.
  */
 
 import { cookies } from "next/headers";
 import type { NextRequest } from "next/server";
 
+import { toClientMessage } from "@/lib/server/client-contract";
 import { loadWebConfigSafe } from "@/lib/server/config";
 import { jsonError, jsonOk, nowSeconds } from "@/lib/server/respond";
 import { SESSION_COOKIE_NAME, verifySessionToken } from "@/lib/server/session";
@@ -73,7 +75,7 @@ export async function GET(request: NextRequest) {
   );
   if (result.ok) {
     return jsonOk({
-      messages: result.snapshot.messages,
+      messages: result.snapshot.messages.map(toClientMessage),
       status: {
         queued: result.snapshot.queued,
         generating: result.snapshot.generating,

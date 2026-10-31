@@ -11,11 +11,14 @@
  *   a fresh key.
  * - Failures are generic: input problems are 4xx with a stable kind;
  *   worker unavailability is 502 "unavailable" with no upstream detail.
+ * The accepted message is reduced to the client-facing shape (see
+ * `client-contract.ts`).
  * No identity information is forwarded to the worker.
  */
 
 import type { NextRequest } from "next/server";
 
+import { toClientMessage } from "@/lib/server/client-contract";
 import { loadWebConfigSafe } from "@/lib/server/config";
 import { isSameOriginRequest } from "@/lib/server/request-guard";
 import { jsonError, jsonOk, nowSeconds } from "@/lib/server/respond";
@@ -105,7 +108,7 @@ export async function POST(request: NextRequest) {
   });
   const result = await client.sendMessage(parsed.text, parsed.clientKey);
   if (result.ok) {
-    return jsonOk({ message: result.message });
+    return jsonOk({ message: toClientMessage(result.message) });
   }
   if (result.kind === "conflict") {
     return jsonError(409, "conflict");
