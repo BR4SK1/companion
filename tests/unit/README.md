@@ -6,6 +6,8 @@ Unit tests live in this directory as `*.test.mjs` files and run on Node's built-
 pnpm test:unit
 ```
 
+The same suite also runs automatically through the repository's `pre-commit` hook before every commit is created; a failing run blocks the commit (see [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md)).
+
 The command runs `node --test "tests/unit/**/*.test.mjs"`, so any future test file matching that pattern under this directory is discovered automatically — add files here and they run without changing the command. Whether future unit tests should instead be colocated next to the code they exercise is unresolved; if colocated tests are adopted later, extend this command's pattern rather than introducing a second unit runner.
 
 ## Current contents

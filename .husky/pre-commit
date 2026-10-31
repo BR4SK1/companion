@@ -1,0 +1,2 @@
+# Run the full unit suite before the commit is created; any failing test blocks the commit.
+pnpm test:unit

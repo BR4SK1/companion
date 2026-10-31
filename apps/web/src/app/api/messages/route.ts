@@ -14,15 +14,26 @@
  * The accepted message is reduced to the client-facing shape (see
  * `client-contract.ts`).
  * No identity information is forwarded to the worker.
+ *
+ * Non-production-only test channel: a request attested by the loopback test
+ * listener (see `test-gate.ts`) is authorized by the separate identity-free
+ * test session, with the same-origin check applied against the test
+ * channel's loopback origin. The main channel's behavior is unchanged, and
+ * a test session is worthless on it (and vice versa).
  */
 
 import type { NextRequest } from "next/server";
 
 import { toClientMessage } from "@/lib/server/client-contract";
 import { loadWebConfigSafe } from "@/lib/server/config";
-import { isSameOriginRequest } from "@/lib/server/request-guard";
 import { jsonError, jsonOk, nowSeconds } from "@/lib/server/respond";
-import { SESSION_COOKIE_NAME, verifySessionToken } from "@/lib/server/session";
+import { SESSION_COOKIE_NAME, TEST_SESSION_COOKIE_NAME } from "@/lib/server/session";
+import {
+  resolveRequestChannel,
+  stateChangeAllowedForChannel,
+  TEST_ATTESTATION_HEADER,
+  verifyAccessForChannel,
+} from "@/lib/server/test-gate";
 import { createWorkerClient } from "@/lib/server/worker-client";
 
 export const runtime = "nodejs";
@@ -76,16 +87,22 @@ export async function POST(request: NextRequest) {
     return jsonError(503, "unavailable");
   }
   const config = configResult.config;
-  if (!isSameOriginRequest(request.headers.get("origin"), config.publicOrigin)) {
+  const channel = resolveRequestChannel(
+    config,
+    request.headers.get(TEST_ATTESTATION_HEADER),
+  );
+  if (!stateChangeAllowedForChannel(config, channel, request.headers.get("origin"))) {
     return jsonError(403, "forbidden");
   }
-  const session = verifySessionToken(
+  const access = verifyAccessForChannel(
+    config,
+    channel,
     request.cookies.get(SESSION_COOKIE_NAME)?.value,
-    config.sessionSecret,
+    request.cookies.get(TEST_SESSION_COOKIE_NAME)?.value,
     nowSeconds(),
   );
-  if (session === null) {
-    return jsonError(401, "unauthorized");
+  if (!access.ok) {
+    return jsonError(access.status, access.kind);
   }
 
   const contentType = request.headers.get("content-type");

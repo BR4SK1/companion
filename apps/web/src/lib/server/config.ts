@@ -11,7 +11,15 @@
  * Authentication identity stays at this edge: the configured values below
  * authorize the owner at the BFF and are never propagated into domain
  * records, worker calls, or job payloads (apps/web/AGENTS.md).
+ *
+ * The optional non-production-only test gate (see `test-gate.ts`) is parsed
+ * here as well, with the same fail-closed semantics: it is enabled only by
+ * an explicit `WEB_TEST_GATE_ENABLED=true`, and a malformed gate value
+ * fails the whole configuration rather than opening anything. The gate is
+ * never inferred from `NODE_ENV` or any other ambient signal.
  */
+
+import { parseTestGateEnv, TEST_GATE_SESSION_SECRET_ENV } from "../../../server/gate-env.mjs";
 
 export interface WebConfig {
   /**
@@ -36,6 +44,26 @@ export interface WebConfig {
   /** Shared service-to-service credential; must match the worker's token. */
   readonly workerToken: string;
   readonly workerTimeoutMs: number;
+  /**
+   * The non-production-only test gate's configuration, or `null` when the
+   * gate is disabled (the default, and the only state a production
+   * deployment may run in). Present only when
+   * `WEB_TEST_GATE_ENABLED` is explicitly "true"; see `test-gate.ts` for
+   * the runtime decisions and apps/web/README.md for the security model.
+   */
+  readonly testGate: TestGateConfig | null;
+}
+
+/** The test gate's validated configuration (loopback-only E2E entry). */
+export interface TestGateConfig {
+  /** The dedicated listener's port; the listener binds 127.0.0.1 only. */
+  readonly port: number;
+  /**
+   * Dedicated signing secret for test sessions; required to differ from
+   * the owner session secret.
+   */
+  readonly sessionSecret: string;
+  readonly sessionTtlSeconds: number;
 }
 
 export class WebConfigError extends Error {
@@ -132,6 +160,33 @@ export function loadWebConfig(
     );
   }
 
+  // The non-production-only test gate: disabled unless explicitly enabled,
+  // and fully validated when enabled — a malformed gate value fails the
+  // whole configuration (fail closed) instead of opening anything.
+  let testGate: TestGateConfig | null = null;
+  try {
+    const gate = parseTestGateEnv(env);
+    if (gate.enabled) {
+      if (gate.sessionSecret === sessionSecret) {
+        throw new Error(
+          `${TEST_GATE_SESSION_SECRET_ENV} must differ from WEB_SESSION_SECRET (the test gate must never sign sessions with the owner session secret)`,
+        );
+      }
+      // Port-collision and value validation are shared with the custom
+      // server via parseTestGateEnv; only the secret-equality check needs
+      // both secrets and therefore lives here.
+      testGate = {
+        port: gate.port,
+        sessionSecret: gate.sessionSecret,
+        sessionTtlSeconds: gate.sessionTtlSeconds,
+      };
+    }
+  } catch (error) {
+    throw new WebConfigError(
+      error instanceof Error ? error.message : "invalid test gate configuration",
+    );
+  }
+
   return {
     publicOrigin,
     oidcIssuerUrl,
@@ -147,6 +202,7 @@ export function loadWebConfig(
     workerTimeoutMs: optionalNumber(env, "WEB_WORKER_TIMEOUT_MS", DEFAULT_WORKER_TIMEOUT_MS, {
       positive: true,
     }),
+    testGate,
   };
 }
 

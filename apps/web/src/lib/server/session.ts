@@ -20,10 +20,30 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 
 export const SESSION_COOKIE_NAME = "companion_session";
 export const AUTH_FLOW_COOKIE_NAME = "companion_auth_flow";
+/**
+ * The test gate's separate session cookie (non-production-only loopback
+ * entry; see `test-gate.ts`). Deliberately a different name AND a
+ * different signing secret from the owner session: the two session kinds
+ * are disjoint, so the test door grants no owner identity and an owner
+ * session can never be presented as a test session or vice versa.
+ */
+export const TEST_SESSION_COOKIE_NAME = "companion_test_session";
 
 export interface SessionPayload {
   /** Identity-provider subject; the allowlist was checked at sign-in. */
   readonly sub: string;
+  readonly iat: number;
+  /** Expiry as a Unix timestamp in seconds. */
+  readonly exp: number;
+}
+
+/**
+ * The test gate's session payload: a fixed kind marker and expiry only —
+ * it carries no subject and no identity of any kind. The gate grants
+ * access to a non-production candidate, not an identity.
+ */
+export interface TestSessionPayload {
+  readonly kind: "e2e";
   readonly iat: number;
   /** Expiry as a Unix timestamp in seconds. */
   readonly exp: number;
@@ -124,6 +144,9 @@ export function verifySessionToken(
   const payload = verifyTokenPayload(token, secret, nowSeconds);
   if (
     payload === null ||
+    // Shape disjointness: a test-session payload (which carries a `kind`
+    // marker and no subject) is never accepted as an owner session.
+    "kind" in payload ||
     typeof payload.sub !== "string" ||
     payload.sub.length === 0 ||
     typeof payload.iat !== "number" ||
@@ -132,6 +155,37 @@ export function verifySessionToken(
     return null;
   }
   return { sub: payload.sub, iat: payload.iat, exp: payload.exp };
+}
+
+export function createTestSessionPayload(
+  nowSeconds: number,
+  ttlSeconds: number,
+): TestSessionPayload {
+  return {
+    kind: "e2e",
+    iat: nowSeconds,
+    exp: nowSeconds + ttlSeconds,
+  };
+}
+
+export function verifyTestSessionToken(
+  token: string | undefined,
+  secret: string,
+  nowSeconds: number,
+): TestSessionPayload | null {
+  const payload = verifyTokenPayload(token, secret, nowSeconds);
+  if (
+    payload === null ||
+    // Shape disjointness: an owner session (which carries a subject) is
+    // never accepted as a test session, and the kind marker must be exact.
+    payload.kind !== "e2e" ||
+    "sub" in payload ||
+    typeof payload.iat !== "number" ||
+    typeof payload.exp !== "number"
+  ) {
+    return null;
+  }
+  return { kind: "e2e", iat: payload.iat, exp: payload.exp };
 }
 
 export function createAuthFlowPayload(

@@ -1,3 +1,4 @@
+{{- include "companion.validateDeployment" . }}
 {{- if .Values.web.enabled }}
 {{- $repository := required "web.image.repository is required when web is enabled" .Values.web.image.repository -}}
 {{- $tag := required "web.image.tag is required when web is enabled" .Values.web.image.tag -}}
@@ -15,6 +16,35 @@ missing non-secret value would deploy an app that only ever reports
 {{- $requireIssuerUrl := required "web.env.WEB_OIDC_ISSUER_URL is required when web is enabled" (index .Values.web.env "WEB_OIDC_ISSUER_URL" | default "") -}}
 {{- $requireClientId := required "web.env.WEB_OIDC_CLIENT_ID is required when web is enabled" (index .Values.web.env "WEB_OIDC_CLIENT_ID" | default "") -}}
 {{- $requireOwnerSubjects := required "web.env.WEB_OWNER_SUBJECTS is required when web is enabled" (index .Values.web.env "WEB_OWNER_SUBJECTS" | default "") -}}
+{{- /* Non-production-only test-entry gate guards. The gate grants
+unauthenticated full-application access on a loopback-only listener; it is
+fail-closed in the application, and rendering fails loudly rather than
+producing a deployment that could weaken the owner-only boundary. It may
+only render for a declared non-production deployment in the one authorized
+non-production namespace (pinned below, matching
+AUTHORIZED_NON_PRODUCTION_NAMESPACE in apps/web/server/gate-env.mjs — keep
+the two in sync): purpose and downward-API agreement alone would let any
+namespace self-declare itself non-production. */}}
+{{- $purpose := .Values.deployment.purpose -}}
+{{- $declaredNamespace := .Values.deployment.namespace -}}
+{{- $authorizedGateNamespace := "companion-np" -}}
+{{- $testGateEnabled := false -}}
+{{- $testGatePort := 0 -}}
+{{- $testGateSecret := "" -}}
+{{- if .Values.web.testGate.enabled }}
+{{- if ne $purpose "non-production" }}{{ fail (printf "web.testGate.enabled must never be set for a production deployment (deployment.purpose is %s): the test entry is non-production-only" $purpose) }}{{ end }}
+{{- if ne $declaredNamespace $authorizedGateNamespace }}{{ fail (printf "web.testGate.enabled requires deployment.namespace to be the authorized non-production namespace (%s), got %s: no other namespace may self-declare itself non-production" $authorizedGateNamespace $declaredNamespace) }}{{ end }}
+{{- $testGateEnabled = true -}}
+{{- $testGatePort = int .Values.web.testGate.port -}}
+{{- if or (lt $testGatePort 1) (gt $testGatePort 65535) }}{{ fail (printf "web.testGate.port must be an integer between 1 and 65535 when web.testGate is enabled, got %s" (toString .Values.web.testGate.port)) }}{{ end }}
+{{- if eq $testGatePort (int .Values.web.containerPort) }}{{ fail "web.testGate.port must differ from web.containerPort" }}{{ end }}
+{{- if eq $testGatePort (int .Values.web.service.port) }}{{ fail "web.testGate.port must differ from web.service.port" }}{{ end }}
+{{- $testGateSecret = required "web.testGate.existingSecret is required when web.testGate is enabled (must provide the WEB_TEST_GATE_SESSION_SECRET key)" .Values.web.testGate.existingSecret -}}
+{{- if eq $testGateSecret $secret }}{{ fail "web.testGate.existingSecret must be a separate Secret from web.existingSecret: the test gate must never sign sessions with the owner session secret" }}{{ end }}
+{{- end }}
+{{- range $key, $value := .Values.web.env }}
+{{- if or (hasPrefix "WEB_TEST_GATE_" $key) (hasPrefix "COMPANION_" $key) }}{{ fail (printf "web.env must not set %s: deployment-purpose attestation and test-gate configuration are chart-owned" $key) }}{{ end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -43,6 +73,15 @@ spec:
           ports:
             - name: http
               containerPort: {{ .Values.web.containerPort }}
+{{- if $testGateEnabled }}
+            # The test-entry listener is loopback-only inside the container;
+            # declaring the port is informational. This chart deliberately
+            # creates NO Service or Ingress for it: the only access path is
+            # `kubectl port-forward` (the kubelet dials 127.0.0.1 inside the
+            # pod's network namespace).
+            - name: test-entry
+              containerPort: {{ $testGatePort }}
+{{- end }}
           env:
             - name: PORT
               value: {{ .Values.web.containerPort | quote }}
@@ -71,6 +110,33 @@ spec:
                 secretKeyRef:
                   name: {{ $secret }}
                   key: WEB_WORKER_TOKEN
+{{- /* Deployment-purpose attestation carried into the container: the
+declared purpose and namespace are chart-rendered, and the pod's actual
+namespace arrives through the Kubernetes downward API (kubelet-provided,
+never a value and never request data). The application re-verifies both
+at runtime, fail-closed, before the test-entry gate may open. */}}
+            - name: COMPANION_DEPLOYMENT_PURPOSE
+              value: {{ $purpose | quote }}
+            - name: COMPANION_DEPLOYMENT_NAMESPACE
+              value: {{ $declaredNamespace | quote }}
+            - name: COMPANION_POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+{{- if $testGateEnabled }}
+{{- /* Non-production-only test-entry gate. The gate is fail-closed in the
+application (listener bound to 127.0.0.1, per-request socket and gate
+checks, separate session secret). NEVER enable this in production. */}}
+            - name: WEB_TEST_GATE_ENABLED
+              value: "true"
+            - name: WEB_TEST_GATE_PORT
+              value: {{ $testGatePort | quote }}
+            - name: WEB_TEST_GATE_SESSION_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $testGateSecret }}
+                  key: WEB_TEST_GATE_SESSION_SECRET
+{{- end }}
             {{- range $key, $value := .Values.web.env }}
             {{- if and $value (ne $key "WEB_WORKER_URL") (ne $key "WEB_PUBLIC_URL") (ne $key "WEB_OIDC_ISSUER_URL") (ne $key "WEB_OIDC_CLIENT_ID") (ne $key "WEB_OWNER_SUBJECTS") }}
             - name: {{ $key }}
@@ -87,6 +153,11 @@ spec:
               path: /
               port: http
             periodSeconds: 20
+            {{- /* Probes deliberately target the main `http` port only: the
+            test-entry listener (if enabled) accepts loopback connections
+            only, so a kubelet probe against it could never succeed — and
+            must never be configured, because that would require widening
+            the listener. */}}
           resources:
             {{- toYaml .Values.web.resources | nindent 12 }}
 ---

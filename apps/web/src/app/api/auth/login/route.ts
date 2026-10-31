@@ -8,19 +8,24 @@
  * HMAC-signed HttpOnly cookie, never in the URL or browser storage.
  */
 
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 
 import { loadWebConfigSafe } from "@/lib/server/config";
+import { nowSeconds } from "@/lib/server/respond";
 import {
   AUTH_FLOW_COOKIE_NAME,
   createAuthFlowPayload,
   signToken,
 } from "@/lib/server/session";
-import { nowSeconds } from "@/lib/server/respond";
 import {
   createLoginChallenge,
   discoverOidcConfiguration,
 } from "@/lib/server/oidc";
+import {
+  resolveRequestChannel,
+  testChannelOrigin,
+  TEST_ATTESTATION_HEADER,
+} from "@/lib/server/test-gate";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -28,7 +33,7 @@ export const dynamic = "force-dynamic";
 /** Lifetime of the signed login-flow cookie, in seconds. */
 const FLOW_TTL_SECONDS = 600;
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   const configResult = loadWebConfigSafe(process.env);
   if (!configResult.ok) {
     // Fail closed: no configuration, no sign-in. A plain generic response
@@ -39,6 +44,15 @@ export async function GET() {
     });
   }
   const config = configResult.config;
+  // The OIDC flow never runs on the test channel: the gate's sign-in is
+  // the separate test-session issuance, and an owner session must never be
+  // minted through the loopback test entry.
+  if (resolveRequestChannel(config, request.headers.get(TEST_ATTESTATION_HEADER)) === "test") {
+    return NextResponse.redirect(
+      new URL("/api/test-gate/session", testChannelOrigin(config)),
+      303,
+    );
+  }
   try {
     const configuration = await discoverOidcConfiguration(config);
     const challenge = await createLoginChallenge(config, configuration);

@@ -17,6 +17,42 @@ existing Kubernetes Secrets — never chart defaults, never committed values.
   (comma-separated owner subjects). `WEB_WORKER_URL` is derived from the
   worker Service when the worker is enabled, or must be supplied via
   `web.env` otherwise.
+- `web.testGate` — the non-production-only test-entry gate (default off).
+  When `web.testGate.enabled` is true, the web Deployment receives
+  `WEB_TEST_GATE_ENABLED=true`, `WEB_TEST_GATE_PORT`, and a
+  `WEB_TEST_GATE_SESSION_SECRET` key ref from a dedicated existing Secret
+  (`web.testGate.existingSecret`), plus an informational `test-entry`
+  container port. Rendering fails unless a separate Secret is provided,
+  fails when that Secret equals `web.existingSecret` (the test gate must
+  never sign sessions with the owner session secret), fails on a gate port
+  colliding with the container or service port, fails on a gate port
+  outside 1–65535, fails if `WEB_TEST_GATE_*` or `COMPANION_*` variables
+  are smuggled through `web.env`, and — critically — fails unless
+  `deployment.purpose` is exactly `non-production` AND
+  `deployment.namespace` is the one authorized non-production namespace
+  (`companion-np`, pinned in the chart and mirrored by the application):
+  the gate can never render for a production deployment, and no other
+  namespace may self-declare itself non-production. The listener itself
+  additionally requires the Host header `127.0.0.1:<gate port>` on every
+  request and refuses forwarding/proxy headers (DNS-rebinding defense).
+  The chart deliberately creates no Service, Ingress, or other route for
+  the test listener: it is bound to `127.0.0.1` inside the pod and
+  reachable only through `kubectl port-forward` (see apps/web/README.md
+  for the security model and the safe access procedure). Never enable this
+  for production.
+
+Every release must also declare the deployment-purpose attestation the
+application re-verifies at runtime:
+
+- `deployment.purpose` — exactly `non-production` or `production`
+  (required; anything else fails rendering).
+- `deployment.namespace` — the exact namespace the release is installed
+  into (required; rendering fails when it differs from the release
+  namespace). Both values are injected into the web container together
+  with the pod's actual namespace via the Kubernetes downward API
+  (`metadata.namespace`), and the application opens the test-entry gate
+  only when the declared purpose is `non-production` and the declared
+  namespace equals the kubelet-provided pod namespace.
 - `templates/ingress.yaml` — optional Traefik Ingress; hostname and
   middlewares are per-environment values.
 - `templates/worker.yaml` — worker Deployment plus a **cluster-internal**
@@ -80,6 +116,14 @@ ingress hostnames, middleware names, and model ids are environment-specific
 and supplied through a per-environment values file that this repository keeps
 outside version control (see [`../environments/README.md`](../environments/README.md)).
 Missing required values fail rendering instead of producing broken resources.
+
+Render-time checks for the chart guards — including the structural
+Deployment validation (ports vs env shapes, attestation injection) and the
+purpose/namespace negatives — run without cluster access:
+
+```sh
+deploy/helm/render-checks.sh
+```
 
 ## Scope and boundaries
 

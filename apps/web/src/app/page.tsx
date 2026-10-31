@@ -4,8 +4,13 @@ import { LiveThread } from "@/components/live-thread";
 import { SignInView, UnavailableView } from "@/components/gate-views";
 import { loadWebConfigSafe } from "@/lib/server/config";
 import { nowSeconds } from "@/lib/server/respond";
-import { SESSION_COOKIE_NAME, verifySessionToken } from "@/lib/server/session";
-import { cookies } from "next/headers";
+import {
+  resolveRequestChannel,
+  TEST_ATTESTATION_HEADER,
+} from "@/lib/server/test-gate";
+import { SESSION_COOKIE_NAME, TEST_SESSION_COOKIE_NAME, verifySessionToken, verifyTestSessionToken } from "@/lib/server/session";
+import { cookies, headers } from "next/headers";
+import { redirect } from "next/navigation";
 
 /**
  * The single continuous conversation, behind the BFF's owner-only edge.
@@ -16,6 +21,13 @@ import { cookies } from "next/headers";
  * the sign-in view. Only a verified owner session reaches the live thread.
  * The `?auth=` query parameter (set by the sign-in flow on failure) toggles
  * the one generic retry notice; its value is never interpreted further.
+ *
+ * Non-production-only test channel: when the request is attested by the
+ * loopback test listener (`TEST_ATTESTATION_HEADER` carrying the
+ * process-random token that only that listener injects) and the gate is
+ * configured, the page verifies the separate identity-free test session
+ * instead of an owner session; without one it redirects to the gate's
+ * issuance endpoint. The main channel's behavior is unchanged.
  */
 export const dynamic = "force-dynamic";
 
@@ -32,8 +44,36 @@ export default async function HomePage({
     return <UnavailableView />;
   }
   const config = configResult.config;
+
+  const requestHeaders = await headers();
+  const requestCookies = await cookies();
+  const channel = resolveRequestChannel(
+    config,
+    requestHeaders.get(TEST_ATTESTATION_HEADER),
+  );
+  if (channel === "test") {
+    if (config.testGate === null) {
+      // Defense in depth: an attested request implies the gate is
+      // configured; refuse rather than guess.
+      return <UnavailableView />;
+    }
+    const testSession = verifyTestSessionToken(
+      requestCookies.get(TEST_SESSION_COOKIE_NAME)?.value,
+      config.testGate.sessionSecret,
+      nowSeconds(),
+    );
+    if (testSession === null) {
+      redirect("/api/test-gate/session");
+    }
+    return (
+      <Box className="app-shell" sx={{ display: "flex", flexDirection: "column" }}>
+        <LiveThread />
+      </Box>
+    );
+  }
+
   const session = verifySessionToken(
-    (await cookies()).get(SESSION_COOKIE_NAME)?.value,
+    requestCookies.get(SESSION_COOKIE_NAME)?.value,
     config.sessionSecret,
     nowSeconds(),
   );

@@ -8,15 +8,24 @@
  * from the worker's domain shape to the client-facing shape (see
  * `client-contract.ts`). Errors are generic; worker details never pass
  * through. No identity information is forwarded to the worker.
+ *
+ * Non-production-only test channel: a request attested by the loopback test
+ * listener (see `test-gate.ts`) is authorized by the separate identity-free
+ * test session. The main channel's behavior is unchanged, and a test
+ * session is worthless on it (and vice versa).
  */
 
-import { cookies } from "next/headers";
 import type { NextRequest } from "next/server";
 
 import { toClientMessage } from "@/lib/server/client-contract";
 import { loadWebConfigSafe } from "@/lib/server/config";
 import { jsonError, jsonOk, nowSeconds } from "@/lib/server/respond";
-import { SESSION_COOKIE_NAME, verifySessionToken } from "@/lib/server/session";
+import { SESSION_COOKIE_NAME, TEST_SESSION_COOKIE_NAME } from "@/lib/server/session";
+import {
+  resolveRequestChannel,
+  TEST_ATTESTATION_HEADER,
+  verifyAccessForChannel,
+} from "@/lib/server/test-gate";
 import { createWorkerClient } from "@/lib/server/worker-client";
 import { THREAD_PAGE_SIZE } from "@/lib/thread-state";
 
@@ -49,13 +58,19 @@ export async function GET(request: NextRequest) {
     return jsonError(503, "unavailable");
   }
   const config = configResult.config;
-  const session = verifySessionToken(
-    (await cookies()).get(SESSION_COOKIE_NAME)?.value,
-    config.sessionSecret,
+  const channel = resolveRequestChannel(
+    config,
+    request.headers.get(TEST_ATTESTATION_HEADER),
+  );
+  const access = verifyAccessForChannel(
+    config,
+    channel,
+    request.cookies.get(SESSION_COOKIE_NAME)?.value,
+    request.cookies.get(TEST_SESSION_COOKIE_NAME)?.value,
     nowSeconds(),
   );
-  if (session === null) {
-    return jsonError(401, "unauthorized");
+  if (!access.ok) {
+    return jsonError(access.status, access.kind);
   }
   const beforeParam = parseBeforeParam(
     request.nextUrl.searchParams.get("before"),

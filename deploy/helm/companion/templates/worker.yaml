@@ -1,3 +1,4 @@
+{{- include "companion.validateDeployment" . }}
 {{- if .Values.worker.enabled }}
 {{- $repository := required "worker.image.repository is required when worker is enabled" .Values.worker.image.repository -}}
 {{- $tag := required "worker.image.tag is required when worker is enabled" .Values.worker.image.tag -}}

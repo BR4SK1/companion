@@ -28,6 +28,7 @@ import {
   discoverOidcConfiguration,
   exchangeAuthorizationCode,
 } from "@/lib/server/oidc";
+import { resolveRequestChannel, TEST_ATTESTATION_HEADER } from "@/lib/server/test-gate";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -53,6 +54,16 @@ export async function GET(request: NextRequest) {
     });
   }
   const config = configResult.config;
+
+  // The OIDC flow never runs on the test channel: an owner session must
+  // never be minted through the loopback test entry. A generic 404 keeps
+  // the endpoint's existence uninformative there.
+  if (resolveRequestChannel(config, request.headers.get(TEST_ATTESTATION_HEADER)) === "test") {
+    return new NextResponse("Not found.", {
+      status: 404,
+      headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" },
+    });
+  }
 
   // The flow cookie must verify before anything else is trusted.
   const flow = verifyAuthFlowToken(

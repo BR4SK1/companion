@@ -14,7 +14,7 @@ The pinned pnpm version is activated as follows: install any pnpm 10.x by your p
 
 The repository is a pnpm workspace (`pnpm-workspace.yaml` covers `apps/*`). `pnpm install` at the root installs the root tooling package and every workspace package's dependencies in one shared lockfile. Workspace application packages (currently `apps/web`) are named `@companion/<app>` so `pnpm --filter` commands address them individually; see [`apps/web/README.md`](apps/web/README.md) for its commands.
 
-Hook tooling is installed locally with the repository dependencies. The `commit-msg` hook runs commitlint from those locally installed dependencies (`pnpm exec` resolves the repository's `node_modules`); it installs nothing when it runs. Separately, invoking pnpm itself can fetch the pinned pnpm release once via pnpm's version manager if the invoked pnpm differs from the `packageManager` pin — a one-time setup occurrence, not hook-time behavior.
+Hook tooling is installed locally with the repository dependencies, and the hooks run from those locally installed dependencies (`pnpm` and `pnpm exec` resolve the repository's `node_modules`); they install nothing when they run. Two hooks are active: `commit-msg` validates the commit message with commitlint, and `pre-commit` runs the full unit suite with `pnpm test:unit` — a failing run blocks the commit (see [Pre-commit unit tests](#pre-commit-unit-tests)). Separately, invoking pnpm itself can fetch the pinned pnpm release once via pnpm's version manager if the invoked pnpm differs from the `packageManager` pin — a one-time setup occurrence, not hook-time behavior.
 
 ```sh
 pnpm install
@@ -35,6 +35,14 @@ pnpm test:unit
 ```
 
 The command discovers test files matching `tests/unit/**/*.test.mjs`, so new test files added under [`tests/unit`](tests/unit/README.md) run without changing the command. It contains the deliberate placeholder harness suite, the OpenRouter Decisions and Chat contract tests, the transport tests, the worker's pure turn-logic and HTTP API contract tests, and the web app's pure-logic tests (thread grouping, scroll anchoring, time labels, thread-state merging, BFF session/configuration/origin guards); they make no network calls and need no database. Database-backed worker coverage lives in [`tests/integration`](tests/integration/README.md), which is skipped unless a disposable isolated non-production database is explicitly provided via `WORKER_TEST_DATABASE_URL` (never a real application database — the suites truncate the domain tables).
+
+## Pre-commit unit tests
+
+Every `git commit` first runs the full unit suite (`pnpm test:unit`) through the `pre-commit` hook. If any unit test fails, the commit is not created; fix the code or the test and commit again. The suite makes no network calls and needs no database, so it is safe to run on every commit regardless of what changed, documentation-only commits included.
+
+The hook runs the unit suite only. The database-backed integration suites in [`tests/integration`](tests/integration/README.md) are deliberately not part of it: they are skipped unless an explicitly provided disposable non-production database is set via `WORKER_TEST_DATABASE_URL`, and when one is provided they truncate the domain tables — side effects that never belong inside a commit hook.
+
+The hook tests the working tree as it stands when the commit is made, not the exact staged snapshot; keep the working tree consistent with what you stage.
 
 ## Type checking
 
@@ -59,21 +67,21 @@ docs: clarify the worker deployment scope
 feat(bff): add owner authorization at the BFF edge
 ```
 
-### Bypassing the hook
+### Bypassing the hooks
 
-The hook is a local convenience, not a server-side gate: no CI or branch protection exists yet. A commit can bypass validation with:
+The hooks are a local convenience, not a server-side gate: no CI or branch protection exists yet. `git commit --no-verify` skips both the `commit-msg` message validation and the `pre-commit` unit tests:
 
 ```sh
 git commit --no-verify
 ```
 
-Use bypass sparingly and fix the message before pushing where possible, since a pushed invalid message cannot be re-validated by the hook.
+Use bypass sparingly and fix the message before pushing where possible, since a pushed invalid message cannot be re-validated by the hook, and a skipped test run is not made up later.
 
 ### Limitations
 
-- Hooks run locally only. Clones that skip `pnpm install`, or any workflow that does not run Git hooks, do not validate messages.
+- Hooks run locally only. Clones that skip `pnpm install`, or any workflow that does not run Git hooks, run neither hook.
 - Squash merges are not validated. When squashing a pull request, the squash commit title is entered at merge time and bypasses the hook entirely; keep it Conventional Commits-conformant by hand.
-- The hook validates the message only. It does not check content, run tests, or perform any publication-safety review.
+- The `commit-msg` hook validates the message only. It does not check content or perform any publication-safety review; unit tests run separately in the `pre-commit` hook, and neither hook performs publication-safety review.
 
 ## Pull requests
 
