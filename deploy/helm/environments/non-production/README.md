@@ -10,7 +10,12 @@ tests cannot silently switch versions.
 
 The non-production configuration is applied with the `companion` chart into a
 dedicated non-production namespace. It uses a database, credentials, storage,
-and external side-effect boundaries separate from production. External
+and external side-effect boundaries separate from production — with one
+narrow, owner-authorized exception: the OpenRouter provider API key may hold
+the same value here as in production, each environment still keeping its own
+Kubernetes Secret (spend limits, revocation, and exposure of that key are
+shared across both environments — an explicitly accepted owner trade-off).
+External
 PostgreSQL and Keycloak are not provisioned by this project: the deployables
 require a dedicated non-production database and an OIDC confidential client
 (redirect URI `${WEB_PUBLIC_URL}/api/auth/callback`) to be provided before

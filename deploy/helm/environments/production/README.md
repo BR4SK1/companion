@@ -2,7 +2,7 @@
 
 ## Responsibilities and boundaries
 
-Document the future production configuration for application containers on K3s. Production must use its own database, credentials, storage, and external side-effect boundaries, separate from non-production. PostgreSQL and Keycloak are external existing services and are not provisioned by this chart or repository.
+Document the future production configuration for application containers on K3s. Production must use its own database, credentials, storage, and external side-effect boundaries, separate from non-production — with one narrow, owner-authorized exception, documented in [Shared provider credential](#shared-provider-credential-owner-authorized-exception) below. PostgreSQL and Keycloak are external existing services and are not provisioned by this chart or repository.
 
 ## Approval and promotion
 
@@ -45,3 +45,34 @@ the only access control on that path. Health there is ordinary Service
 behavior: only Ready web pods (the readiness probe on `/`) receive
 traffic, and there is no separate LoadBalancer health check. The worker
 never gets a LoadBalancer; its Service stays cluster-internal by design.
+
+## Shared provider credential (owner-authorized exception)
+
+As an explicit owner decision (2026-11-01), production and non-production may
+share one model-provider credential: the OpenRouter API key may hold the same
+value in both environments. Each environment still delivers it only through
+its own Kubernetes Secret — the Secrets themselves, their namespaces, and
+their delivery stay separate; only that one key's value is the same.
+
+This coupling is intentional and accepted, and it is the only exception to
+environment credential separation:
+
+- **Spend limits and revocation are shared.** Rate limits, quota, spend, and
+  revocation/rotation apply to both environments at once: exhausting or
+  revoking the key in one environment degrades or stops the other, and
+  rotating it means reconfiguring both.
+- **Exposure is shared.** Anyone who obtains the key from either environment
+  can use it against both; the blast radius of a leak is both environments'
+  provider usage. The owner has explicitly accepted this trade-off, including
+  the risk that the key in use has been exposed previously.
+- **Privacy posture is unchanged.** Provider-side data handling for requests
+  sent with the shared key is whatever the provider's policy makes of it; the
+  shared key does not change what data leaves the cluster, and non-provider
+  data boundaries are unaffected.
+
+Everything else remains strictly per-environment: databases, storage,
+side-effect boundaries, and all other credentials — the OIDC client secret,
+the session-signing secret, the web↔worker service tokens, and the
+non-production-only test-gate secret. Reversing this exception later (for
+example, issuing a distinct production key) is an owner decision and touches
+only that key's value in the production Secret.
