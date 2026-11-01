@@ -18,7 +18,7 @@ This repository contains architecture documentation, shared-library code ([`libr
 
 - Keep public documentation standalone, generic, and safe to publish. Do not include copied source, private infrastructure identifiers, sensitive usage descriptions, personal details, credentials, or links to non-public documents.
 - Keep local planning and configuration private. Local-only planning files are excluded from version control. Ignore rules are not a security boundary; review public content and secrets before any future publication.
-- Do not add secret values, local environment files, generated artifacts, or deployment credentials to the repository.
+- Do not add secrets — including generated secret keys and credentials — local environment files, or deployment credentials to the repository. Generated artifacts, AI-generated code, and product image assets are not categorically prohibited by this rule.
 
 ## Delivery constraints
 
