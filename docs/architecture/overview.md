@@ -8,12 +8,12 @@ Owner-only authorization belongs at the web BFF edge and is separate from domain
 
 ## Component boundaries
 
-- **Web/BFF:** Next.js, React, and MUI client and future authenticated request boundary. It presents the continuous thread and will enforce owner-only access at the BFF edge. A local-only, fixture-backed client preview exists in `apps/web`; the BFF itself is not implemented.
-- **Worker:** one deployable for durable background responsibilities. A first slice is implemented in `apps/worker` (see its README): durable grouped conversation work on PostgreSQL with OpenRouter response-pattern decisions preceding chat generation. Logical capabilities stay modular; premature service splits are avoided.
+- **Web/BFF:** Next.js, React, and MUI client and authenticated request boundary. It presents the continuous thread and enforces owner-only access at the BFF edge: OIDC authorization-code flow (PKCE, state, nonce) against the existing external Keycloak service through `openid-client`, signed-cookie sessions holding only the identity-provider subject, an explicit owner subject allowlist, and fail-closed behavior when configuration is missing. `apps/web` implements this edge and the live client; the BFF calls the worker's private HTTP API with a service-to-service credential and forwards no identity information.
+- **Worker:** one deployable for durable background responsibilities. A first slice is implemented in `apps/worker` (see its README): durable grouped conversation work on PostgreSQL with OpenRouter response-pattern decisions preceding chat generation, plus the private HTTP ingest/read API the web BFF calls — cluster-internal only, bearer-token authenticated, with idempotent message acceptance (conflicting key reuse rejected) and cursor-paged thread reads in persisted `seq` order (the status carries the allocation invariant — allocation is contiguous, so seqs below a committed seq are committed, in flight, or burned; the web client reconciles by re-deriving gaps between loaded seqs and walking pages downward with a bounded per-cycle budget and no timing assumption — and a sanitized trailing-failure flag that surfaces failed generations without error detail). Logical capabilities stay modular; premature service splits are avoided.
 - **Shared libraries:** reusable OpenRouter transport/capability adapters and PostgreSQL access concerns. Implemented so far: shared OpenRouter transport with typed Decisions and Chat contracts (`libraries/openrouter`), and PostgreSQL connection lifecycle, transactions, and a minimal migration runner over `pg` (`libraries/postgres`). Domain types, schemas, and queries stay with their domain owners; there is no generic shared-types library.
-- **Tests:** Node built-in unit coverage plus a database-backed worker integration suite run against an explicitly provided isolated non-production database; planned Vitest-oriented integration and Playwright-oriented end-to-end coverage remain future work, isolated from production.
+- **Tests:** Node built-in unit coverage plus database-backed worker integration suites (domain store and HTTP API) run against an explicitly provided disposable isolated non-production database; planned Vitest-oriented integration and Playwright-oriented end-to-end coverage remain future work, isolated from production.
 
-The web preview remains disconnected from the worker. Nothing is deployed. No queue library is used; durable work is implemented with PostgreSQL-backed leasing, and no model, hostname, or credential is committed.
+The web client and worker are now connected through the BFF and the worker's private HTTP API; nothing is deployed with this wiring yet. No queue library is used; durable work is implemented with PostgreSQL-backed leasing, and no model, hostname, or credential is committed.
 
 ## Data and model direction
 
@@ -56,4 +56,5 @@ The runner-free trigger/controller for this flow is unresolved and is not runnin
 - How shared infrastructure libraries map to deployment ownership.
 - Where deployment-specific behavior policies belong without embedding policy content in shared libraries.
 - Deployment trigger/controller, candidate serialization/isolation, and immutable artifact promotion mechanism.
-- When and how the web BFF connects to the worker's ingest and thread contracts.
+- BFF session hardening (rotation, revocation, IdP back-channel logout) and rate limiting at the BFF edge; TLS for the in-cluster BFF→worker hop if that boundary ever leaves the cluster network.
+- Whether the response-pattern/conversation schema should move to a shared domain home as more components need the same tables.

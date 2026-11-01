@@ -1,7 +1,9 @@
-# Companion web client image (Next.js). Built from the repository ROOT:
+# Companion web image (Next.js). Built from the repository ROOT:
 #   docker build -f deploy/docker/Dockerfile.web -t <registry>/companion/web:<tag> .
-# The preview is a static client surface with no backend and no environment
-# secrets; nothing is baked in beyond the build itself.
+# The image bakes in no configuration or secrets: the BFF's environment
+# (public URL, OIDC configuration, session secret, worker URL/token) is
+# supplied at runtime through the chart's env and existing-Secret references,
+# and the app fails closed when its configuration is incomplete.
 FROM node:22-alpine
 
 RUN corepack enable

@@ -5,7 +5,23 @@
 # environment-specific configuration supplied through a per-environment values
 # file, which this repository keeps outside version control (see
 # ../environments/README.md). Secret values are never accepted here; the
-# worker reads them from an existing Kubernetes Secret referenced by name.
+# deployables read them from existing Kubernetes Secrets referenced by name.
+
+# Deployment-purpose attestation, fail closed: every install must declare
+# exactly what it is and where it runs; unknown or missing values fail
+# rendering.
+deployment:
+  # Exactly "non-production" or "production". Deployment-specific
+  # capabilities key off it: the web test-entry gate renders only for
+  # "non-production", and the application refuses to open the gate for a
+  # "production" deployment at runtime.
+  purpose: ""
+  # The exact namespace this release is installed into. The chart fails
+  # rendering when it differs from the release namespace. The value is
+  # carried into the container, where the application re-verifies it against
+  # the Kubernetes-provided pod namespace (downward API) before the
+  # test-entry gate may open.
+  namespace: ""
 
 web:
   enabled: true
@@ -25,6 +41,50 @@ web:
     # Optional Traefik middlewares, referenced the way the target cluster
     # expects (for example "<name>@kubernetescrd").
     middlewares: []
+  # Name of an existing Secret in the release namespace that must provide the
+  # keys WEB_OIDC_CLIENT_SECRET, WEB_SESSION_SECRET, and WEB_WORKER_TOKEN.
+  # The chart never creates or templates secrets. The BFF fails closed at
+  # runtime when its configuration is incomplete; see apps/web/README.md.
+  existingSecret: ""
+  # Non-secret BFF environment configuration. These are required for the BFF
+  # to serve the conversation: WEB_PUBLIC_URL, WEB_OIDC_ISSUER_URL,
+  # WEB_OIDC_CLIENT_ID, WEB_OWNER_SUBJECTS (comma-separated identity-provider
+  # subjects of the owner). WEB_WORKER_URL is derived from the worker service
+  # when the worker is enabled; supply it here only when the worker is
+  # disabled. Empty values are skipped so a missing required variable fails
+  # closed in the web app's own validation instead of opening access.
+  # WEB_TEST_GATE_* variables are rejected here; the gate is configured
+  # only through the testGate block below.
+  env: {}
+  # Non-production-only test-entry gate for end-to-end testing (NEVER
+  # production). When enabled, the web container opens one additional HTTP
+  # listener bound strictly to 127.0.0.1 inside the pod's network
+  # namespace: unauthenticated full-application access (reading and sending
+  # real conversation, which can incur provider/model costs), reachable
+  # only through `kubectl port-forward` — a loopback-bound socket is not
+  # addressable through the ClusterIP Service or the Ingress. The gate is
+  # fail-closed (default off; checked at listener bind, on every request,
+  # at session issuance, and on every session use) and signs its own
+  # identity-free test sessions with a dedicated secret. See
+  # apps/web/README.md for the security model and the safe access
+  # procedure.
+  testGate:
+    # Production deployments must leave this disabled: the chart refuses to
+    # render the gate for a deployment.purpose of "production". Even when
+    # enabled, the listener is loopback-only and no Service, Ingress, or
+    # other route to it is ever created by this chart.
+    enabled: false
+    # Loopback listener port inside the pod; must differ from
+    # web.containerPort and web.service.port. Access with
+    # `kubectl port-forward -n <namespace> pod/<web-pod> 3100:3100` and use
+    # http://127.0.0.1:3100 locally.
+    port: 3100
+    # Name of an existing Secret in the release namespace that must provide
+    # the key WEB_TEST_GATE_SESSION_SECRET (at least 32 characters). It must
+    # be a DIFFERENT Secret from web.existingSecret — the test gate must
+    # never sign sessions with the owner session secret; rendering fails
+    # otherwise.
+    existingSecret: ""
   resources:
     requests:
       cpu: 50m
@@ -39,9 +99,17 @@ worker:
     repository: ""
     tag: ""
   replicas: 1
+  # Private HTTP API listener (the web BFF's service-to-service boundary).
+  # Exposed only through a cluster-internal Service; there is no ingress and
+  # no public route to it.
+  containerPort: 8080
+  service:
+    port: 8080
   # Name of an existing Secret in the release namespace that must provide the
-  # keys WORKER_DATABASE_URL and OPENROUTER_API_KEY. The chart never creates
-  # or templates secrets.
+  # keys WORKER_DATABASE_URL, OPENROUTER_API_KEY, and WORKER_API_TOKEN. The
+  # chart never creates or templates secrets. WORKER_API_TOKEN is the private
+  # service-to-service credential; the web deployment's WEB_WORKER_TOKEN must
+  # hold the same value.
   existingSecret: ""
   # Non-secret worker environment configuration (for example model ids).
   # Empty values are skipped so a missing required variable fails in the

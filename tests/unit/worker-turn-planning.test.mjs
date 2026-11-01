@@ -282,6 +282,7 @@ describe("worker configuration", () => {
     OPENROUTER_API_KEY: "test-key",
     WORKER_CHAT_MODEL: "chat-model",
     WORKER_DECISION_MODEL: "decision-model",
+    WORKER_API_TOKEN: "service-token",
   };
 
   it("applies provisional defaults for numeric and URL settings", () => {
@@ -293,6 +294,10 @@ describe("worker configuration", () => {
     assert.equal(config.openrouter.decisionTimeoutMs, 30000);
     assert.ok(config.openrouter.chatUrl.startsWith("https://"));
     assert.ok(config.openrouter.decisionsUrl.includes("decisions"));
+    // The private API listens cluster-internally by default and always
+    // requires its service credential.
+    assert.equal(config.http.host, "0.0.0.0");
+    assert.equal(config.http.port, 8080);
   });
 
   it("reports the offending variable for missing required values", () => {
@@ -306,6 +311,44 @@ describe("worker configuration", () => {
     );
     assert.throws(() => loadWorkerConfig({ ...validEnv, OPENROUTER_API_KEY: "" }));
     assert.throws(() => loadWorkerConfig({ ...validEnv, WORKER_CHAT_MODEL: "" }));
+  });
+
+  it("fails closed without the private API service credential", () => {
+    // No unauthenticated mode exists: an empty or missing token must refuse
+    // startup rather than serve the API openly.
+    for (const token of [undefined, ""]) {
+      assert.throws(
+        () => loadWorkerConfig({ ...validEnv, WORKER_API_TOKEN: token }),
+        (error) => {
+          assert.ok(error instanceof WorkerConfigError);
+          assert.ok(error.message.includes("WORKER_API_TOKEN"));
+          return true;
+        },
+        `expected rejection for token: ${String(token)}`,
+      );
+    }
+  });
+
+  it("parses the private API listener overrides", () => {
+    const config = loadWorkerConfig({
+      ...validEnv,
+      WORKER_HTTP_HOST: "127.0.0.1",
+      WORKER_HTTP_PORT: "9000",
+    });
+    assert.equal(config.http.host, "127.0.0.1");
+    assert.equal(config.http.port, 9000);
+    assert.throws(
+      () => loadWorkerConfig({ ...validEnv, WORKER_HTTP_PORT: "abc" }),
+      WorkerConfigError,
+    );
+    assert.throws(
+      () => loadWorkerConfig({ ...validEnv, WORKER_HTTP_PORT: "70000" }),
+      (error) => {
+        assert.ok(error instanceof WorkerConfigError);
+        assert.ok(error.message.includes("WORKER_HTTP_PORT"));
+        return true;
+      },
+    );
   });
 
   it("rejects malformed numbers and URLs", () => {

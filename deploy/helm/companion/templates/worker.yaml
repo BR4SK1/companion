@@ -1,7 +1,8 @@
+{{- include "companion.validateDeployment" . }}
 {{- if .Values.worker.enabled }}
 {{- $repository := required "worker.image.repository is required when worker is enabled" .Values.worker.image.repository -}}
 {{- $tag := required "worker.image.tag is required when worker is enabled" .Values.worker.image.tag -}}
-{{- $secret := required "worker.existingSecret is required when worker is enabled (must provide WORKER_DATABASE_URL and OPENROUTER_API_KEY keys)" .Values.worker.existingSecret -}}
+{{- $secret := required "worker.existingSecret is required when worker is enabled (must provide WORKER_DATABASE_URL, OPENROUTER_API_KEY, and WORKER_API_TOKEN keys)" .Values.worker.existingSecret -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -32,6 +33,9 @@ spec:
         - name: worker
           image: "{{ $repository }}:{{ $tag }}"
           imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: {{ .Values.worker.containerPort }}
           env:
             - name: WORKER_DATABASE_URL
               valueFrom:
@@ -43,15 +47,54 @@ spec:
                 secretKeyRef:
                   name: {{ $secret }}
                   key: OPENROUTER_API_KEY
+            {{- /* Private service-to-service credential for the HTTP API;
+            required (the worker fails closed without it). The web
+            deployment carries the same value as WEB_WORKER_TOKEN. */}}
+            - name: WORKER_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: WORKER_API_TOKEN
+            - name: WORKER_HTTP_PORT
+              value: {{ .Values.worker.containerPort | quote }}
             {{- range $key, $value := .Values.worker.env }}
             {{- if $value }}
             - name: {{ $key }}
               value: {{ $value | quote }}
             {{- end }}
             {{- end }}
-          {{- /* No HTTP probes: the worker runs no HTTP listener. Liveness is
-          process supervision (restartPolicy: Always); a failed startup exits
-          with a named-variable configuration error. */}}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
+---
+{{- /* Cluster-internal Service only: the BFF reaches the worker through
+the in-cluster DNS name. There is deliberately no Ingress and no
+LoadBalancer for the worker; its API is a private service-to-service
+surface guarded by the bearer token. */}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "companion.workerName" . }}
+  labels:
+    {{- include "companion.labels" . | nindent 4 }}
+    app.kubernetes.io/name: worker
+    app.kubernetes.io/component: worker
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: worker
+  ports:
+    - name: http
+      port: {{ .Values.worker.service.port }}
+      targetPort: http
 {{- end }}

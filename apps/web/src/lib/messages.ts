@@ -12,7 +12,7 @@ export type MessageRole = "user" | "assistant";
 
 /** A locally stored fixture image attached to a message. Uploads are out of scope. */
 export interface MessageImage {
-  /** Static asset path served by this app (e.g. "/fixtures/example.svg"). */
+  /** Static asset path served by this app, when images are present. */
   readonly src: string;
   /** Human-readable description announced to assistive technology. */
   readonly alt: string;
