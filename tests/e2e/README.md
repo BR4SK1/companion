@@ -129,6 +129,15 @@ on the turn's own recorded request rather than on request counts:
    continuity with the failed message still in later context, connection-error
    state and recovery while the worker is paused, and a send that failed
    while the worker was unreachable retried idempotently.
+6. `06-pwa` — the PWA static assets (manifest, service worker, offline page,
+   icons) publicly reachable and user-agnostic on both channels, the
+   document head's manifest link and Apple metadata, service worker
+   registration in the production build with its cache holding exactly the
+   one offline page under its own prefix, the offline fallback shown for a
+   failed top-level navigation and recovery once back online, the BFF's
+   `/api` surface never intercepted (subresource fetches and top-level
+   navigations alike), and HTTP error responses preserved. No messages are
+   sent; no provider traffic occurs.
 
 ## Deployed non-production smoke (separately authorized; real billable provider)
 
