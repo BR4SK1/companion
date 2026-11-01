@@ -18,7 +18,7 @@ This repository contains architecture documentation, shared-library code ([`libr
 
 - Keep public documentation standalone, generic, and safe to publish. Do not include copied source, private infrastructure identifiers, sensitive usage descriptions, personal details, credentials, or links to non-public documents.
 - Keep local planning and configuration private. Local-only planning files are excluded from version control. Ignore rules are not a security boundary; review public content and secrets before any future publication.
-- Do not add secret values, local environment files, generated artifacts, or deployment credentials to the repository.
+- Do not add secrets — including generated secret keys and credentials — local environment files, or deployment credentials to the repository. Generated artifacts, AI-generated code, and product image assets are not categorically prohibited by this rule.
 
 ## Delivery constraints
 
@@ -28,6 +28,8 @@ This repository contains architecture documentation, shared-library code ([`libr
 - Non-production and production require separate databases, secrets, storage, and side-effect boundaries. Account for restart/order/idempotency testing, migration compatibility and recovery, and serialization or isolation of concurrent non-production candidates.
 - Narrow, explicit owner exception to that separation (2026-11-01 decision): the OpenRouter provider API key may hold the same value in non-production and production, each still delivered only through its own per-environment Kubernetes Secret. This is an owner choice, not a default, and it weakens nothing else: the databases, storage, side-effect boundaries, and every other credential (OIDC client secret, session-signing secret, service-to-service tokens, test-gate secret) remain strictly per-environment. The trade-off is documented and accepted: with one shared provider key, spend limits, revocation, and exposure are coupled across both environments — exhausting, revoking, or exposing the key in either environment affects both — and the owner has explicitly accepted that, including the risk that the key in use has been exposed previously.
 - A runner-free deployment trigger/controller is unresolved and not running. A merge does not currently deploy. Never claim a deployment or production approval occurred unless verified.
+- Local and disposable E2E environments remain fake-provider only; they are the default for local validation and are distinct from deployed validation. Deployed non-production E2E validation before a pull request must always include the billable deployed non-production provider smoke test against the real provider — it is a required step, not a skippable one. If it cannot be run or does not pass, stop the delivery workflow and report the blocker rather than proceeding toward a pull request.
+- That deployed provider smoke test is a real-provider call: it incurs cost and performs writes and cleanup against non-production. It additionally requires separate owner authorization for the call itself, plus the operator's own explicit acknowledgment of exclusive dev access before anyone may treat or claim operator exclusivity as confirmed. Do not imply operator exclusivity without that confirmation, and do not authorize or perform the call on the owner's behalf.
 - No production access or production provisioning is required for scaffold or contract-level work.
 
 ## Delegation and handoff

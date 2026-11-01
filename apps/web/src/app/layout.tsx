@@ -3,6 +3,7 @@ import type { Metadata, Viewport } from "next";
 import { AppRouterCacheProvider } from "@mui/material-nextjs/v16-appRouter";
 import { InitColorSchemeScript } from "@mui/material";
 
+import { RegisterServiceWorker } from "@/components/register-service-worker";
 import { AppProviders } from "@/theme/app-providers";
 import {
   COLOR_SCHEME_STORAGE_KEY,
@@ -18,6 +19,20 @@ export const metadata: Metadata = {
     "Private companion conversation. Owner sign-in required; the thread is served only to the authenticated owner.",
   // A private single-owner app is not meant to be indexed or shared as a page.
   robots: { index: false, follow: false },
+  // Installable web app (PWA). The manifest (app/manifest.ts) and the Apple
+  // home-screen metadata are static, user-agnostic values; the icons are
+  // generated from source-defined drawing code by the app/icon.ts and
+  // app/apple-icon.ts conventions (src/lib/icons.ts).
+  manifest: "/manifest.webmanifest",
+  applicationName: "Companion",
+  appleWebApp: {
+    capable: true,
+    title: "Companion",
+    // "default" keeps iOS status-bar text readable in both themes. Whether
+    // the bar overlaps content is device- and mode-dependent, and the header
+    // already pads by env(safe-area-inset-top) under viewportFit: "cover".
+    statusBarStyle: "default",
+  },
 };
 
 export const viewport: Viewport = {
@@ -55,6 +70,7 @@ export default function RootLayout({
         <AppRouterCacheProvider options={{ key: "mui" }}>
           <AppProviders>{children}</AppProviders>
         </AppRouterCacheProvider>
+        <RegisterServiceWorker />
       </body>
     </html>
   );

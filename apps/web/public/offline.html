@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Companion — offline</title>
+    <style>
+      /* Self-contained fallback page: no external assets, scripts, or fonts,
+         so it renders with no network access at all. Colors follow the app
+         theme's background/primary scheme colors (src/theme/theme.ts). */
+      html {
+        color-scheme: light dark;
+      }
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #f4f3f9;
+        color: #2b2b33;
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        padding: 24px;
+        box-sizing: border-box;
+        text-align: center;
+      }
+      @media (prefers-color-scheme: dark) {
+        body {
+          background: #121218;
+          color: #e6e8eb;
+        }
+      }
+      h1 {
+        font-size: 1.25rem;
+        margin: 0 0 0.5rem;
+      }
+      p {
+        margin: 0 0 1.25rem;
+        line-height: 1.5;
+        color: #59636e;
+      }
+      @media (prefers-color-scheme: dark) {
+        p {
+          color: #9ba1a9;
+        }
+      }
+      button {
+        font: inherit;
+        padding: 0.5rem 1.25rem;
+        border-radius: 12px;
+        border: none;
+        background: #5b4bc4;
+        color: #ffffff;
+        cursor: pointer;
+      }
+      button:active {
+        opacity: 0.85;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>You're offline</h1>
+      <p>
+        Companion needs a connection to show your conversation and to sign
+        in. Nothing was cached here. Reconnect and try again.
+      </p>
+      <button type="button" onclick="location.reload()">Retry</button>
+    </main>
+  </body>
+</html>
