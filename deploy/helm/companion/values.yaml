@@ -41,6 +41,27 @@ web:
     # Optional Traefik middlewares, referenced the way the target cluster
     # expects (for example "<name>@kubernetescrd").
     middlewares: []
+  # Optional K3s ServiceLB (LoadBalancer) Service for the web client: it
+  # publishes the Service port directly on the node host, bypassing the
+  # Traefik ingress and every middleware configured on it. See the chart
+  # README for the health and security implications of that direct path.
+  loadBalancer:
+    # Disabled by default, and production-gated: the chart refuses to render
+    # it unless deployment.purpose is exactly "production", so a
+    # non-production release can never expose the web client on a host port
+    # (its only public route is the Traefik Ingress). Because the
+    # non-production-only test gate requires a non-production purpose, the
+    # gate and this Service can never render in the same release.
+    enabled: false
+    # Node host port that K3s ServiceLB binds for the web client (the
+    # Service's published port; traffic reaches the web container's HTTP
+    # port). Required when enabled — there is deliberately no default — and
+    # it must be an integer between 1 and 65535 that differs from
+    # web.service.port. Choose it under the hosting environment's host-port
+    # policy and keep it unique across that environment's published
+    # services; the chart cannot detect a host-port collision between
+    # different releases.
+    hostPort: ""
   # Name of an existing Secret in the release namespace that must provide the
   # keys WEB_OIDC_CLIENT_SECRET, WEB_SESSION_SECRET, and WEB_WORKER_TOKEN.
   # The chart never creates or templates secrets. The BFF fails closed at

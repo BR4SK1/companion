@@ -55,6 +55,23 @@ application re-verifies at runtime:
   namespace equals the kubelet-provided pod namespace.
 - `templates/ingress.yaml` — optional Traefik Ingress; hostname and
   middlewares are per-environment values.
+- `templates/web-loadbalancer.yaml` — optional, **production-gated** K3s
+  ServiceLB (LoadBalancer) Service for the web client, disabled by default.
+  It renders only when `web.loadBalancer.enabled` is true AND
+  `deployment.purpose` is exactly `production`: any other purpose fails
+  rendering, so a non-production release can never publish the web client
+  on a host port (its only public route there is the Traefik Ingress). It
+  requires an explicit `web.loadBalancer.hostPort` — no default, an integer
+  from 1 to 65535 that must differ from `web.service.port` — because the
+  host port is environment-specific infrastructure; choose it under the
+  hosting environment's host-port policy and keep it unique across that
+  environment's published services (the chart cannot detect a host-port
+  collision between releases). The Service carries the web Service's
+  release-scoped selector, so it can only ever select its own release's web
+  pods. Because the non-production-only test gate requires a
+  non-production purpose, the gate and this Service can never render in the
+  same release. The worker never gets a LoadBalancer: its Service stays
+  cluster-internal by design.
 - `templates/worker.yaml` — worker Deployment plus a **cluster-internal**
   ClusterIP Service (the web BFF's service-to-service boundary; there is
   deliberately no Ingress, LoadBalancer, or public route to the worker) with
@@ -89,6 +106,16 @@ Template boundary details:
 - Secret values are never templated. Both deployables reference an existing
   Secret by name and fail (at startup or render time) when configuration is
   incomplete.
+- The optional web LoadBalancer path bypasses Traefik entirely: K3s
+  ServiceLB binds the configured host port on every node and forwards
+  straight to the web pods, so nothing enforced by Traefik middlewares
+  (rate limits, security headers, allowlists) applies on that path. The web
+  BFF's owner-only authentication remains the only access control there,
+  and the published port is plain HTTP on the host network (TLS
+  termination happens upstream, for example at a tunnel). Health on that
+  path is ordinary Service behavior: only Ready endpoints (the web
+  readiness probe on `/`) receive traffic, and there is no separate
+  LoadBalancer health check. The worker has no such path at all.
 
 Template boundary details:
 

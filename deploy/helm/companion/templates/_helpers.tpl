@@ -12,6 +12,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{ printf "%s-web" .Release.Name }}
 {{- end -}}
 
+{{- define "companion.webLbName" -}}
+{{ printf "%s-web-lb" .Release.Name }}
+{{- end -}}
+
 {{- define "companion.workerName" -}}
 {{ printf "%s-worker" .Release.Name }}
 {{- end -}}

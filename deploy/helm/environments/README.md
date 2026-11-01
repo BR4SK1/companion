@@ -3,7 +3,14 @@
 Non-production and production responsibilities are described separately in
 [`non-production`](non-production/README.md) and
 [`production`](production/README.md). The two environments must have separate
-databases, secrets, storage, and side-effect boundaries. PostgreSQL and
+databases, secrets, storage, and side-effect boundaries — with one narrow,
+owner-authorized exception: the OpenRouter provider API key may hold the same
+value in both environments, each still delivered only through that
+environment's own Kubernetes Secret. That key's spend limits, revocation, and
+exposure are thereby shared between the environments, and the owner has
+explicitly accepted that trade-off, including the risk that the key in use
+has been exposed previously; every other credential stays per-environment.
+PostgreSQL and
 Keycloak remain externally managed, outside K3s.
 
 Environment-specific values — registry paths, image tags, ingress hostnames,
