@@ -36,6 +36,7 @@ This repository contains architecture documentation, shared-library code ([`libr
 
 - The active primary agent owns user clarification and authorization. A delegated agent continues routine work within its authorized scope; it does not start a separate user conversation.
 - Return blockers, consequential product/design/deployment choices, scope changes, and access requirements to the primary agent for resolution before continuing the affected work. Do not make those decisions or grant approvals on the primary's behalf.
+- Skill trigger: when the user asks to "ship it" or "ship this" for Companion, load the [`ship-it`](.opencode/skills/ship-it/README.md) skill and follow it for that request. Discussing, quoting, or merely referring to the phrase or the skill is not itself a request to ship. This trigger confers no authorization by itself and does not replace any instruction here: existing permissions, boundaries, and delivery constraints still apply, and no delivery step proceeds without the user's explicit request and the repository's required gates.
 - Skills provide reusable guidance only; they do not replace repository instructions, permissions, credentials, or explicit task authorization.
 
 ## Process adherence

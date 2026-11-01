@@ -139,7 +139,7 @@ on the turn's own recorded request rather than on request counts:
    navigations alike), and HTTP error responses preserved. No messages are
    sent; no provider traffic occurs.
 
-## Deployed non-production smoke (separately authorized; real billable provider)
+## Deployed non-production smoke (explicitly authorized; real billable provider)
 
 `deployed-dev-smoke.mjs` is deliberately separate from everything above: the
 Playwright suite runs against a disposable local stack and a fake provider,
@@ -152,7 +152,16 @@ synthetic user message's worth of real, billable OpenRouter calls**.
   the billable provider call and the non-production database write) and
   `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` (the operator's explicit
   acknowledgement that the dev stack is exclusively theirs for this run):
-  running it is an explicit, separately authorized act.
+  running it is always an explicitly authorized act. Where that
+  authorization comes from depends on the context: outside this
+  repository's ship-it flow it is granted per run; within the ship-it flow
+  it is the owner's standing authorization (recorded 2026-11-01 in
+  [`../../.opencode/skills/ship-it/SKILL.md`](../../.opencode/skills/ship-it/SKILL.md)),
+  which covers this smoke's billable non-production provider calls and its
+  non-production database write, resting on the owner's affirmation that the
+  non-production environment and the accounts associated with this project
+  belong to the owner and are not shared. Both variables remain required in
+  every context, and nothing in the script's guards changes with context.
 - Exclusivity is an operator assertion, NOT a system enforcement. The
   system cannot prevent another user's message from being ingested before or
   during the run, and the worker's chat request includes the thread's
@@ -205,7 +214,8 @@ synthetic user message's worth of real, billable OpenRouter calls**.
   nothing-to-clean. Cleanup and post-state verification run even when the
   browser journey fails.
 
-Run (only after explicit authorization, both variables):
+Run (both variables required in every context — see the authorization note
+above):
 
 ```sh
 E2E_DEPLOYED_SMOKE_ALLOWED=1 E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1 \
