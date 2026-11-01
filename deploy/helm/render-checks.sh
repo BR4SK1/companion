@@ -10,7 +10,12 @@
 #      name + valueFrom), including the deployment-purpose attestation
 #      (declared purpose/namespace plus the downward-API pod namespace) and
 #      — when the gate is enabled — the gate variables from the separate
-#      secret.
+#      secret. No LoadBalancer Service renders by default (gate-disabled,
+#      gate-enabled, or plain production); with the optional web
+#      LoadBalancer enabled for a production purpose, exactly one
+#      LoadBalancer Service renders, named `*-web-lb`, web-labeled, with a
+#      release-scoped selector and the configured host port → the web
+#      targetPort — and it is the only LoadBalancer Service in the render.
 # Render-guard checks (helm fails rendering):
 #   1. missing/unknown deployment purpose or namespace, and a declared
 #      namespace differing from the release namespace, fail rendering;
@@ -24,7 +29,11 @@
 #      rendering, and the port must be an integer between 1 and 65535
 #      (0, negative, and > 65535 fail; 1 and 65535 are accepted);
 #   6. sneaking WEB_TEST_GATE_* or COMPANION_* variables through web.env
-#      fails rendering.
+#      fails rendering;
+#   7. the optional web LoadBalancer Service is production-gated (it fails
+#      to render for a non-production purpose), requires an explicit host
+#      port, rejects out-of-range ports (1 and 65535 render) and a host
+#      port equal to the ClusterIP service port.
 #
 # Usage: deploy/helm/render-checks.sh   (requires `helm` and `python3` with
 # PyYAML)
@@ -36,6 +45,15 @@ RELEASE_NAMESPACE="companion-np"
 BASE_SETS='deployment.purpose=non-production,deployment.namespace=companion-np,web.image.repository=registry.example/companion/web,web.image.tag=candidate,web.existingSecret=web-secrets,web.ingress.host=app.example.com,web.env.WEB_PUBLIC_URL=https://companion.example.com,web.env.WEB_OIDC_ISSUER_URL=https://keycloak.example.com/realms/companion,web.env.WEB_OIDC_CLIENT_ID=companion-web,web.env.WEB_OWNER_SUBJECTS=owner-subject,worker.image.repository=registry.example/companion/worker,worker.image.tag=candidate,worker.existingSecret=worker-secrets'
 
 GATE_SETS='web.testGate.enabled=true,web.testGate.existingSecret=web-test-gate-secrets'
+
+# Production-flavored base set (same values, purpose=production).
+PROD_SETS="$(printf '%s' "$BASE_SETS" | sed 's/deployment.purpose=non-production/deployment.purpose=production/')"
+
+# Test value for the optional web LoadBalancer host port. Arbitrary
+# render-check value, not any real environment's assignment.
+LB_TEST_PORT=5150
+
+LB_SETS="web.loadBalancer.enabled=true,web.loadBalancer.hostPort=$LB_TEST_PORT"
 
 pass() { echo "ok    - $1"; }
 fail() { echo "FAIL  - $1"; exit 1; }
@@ -54,14 +72,16 @@ render "$BASE_SETS" > "$TMPDIR_CHECK/disabled.yaml"
 # 0b. Gate-enabled render.
 render "$BASE_SETS,$GATE_SETS" > "$TMPDIR_CHECK/enabled.yaml"
 # 0c. Production render without the gate.
-render "$(printf '%s' "$BASE_SETS" | sed 's/deployment.purpose=non-production/deployment.purpose=production/')" > "$TMPDIR_CHECK/production.yaml"
+render "$PROD_SETS" > "$TMPDIR_CHECK/production.yaml"
+# 0d. Production render with the optional web LoadBalancer Service enabled.
+render "$PROD_SETS,$LB_SETS" > "$TMPDIR_CHECK/lb.yaml"
 
-python3 - "$TMPDIR_CHECK/disabled.yaml" "$TMPDIR_CHECK/enabled.yaml" "$TMPDIR_CHECK/production.yaml" <<'PYEOF'
+python3 - "$TMPDIR_CHECK/disabled.yaml" "$TMPDIR_CHECK/enabled.yaml" "$TMPDIR_CHECK/production.yaml" "$TMPDIR_CHECK/lb.yaml" <<'PYEOF'
 import sys
 
 import yaml
 
-disabled_path, enabled_path, production_path = sys.argv[1:4]
+disabled_path, enabled_path, production_path, lb_path = sys.argv[1:5]
 
 
 def load(path):
@@ -85,6 +105,15 @@ def container_of(deployment):
     containers = deployment["spec"]["template"]["spec"]["containers"]
     assert len(containers) == 1, f"expected exactly one container, got {len(containers)}"
     return containers[0]
+
+
+def loadbalancer_services(docs):
+    return [
+        doc
+        for doc in docs
+        if doc.get("kind") == "Service"
+        and doc.get("spec", {}).get("type") == "LoadBalancer"
+    ]
 
 
 def check_ports(container, expected):
@@ -189,6 +218,55 @@ check_env(
     "companion-np",
 )
 print("ok    - production Deployment: renders normally with purpose=production and no gate variables")
+
+# No LoadBalancer Service renders by default, whatever the purpose or gate.
+for label, docs in (
+    ("gate-disabled", disabled_docs),
+    ("gate-enabled", enabled_docs),
+    ("production", production_docs),
+):
+    assert loadbalancer_services(docs) == [], (
+        f"{label} render must contain no LoadBalancer Service by default"
+    )
+print("ok    - no LoadBalancer Service renders by default (gate-disabled, gate-enabled, production)")
+
+# With the LoadBalancer explicitly enabled for a production purpose,
+# exactly one narrow LoadBalancer Service renders next to the ClusterIP.
+lb_docs = load(lb_path)
+lb_services = loadbalancer_services(lb_docs)
+assert len(lb_services) == 1, f"expected exactly one LoadBalancer Service, got {len(lb_services)}"
+lb = lb_services[0]
+assert lb["metadata"]["name"].endswith("-web-lb"), f"LoadBalancer Service name: {lb['metadata']['name']}"
+lb_labels = lb["metadata"].get("labels", {})
+assert (
+    lb_labels.get("app.kubernetes.io/name") == "web"
+    and lb_labels.get("app.kubernetes.io/component") == "web"
+), f"LoadBalancer Service labels: {lb_labels}"
+# Release-scoped selector: this Service can only ever select this release's
+# own web pods, never another release's (selectors never cross namespaces).
+assert lb["spec"]["selector"] == {
+    "app.kubernetes.io/instance": "companion",
+    "app.kubernetes.io/name": "web",
+}, f"LoadBalancer selector must be release-scoped to the web pods: {lb['spec']['selector']}"
+lb_ports = lb["spec"]["ports"]
+assert len(lb_ports) == 1, f"expected exactly one LoadBalancer port, got {lb_ports}"
+lb_port = lb_ports[0]
+assert set(lb_port.keys()) <= {"name", "port", "targetPort", "protocol"}, (
+    f"LoadBalancer port object has unexpected keys: {lb_port}"
+)
+assert lb_port.get("name") == "http", lb_port
+assert lb_port.get("port") == 5150, lb_port
+assert lb_port.get("targetPort") == "http", lb_port
+# The LoadBalancer is additive: the web ClusterIP Service still renders.
+clusterips = [
+    doc
+    for doc in lb_docs
+    if doc.get("kind") == "Service"
+    and doc.get("spec", {}).get("type", "ClusterIP") == "ClusterIP"
+    and doc["metadata"]["name"].endswith("-web")
+]
+assert len(clusterips) == 1, f"expected the web ClusterIP Service to still render, got {len(clusterips)}"
+print("ok    - LoadBalancer Service: exactly one, web-labeled, release-scoped selector, host port -> targetPort http, alongside the ClusterIP")
 PYEOF
 pass "structural Deployment checks (ports vs env, attestation injection) passed for disabled/enabled/production renders"
 
@@ -233,6 +311,26 @@ render_must_fail "$BASE_SETS,web.env.WEB_TEST_GATE_ENABLED=true"
 pass "WEB_TEST_GATE_* variables through web.env fail rendering"
 render_must_fail "$BASE_SETS,web.env.COMPANION_DEPLOYMENT_PURPOSE=non-production"
 pass "COMPANION_* variables through web.env fail rendering"
+
+# 5a. The optional web LoadBalancer Service is production-gated and explicit.
+render_must_fail "$BASE_SETS,$LB_SETS"
+pass "the web LoadBalancer Service fails to render for a non-production deployment purpose"
+render_must_fail "$PROD_SETS,web.loadBalancer.enabled=true"
+pass "an enabled web LoadBalancer without an explicit hostPort fails rendering"
+render "$PROD_SETS,web.loadBalancer.hostPort=$LB_TEST_PORT" > /dev/null
+pass "a web LoadBalancer hostPort without enabled=true renders nothing (still disabled by default)"
+render_must_fail "$PROD_SETS,web.loadBalancer.enabled=true,web.loadBalancer.hostPort=3000"
+pass "a web LoadBalancer hostPort equal to web.service.port fails rendering"
+for bad_lb_port in 0 -1 65536 70000; do
+  render_must_fail "$PROD_SETS,web.loadBalancer.enabled=true,web.loadBalancer.hostPort=$bad_lb_port"
+  pass "an out-of-range web LoadBalancer hostPort ($bad_lb_port) fails rendering"
+done
+for boundary_lb_port in 1 65535; do
+  render "$PROD_SETS,web.loadBalancer.enabled=true,web.loadBalancer.hostPort=$boundary_lb_port" > /dev/null
+  pass "the range boundary web LoadBalancer hostPort ($boundary_lb_port) renders"
+done
+render_must_fail "$PROD_SETS,$GATE_SETS,$LB_SETS"
+pass "the test gate and the web LoadBalancer can never render in the same release"
 
 # 6. Defaults without purpose/namespace fail (the contract is required).
 render_must_fail 'web.image.repository=registry.example/companion/web'

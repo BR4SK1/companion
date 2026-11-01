@@ -27,3 +27,21 @@ purpose and the downward-API pod namespace at runtime and refuses to open
 the gate for a `production` deployment, and its sessions require a
 dedicated secret in a separate Secret — the chart refuses to render the
 gate pointing at the owner session secret.
+
+Publishing the web client on a node host port (for example as a tunnel's
+target) uses the chart's optional `web.loadBalancer` Service, which is
+disabled by default and production-gated: it renders only for
+`deployment.purpose: production` with an explicit
+`web.loadBalancer.hostPort` (an integer from 1 to 65535 that must differ
+from `web.service.port`; the chart cannot detect a host-port collision
+between releases, so choose it under the hosting environment's host-port
+policy and keep it unique across that environment's published services).
+Enabling it bypasses the Traefik ingress and its middlewares entirely:
+nothing Traefik enforces on the ingress route — rate limits, security
+headers, allowlists — applies on the LoadBalancer path, the published port
+is plain HTTP on the host network (TLS termination happens upstream, for
+example at a tunnel), and the web BFF's owner-only authentication remains
+the only access control on that path. Health there is ordinary Service
+behavior: only Ready web pods (the readiness probe on `/`) receive
+traffic, and there is no separate LoadBalancer health check. The worker
+never gets a LoadBalancer; its Service stays cluster-internal by design.

@@ -1,0 +1,47 @@
+{{- include "companion.validateDeployment" . }}
+{{- if and .Values.web.enabled .Values.web.loadBalancer.enabled }}
+{{- /* Optional, production-gated K3s ServiceLB (LoadBalancer) Service for
+the web client. Disabled by default; rendering fails for any
+deployment.purpose other than exactly "production", so a non-production
+release can never expose the web client on a node host port — its only
+public route there is the Traefik Ingress (with its middlewares). Because
+the non-production-only test gate requires a non-production purpose, the
+gate and this Service can never render in the same release. This path
+bypasses Traefik entirely: nothing enforced by Traefik middlewares
+(rate limits, headers, allowlists) applies here, so the web BFF's
+owner-only authentication remains the only access control. The host port is
+required and validated — no generic default — because it is
+environment-specific infrastructure (choose it under the hosting
+environment's host-port policy; the chart cannot detect collisions between
+releases). Health: like any Service, only Ready endpoints receive traffic,
+so the web readiness probe on "/" gates this path; there is no separate
+LoadBalancer health check. */}}
+{{- $purpose := .Values.deployment.purpose -}}
+{{- if ne $purpose "production" }}{{ fail (printf "web.loadBalancer.enabled is production-gated: it requires deployment.purpose to be exactly \"production\", got %s; a non-production release must not expose the web client on a host port" $purpose) }}{{ end }}
+{{- $lbHostPort := int .Values.web.loadBalancer.hostPort -}}
+{{- if or (lt $lbHostPort 1) (gt $lbHostPort 65535) }}{{ fail (printf "web.loadBalancer.hostPort must be an integer between 1 and 65535 when web.loadBalancer is enabled, got %s" (toString .Values.web.loadBalancer.hostPort)) }}{{ end }}
+{{- if eq $lbHostPort (int .Values.web.service.port) }}{{ fail (printf "web.loadBalancer.hostPort (%d) must differ from web.service.port (%d): the LoadBalancer Service and the ClusterIP Service must stay unambiguous" $lbHostPort (int .Values.web.service.port)) }}{{ end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "companion.webLbName" . }}
+  labels:
+    {{- include "companion.labels" . | nindent 4 }}
+    app.kubernetes.io/name: web
+    app.kubernetes.io/component: web
+spec:
+  type: LoadBalancer
+  {{- /* The same release-scoped selector as the web ClusterIP Service:
+  this Service can only ever select this release's own web pods, never
+  another release's (Kubernetes selectors never cross namespaces, and the
+  instance label separates releases sharing a namespace). */}}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: web
+  ports:
+    - name: http
+      # K3s ServiceLB (klipper-lb) binds the Service port on every node
+      # host; targetPort forwards to the web container's HTTP port.
+      port: {{ $lbHostPort }}
+      targetPort: http
+{{- end }}

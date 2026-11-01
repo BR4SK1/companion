@@ -2,7 +2,8 @@
 
 Application containers target K3s. The Helm organization is
 [`helm/companion`](helm/companion) — the application chart (web and worker
-Deployments, ClusterIP Services, optional web Ingress) with
+Deployments, ClusterIP Services, optional web Ingress, and an optional
+production-gated, disabled-by-default web LoadBalancer Service) with
 [`helm/environments`](helm/environments) documenting environment separation
 and where environment-specific values live. PostgreSQL and Keycloak are
 external existing services and must never be added as chart dependencies or
