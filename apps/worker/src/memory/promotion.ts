@@ -646,10 +646,10 @@ const PROMOTION_ITEM_COLUMNS = `promotion_id, promotion_item_id, canonical_obser
   source_artifact_updated_at, outcome`;
 
 async function getPromotionItems(
-  pool: PostgresPool,
+  executor: SqlExecutor,
   promotionId: string,
 ): Promise<PromotionItem[]> {
-  const result = await pool.query<PromotionItemRow>(
+  const result = await executor.query<PromotionItemRow>(
     `SELECT ${PROMOTION_ITEM_COLUMNS} FROM memory_promotion_item
      WHERE promotion_id = $1 ORDER BY canonical_identity_key`,
     [promotionId],
@@ -686,43 +686,33 @@ async function getPromotion(
   return result.rows[0] ?? null;
 }
 
-async function insertPromotion(
-  pool: PostgresPool,
-  manifest: {
-    promotionId: string;
-    runId: string;
-    observationSetId: string;
-    factSetId: string;
-    sourcePlanHash: string;
-    confirmationToken: string;
-    itemCount: number;
-    promotionSequence: number;
-    allowReactivation: boolean;
-  },
-): Promise<boolean> {
-  const result = await pool.query(
-    `INSERT INTO memory_promotion
-       (promotion_id, run_id, observation_set_id, fact_set_id,
-        canonicalization_version, evidence_policy_version, source_plan_hash,
-        confirmation_token, item_count, promotion_sequence, allow_reactivation, status)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'staged')
-     ON CONFLICT (promotion_id) DO NOTHING
-     RETURNING promotion_id`,
-    [
-      manifest.promotionId,
-      manifest.runId,
-      manifest.observationSetId,
-      manifest.factSetId,
-      CANONICALIZATION_VERSION,
-      CANONICAL_EVIDENCE_POLICY_VERSION,
-      manifest.sourcePlanHash,
-      manifest.confirmationToken,
-      manifest.itemCount,
-      manifest.promotionSequence,
-      manifest.allowReactivation,
-    ],
+async function getPromotionForUpdate(
+  executor: SqlExecutor,
+  promotionId: string,
+): Promise<{
+  promotion_id: string;
+  source_plan_hash: string;
+  confirmation_token: string;
+  item_count: number;
+  promotion_sequence: number | null;
+  allow_reactivation: boolean;
+  status: string;
+} | null> {
+  const result = await executor.query<{
+    promotion_id: string;
+    source_plan_hash: string;
+    confirmation_token: string;
+    item_count: number;
+    promotion_sequence: number | null;
+    allow_reactivation: boolean;
+    status: string;
+  }>(
+    `SELECT promotion_id, source_plan_hash, confirmation_token, item_count,
+            promotion_sequence, allow_reactivation, status
+     FROM memory_promotion WHERE promotion_id = $1 FOR UPDATE`,
+    [promotionId],
   );
-  return result.rows[0] !== undefined;
+  return result.rows[0] ?? null;
 }
 
 async function updatePromotion(
@@ -753,11 +743,11 @@ async function updatePromotion(
 }
 
 async function upsertPromotionItems(
-  pool: PostgresPool,
+  executor: SqlExecutor,
   items: readonly PromotionItem[],
 ): Promise<void> {
   for (const item of items) {
-    await pool.query(
+    await executor.query(
       `INSERT INTO memory_promotion_item
          (promotion_id, promotion_item_id, canonical_observation_id,
           canonical_identity_key, content_hash, observation_key, subject_id, kind,
@@ -1117,81 +1107,109 @@ async function ensurePromotionManifest(
   pool: PostgresPool,
   plan: PromotionPlan,
 ): Promise<{ promotionSequence: number; status: string; sourcePlanHash: string }> {
-  let existing = await getPromotion(pool, plan.promotionId);
-  if (existing === null) {
-    const sequenceResult = await pool.query<{ seq: number }>(
-      `SELECT nextval('memory_promotion_sequence')::int AS seq`,
-    );
-    const sequence = sequenceResult.rows[0]!.seq;
-    await insertPromotion(pool, {
-      promotionId: plan.promotionId,
-      runId: plan.runId,
-      observationSetId: plan.observationSetId,
-      factSetId: plan.factSetId,
-      sourcePlanHash: plan.sourcePlanHash,
-      confirmationToken: plan.confirmationToken,
-      itemCount: plan.itemCount,
-      promotionSequence: sequence,
-      allowReactivation: false,
-    });
-    existing = await getPromotion(pool, plan.promotionId);
+  // Atomic staging: the manifest row and its COMPLETE item set commit
+  // together or not at all, under a row lock that serializes concurrent
+  // stagings of the same promotion. A crash can therefore leave either no
+  // manifest at all (the next attempt plans and stages fresh) or a complete
+  // staged manifest (resumable from its staged items) — never a manifest
+  // whose stored items disagree with its declared item count. That
+  // disagreement is unrecoverable by design elsewhere: the resumable path
+  // rejects it (the staged set is the immutable recovery basis) and would
+  // reject every retry forever, making re-staging unreachable.
+  return withTransaction(pool, async (client) => {
+    let existing = await getPromotionForUpdate(client, plan.promotionId);
     if (existing === null) {
-      throw new Error("Promotion manifest disappeared after a duplicate-key race");
+      const sequenceResult = await client.query<{ seq: number }>(
+        `SELECT nextval('memory_promotion_sequence')::int AS seq`,
+      );
+      const sequence = sequenceResult.rows[0]!.seq;
+      await client.query(
+        `INSERT INTO memory_promotion
+           (promotion_id, run_id, observation_set_id, fact_set_id,
+            canonicalization_version, evidence_policy_version, source_plan_hash,
+            confirmation_token, item_count, promotion_sequence, allow_reactivation, status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'staged')
+         ON CONFLICT (promotion_id) DO NOTHING`,
+        [
+          plan.promotionId,
+          plan.runId,
+          plan.observationSetId,
+          plan.factSetId,
+          CANONICALIZATION_VERSION,
+          CANONICAL_EVIDENCE_POLICY_VERSION,
+          plan.sourcePlanHash,
+          plan.confirmationToken,
+          plan.itemCount,
+          sequence,
+          false,
+        ],
+      );
+      existing = await getPromotionForUpdate(client, plan.promotionId);
+      if (existing === null) {
+        throw new Error("Promotion manifest disappeared after a duplicate-key race");
+      }
     }
-  }
-  if (existing.status === "failed" || existing.status === "staged") {
-    // A failed attempt may be re-staged with a freshly planned token: the
-    // failure is recorded, and the retry carries the new plan hash/token
-    // while keeping the original promotion sequence. A promotion still in
-    // 'staged' may be re-staged the same way: nothing has been applied yet
-    // (apply moves the manifest to 'applying' first), so replacing the
-    // staged item set is safe — and necessary when the fresh plan is smaller
-    // (e.g. an identity turned inactive after the first staging), because
-    // the item upsert never deletes rows that left the plan.
-    await pool.query(
-      `DELETE FROM memory_promotion_item WHERE promotion_id = $1`,
-      [plan.promotionId],
-    );
-    await pool.query(
-      `UPDATE memory_promotion
-       SET source_plan_hash = $2, confirmation_token = $3, item_count = $4,
-           error = NULL, updated_at = now()
-       WHERE promotion_id = $1`,
-      [plan.promotionId, plan.sourcePlanHash, plan.confirmationToken, plan.itemCount],
-    );
-    existing = await getPromotion(pool, plan.promotionId);
-    if (existing === null) {
-      throw new Error("Promotion manifest disappeared during re-staging");
+    if (existing.status === "failed" || existing.status === "staged") {
+      // A failed attempt may be re-staged with a freshly planned token: the
+      // failure is recorded, and the retry carries the new plan hash/token
+      // while keeping the original promotion sequence. A promotion still in
+      // 'staged' may be re-staged the same way: nothing has been applied yet
+      // (apply moves the manifest to 'applying' first), so replacing the
+      // staged item set is safe — and necessary when the fresh plan is smaller
+      // (e.g. an identity turned inactive after the first staging), because
+      // the item upsert never deletes rows that left the plan.
+      await client.query(
+        `DELETE FROM memory_promotion_item WHERE promotion_id = $1`,
+        [plan.promotionId],
+      );
+      await client.query(
+        `UPDATE memory_promotion
+         SET source_plan_hash = $2, confirmation_token = $3, item_count = $4,
+             error = NULL, updated_at = now()
+         WHERE promotion_id = $1`,
+        [plan.promotionId, plan.sourcePlanHash, plan.confirmationToken, plan.itemCount],
+      );
+      existing = await getPromotionForUpdate(client, plan.promotionId);
+      if (existing === null) {
+        throw new Error("Promotion manifest disappeared during re-staging");
+      }
     }
-  }
-  if (
-    existing.source_plan_hash !== plan.sourcePlanHash ||
-    existing.confirmation_token !== plan.confirmationToken ||
-    existing.item_count !== plan.itemCount ||
-    existing.allow_reactivation !== false
-  ) {
-    throw new Error("Existing promotion manifest does not match the current confirmation plan");
-  }
-  if (existing.promotion_sequence === null) {
-    const sequenceResult = await pool.query<{ seq: number }>(
-      `SELECT nextval('memory_promotion_sequence')::int AS seq`,
-    );
-    const sequence = sequenceResult.rows[0]!.seq;
-    await pool.query(
-      `UPDATE memory_promotion SET promotion_sequence = $2, status = 'staged',
-         updated_at = now() WHERE promotion_id = $1`,
-      [plan.promotionId, sequence],
-    );
-    existing = await getPromotion(pool, plan.promotionId);
-    if (existing === null || existing.promotion_sequence === null) {
-      throw new Error("Promotion manifest has no sequence");
+    if (
+      existing.source_plan_hash !== plan.sourcePlanHash ||
+      existing.confirmation_token !== plan.confirmationToken ||
+      existing.item_count !== plan.itemCount ||
+      existing.allow_reactivation !== false
+    ) {
+      throw new Error("Existing promotion manifest does not match the current confirmation plan");
     }
-  }
-  return {
-    promotionSequence: existing.promotion_sequence,
-    status: existing.status,
-    sourcePlanHash: existing.source_plan_hash,
-  };
+    if (existing.promotion_sequence === null) {
+      const sequenceResult = await client.query<{ seq: number }>(
+        `SELECT nextval('memory_promotion_sequence')::int AS seq`,
+      );
+      const sequence = sequenceResult.rows[0]!.seq;
+      await client.query(
+        `UPDATE memory_promotion SET promotion_sequence = $2, status = 'staged',
+           updated_at = now() WHERE promotion_id = $1`,
+        [plan.promotionId, sequence],
+      );
+      existing = await getPromotionForUpdate(client, plan.promotionId);
+      if (existing === null || existing.promotion_sequence === null) {
+        throw new Error("Promotion manifest has no sequence");
+      }
+    }
+    // Stage the complete item set inside this same transaction: the manifest
+    // and its items are one unit (see the atomicity comment above).
+    await upsertPromotionItems(client, plan.items);
+    const staged = await getPromotionItems(client, plan.promotionId);
+    if (staged.length !== plan.itemCount || planHash(staged) !== plan.sourcePlanHash) {
+      throw new Error("Staged promotion items failed plan verification");
+    }
+    return {
+      promotionSequence: existing.promotion_sequence,
+      status: existing.status,
+      sourcePlanHash: existing.source_plan_hash,
+    };
+  });
 }
 
 /** Two history events are the same event when everything but recordedAt
@@ -1881,8 +1899,10 @@ export async function promoteRun(
   // Reactivation safety is structural now: the planner excludes inactive
   // canonical identities, so no staged item can reactivate one. The apply
   // path still skips an item whose identity turned inactive after planning.
+  // The manifest and its complete item set were staged atomically (see
+  // ensurePromotionManifest); the post-commit re-verification below is a
+  // cheap independent check that the committed state matches the plan.
   const manifest = await ensurePromotionManifest(pool, plan);
-  await upsertPromotionItems(pool, plan.items);
   const staged = await getPromotionItems(pool, plan.promotionId);
   if (staged.length !== plan.itemCount || planHash(staged) !== plan.sourcePlanHash) {
     throw new Error("Staged promotion items failed plan verification");

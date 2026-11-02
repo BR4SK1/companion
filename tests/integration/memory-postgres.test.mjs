@@ -1189,7 +1189,11 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
   it("runs the recall evaluation end to end and removes its own rows", async () => {
     // The bundled corpus is generic synthetic content; the evaluation seeds
     // it into the disposable database, runs every query through the real
-    // recall pipeline, scores, and cleans up after itself.
+    // recall pipeline, scores, and cleans up after itself. The evaluation's
+    // target guard requires an EMPTY domain state, so the suite-seeded
+    // subjects are removed first (this is the disposable database; the
+    // suite re-seeds them per test via beforeEach).
+    await pool.query(`DELETE FROM memory_subject`);
     const corpus = validateEvalCorpus(
       JSON.parse(
         readFileSync(
@@ -1208,6 +1212,23 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     assert.ok(first.metrics.precision >= 0.5, `precision@5 ${first.metrics.precision}`);
     assert.ok(first.metrics.mrr >= 0.5, `MRR ${first.metrics.mrr}`);
     assert.equal(first.metrics.temporalViolations, 0);
+
+    // The target guard refuses any database that already holds domain rows:
+    // this is what keeps the evaluation away from in-use or provisioned
+    // databases (it cannot prove disposability beyond the empty-domain
+    // precondition, and the tooling must not claim more than that).
+    await pool.query(`INSERT INTO memory_subject (id, role, profile_enabled, source_label, profile_evidence_rule, position)
+                      VALUES ('provisioned', 'user', false, 'User', 'rule', 0)`);
+    await assert.rejects(
+      () =>
+        runRecallEval(pool, config, corpus, {
+          k: 5,
+          referenceTime: new Date(),
+          timezone: "America/New_York",
+        }),
+      /refusing to run: the target database already holds domain rows/,
+    );
+    await pool.query(`DELETE FROM memory_subject WHERE id = 'provisioned'`);
 
     // Cleanup removed exactly this run's rows; a rerun works.
     const subjectLeft = await pool.query(

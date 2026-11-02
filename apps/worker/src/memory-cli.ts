@@ -57,9 +57,13 @@ export function printUsage(): void {
   console.log("  recall-eval [--corpus <path>] [--k <n>]");
   console.log("      Recall-ranking evaluation (recall@k, precision@k, MRR, temporal");
   console.log("      violations) over a synthetic generic corpus. WRITES evaluation");
-  console.log("      rows and removes them afterwards, so it requires the disposable");
-  console.log("      test database (WORKER_TEST_DATABASE_URL) and refuses");
-  console.log("      WORKER_DATABASE_URL; memory_behavior must be provisioned.");
+  console.log("      rows and removes them afterwards. Requires the disposable test");
+  console.log("      database (WORKER_TEST_DATABASE_URL), refuses that URL when it");
+  console.log("      equals WORKER_DATABASE_URL, and refuses any target that already");
+  console.log("      holds domain rows (conversation, fact, canonical, or subject");
+  console.log("      data) — the target's domain state must be empty, so in-use or");
+  console.log("      provisioned databases always refuse; the tool cannot prove");
+  console.log("      disposability beyond that. memory_behavior must be provisioned.");
   console.log("      Thresholds: MEMORY_EVAL_RECALL_MIN (0.6),");
   console.log("      MEMORY_EVAL_PRECISION_MIN (0.5), MEMORY_EVAL_MRR_MIN (0.5).");
   console.log("      Build the canonical policy review plan (dry run by default). With");
@@ -460,6 +464,17 @@ export async function runRecallEvalCli(
   pool: import("@companion/postgres").PostgresPool,
   args: ParsedArgs,
 ): Promise<void> {
+  // The evaluation writes rows; it must never run through the application
+  // database's own connection string. Equality of the two URLs is the one
+  // identity check available here; the deeper guard (empty domain state)
+  // lives in the harness itself.
+  const testUrl = (process.env.WORKER_TEST_DATABASE_URL ?? "").trim();
+  const appUrl = (process.env.WORKER_DATABASE_URL ?? "").trim();
+  if (appUrl.length > 0 && testUrl === appUrl) {
+    throw new Error(
+      "WORKER_TEST_DATABASE_URL equals WORKER_DATABASE_URL; the recall evaluation refuses to run against the application database's connection string",
+    );
+  }
   const corpusPath = args.corpus ?? new URL("./memory/eval-corpus.json", import.meta.url);
   let corpus: EvalCorpus;
   try {
@@ -478,6 +493,14 @@ export async function runRecallEvalCli(
   }
   const k = args.k ?? 5;
   const config = loadMemoryConfig(process.env);
+  // Echo the connected target identity (database and role only — never the
+  // connection string) so the operator can see what they are pointed at.
+  const identity = await pool.query<{ db: string; role: string }>(
+    `SELECT current_database() AS db, current_user AS role`,
+  );
+  console.log(
+    `recall-eval target: database=${identity.rows[0]?.db ?? "unknown"} role=${identity.rows[0]?.role ?? "unknown"} (disposable test database required)`,
+  );
   const run = await runRecallEval(pool, config, corpus, {
     k,
     referenceTime: new Date(),

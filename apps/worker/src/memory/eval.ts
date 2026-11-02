@@ -311,6 +311,7 @@ export async function runRecallEval(
   corpus: EvalCorpus,
   options: RecallEvalOptions,
 ): Promise<RecallEvalRun> {
+  await assertEvalTargetLooksDisposable(pool);
   await assertEvalSubjectAbsent(pool);
   const seeds = buildEvalSeeds(corpus);
   await seedEvalCorpus(pool, seeds);
@@ -364,6 +365,42 @@ async function assertEvalSubjectAbsent(pool: PostgresPool): Promise<void> {
   if (existing.rows.length > 0) {
     throw new EvalCorpusError(
       `evaluation subject "${EVAL_SUBJECT_ID}" already exists; refusing to run (cleanup deletes by this subject, so a pre-existing row is never touched)`,
+    );
+  }
+}
+
+/**
+ * Disposable-target assurance for the evaluation writes. The harness cannot
+ * know which database the caller considers disposable, so it enforces the
+ * strongest check available to it: the target must hold NO domain rows at
+ * all — no conversation data, no facts, no canonical observations, and no
+ * provisioned subjects. Any database in real use (including an application
+ * database) therefore always refuses. On a database that passes, the
+ * evaluation's writes are confined to its own prefixed rows and are fully
+ * removed afterwards, so a passing target is left exactly as it was found.
+ * This is an emptiness precondition, not proof of disposability: the tool
+ * cannot distinguish an unused application database from a disposable one,
+ * and callers remain responsible for choosing the target.
+ */
+export async function assertEvalTargetLooksDisposable(pool: PostgresPool): Promise<void> {
+  const checks: readonly { readonly table: string; readonly sql: string }[] = [
+    { table: "conversation_message", sql: `SELECT count(*)::int AS n FROM conversation_message` },
+    { table: "conversation_turn", sql: `SELECT count(*)::int AS n FROM conversation_turn` },
+    { table: "memory_fact", sql: `SELECT count(*)::int AS n FROM memory_fact` },
+    {
+      table: "memory_canonical_observation",
+      sql: `SELECT count(*)::int AS n FROM memory_canonical_observation`,
+    },
+    { table: "memory_subject", sql: `SELECT count(*)::int AS n FROM memory_subject` },
+  ];
+  const occupied: string[] = [];
+  for (const check of checks) {
+    const result = await pool.query<{ n: number }>(check.sql);
+    if ((result.rows[0]?.n ?? 0) > 0) occupied.push(check.table);
+  }
+  if (occupied.length > 0) {
+    throw new EvalCorpusError(
+      `refusing to run: the target database already holds domain rows in ${occupied.join(", ")}; the recall evaluation only runs against an empty domain state (a disposable database) — provisioned or in-use databases always refuse`,
     );
   }
 }

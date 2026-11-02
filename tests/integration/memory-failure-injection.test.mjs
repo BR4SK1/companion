@@ -2214,4 +2214,138 @@ describe("memory durability under failure injection (PostgreSQL)", { skip: !hasD
       "a model change must exclude the stored summary",
     );
   });
+
+  // -------------------------------------------------------------------------
+  // Manifest staging atomicity: the manifest row and its complete item set
+  // commit together. A crash during staging must leave either no manifest at
+  // all (next attempt plans fresh) or a complete staged manifest — never an
+  // incomplete staged set, which the resumable path would reject on every
+  // retry and which would make re-staging unreachable.
+  // -------------------------------------------------------------------------
+
+  it("an injected crash at manifest creation leaves no partial manifest and a retry stages fresh", async () => {
+    const { run } = await seedTwoClaimRun(pool);
+    const plan = await buildPromotionPlan(pool, {
+      runId: run.runId,
+      skipTentative: true,
+      behavior: BEHAVIOR,
+    });
+    // Crash on the manifest INSERT itself (the first statement of the
+    // atomic staging transaction).
+    const wrapped = injectingPool(pool, [
+      throwOnNth(
+        (sql) => sql.includes("INSERT INTO memory_promotion\n"),
+        1,
+        "injected crash at manifest creation",
+      ),
+    ]);
+    await assert.rejects(
+      () => promoteRun(wrapped, {
+        runId: run.runId,
+        confirmationToken: plan.confirmationToken,
+        skipTentative: true,
+        behavior: BEHAVIOR,
+      }),
+      /injected crash at manifest creation/,
+    );
+    // Nothing survived: no manifest row, no items.
+    const manifest = await pool.query(
+      `SELECT count(*)::int AS n FROM memory_promotion WHERE run_id = $1`,
+      [run.runId],
+    );
+    assert.equal(manifest.rows[0].n, 0);
+    const items = await pool.query(
+      `SELECT count(*)::int AS n FROM memory_promotion_item WHERE promotion_id = $1`,
+      [plan.promotionId],
+    );
+    assert.equal(items.rows[0].n, 0);
+
+    // A retry plans fresh and completes; re-staging is reachable, not
+    // deadlocked behind an unverifiable staged manifest.
+    const retryPlan = await buildPromotionPlan(pool, {
+      runId: run.runId,
+      skipTentative: true,
+      behavior: BEHAVIOR,
+    });
+    const result = await promoteRun(pool, {
+      runId: run.runId,
+      confirmationToken: retryPlan.confirmationToken,
+      skipTentative: true,
+      behavior: BEHAVIOR,
+    });
+    assert.equal(result.status, "completed");
+    assert.equal(result.itemCount, 2);
+  });
+
+  it("an injected crash mid-item-staging rolls back atomically and the runtime auto-recovers", async () => {
+    const { run } = await seedTwoClaimRun(pool);
+    const plan = await buildPromotionPlan(pool, {
+      runId: run.runId,
+      skipTentative: true,
+      behavior: BEHAVIOR,
+    });
+    // Crash on the SECOND item insert: under atomic staging the manifest and
+    // the first item roll back together.
+    const wrapped = injectingPool(pool, [
+      throwOnNth(
+        (sql) => sql.includes("INSERT INTO memory_promotion_item"),
+        2,
+        "injected crash mid-item-staging",
+      ),
+    ]);
+    await assert.rejects(
+      () => promoteRun(wrapped, {
+        runId: run.runId,
+        confirmationToken: plan.confirmationToken,
+        skipTentative: true,
+        behavior: BEHAVIOR,
+      }),
+      /injected crash mid-item-staging/,
+    );
+    const manifest = await pool.query(
+      `SELECT count(*)::int AS n FROM memory_promotion WHERE run_id = $1`,
+      [run.runId],
+    );
+    assert.equal(manifest.rows[0].n, 0,
+      "atomic staging must not leave a manifest behind when item staging aborts");
+    const items = await pool.query(
+      `SELECT count(*)::int AS n FROM memory_promotion_item WHERE promotion_id = $1`,
+      [plan.promotionId],
+    );
+    assert.equal(items.rows[0].n, 0);
+
+    // The RUNTIME recovers automatically: reconcile selects the pending run,
+    // plans fresh (no manifest exists), stages atomically, and completes —
+    // no manual step, no retry deadlock.
+    const runtime = startMemoryRuntime({
+      pool,
+      config: memoryConfig({
+        WORKER_MEMORY_CONSOLIDATION_NEW_FACTS_THRESHOLD: "999",
+      }),
+      configuration: runtimeConfiguration(),
+      callLlm: makeTwoClaimLlm(),
+      log: () => {},
+    });
+    const deadline = Date.now() + 10_000;
+    let status = null;
+    while (Date.now() < deadline) {
+      const current = await pool.query(
+        `SELECT status FROM memory_promotion WHERE run_id = $1`,
+        [run.runId],
+      );
+      status = current.rows[0]?.status ?? null;
+      if (status === "completed") break;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    await runtime.close();
+    assert.equal(status, "completed",
+      "the runtime must auto-recover a crashed staging by planning fresh");
+    const canonical = await pool.query(
+      `SELECT count(*)::int AS n FROM memory_canonical_observation
+       WHERE promotion_id = (SELECT promotion_id FROM memory_promotion WHERE run_id = $1)
+         AND status = 'active'`,
+      [run.runId],
+    );
+    assert.equal(canonical.rows[0].n, 2);
+  });
 });
