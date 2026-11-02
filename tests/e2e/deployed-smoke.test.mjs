@@ -41,6 +41,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { config } from "./helpers/config.mjs";
+import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import {
   POD_ACTION_SCRIPT_BODY,
   buildMarker,
@@ -71,42 +72,13 @@ function sleep(ms) {
 // Disposable local PostgreSQL (throwaway container; removed in every path)
 // ---------------------------------------------------------------------------
 
-const SCHEMA_SQL = `
-CREATE TABLE conversation_turn (
-  id uuid PRIMARY KEY,
-  status text NOT NULL DEFAULT 'in_flight' CHECK (status IN ('in_flight','completed','failed')),
-  attempt integer NOT NULL DEFAULT 1 CHECK (attempt >= 1),
-  lease_owner text,
-  lease_expires_at timestamptz,
-  selected_pattern_id text,
-  decision jsonb,
-  error text,
-  created_at timestamptz NOT NULL DEFAULT now(),
-  completed_at timestamptz,
-  CONSTRAINT conversation_turn_lease_present
-    CHECK (status <> 'in_flight' OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL))
-);
-CREATE TABLE conversation_message (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  seq bigint GENERATED ALWAYS AS IDENTITY,
-  role text NOT NULL CHECK (role IN ('user','assistant')),
-  content text NOT NULL,
-  client_key text UNIQUE,
-  turn_id uuid REFERENCES conversation_turn (id),
-  created_at timestamptz NOT NULL DEFAULT now()
-);
-CREATE INDEX conversation_message_seq_idx ON conversation_message (seq);
-CREATE INDEX conversation_message_pending_user_idx ON conversation_message (seq) WHERE turn_id IS NULL AND role = 'user';
-CREATE UNIQUE INDEX conversation_turn_reply_idx ON conversation_message (turn_id) WHERE role = 'assistant';
-CREATE INDEX conversation_turn_in_flight_idx ON conversation_turn (created_at) WHERE status = 'in_flight';
-CREATE TABLE response_pattern (
-  id text PRIMARY KEY,
-  enabled boolean NOT NULL DEFAULT true,
-  selection_description text NOT NULL,
-  response_guidance text NOT NULL,
-  position integer NOT NULL CHECK (position >= 0)
-);
-`;
+/** The deployed schema, applied from the real migration set (no drift). */
+async function applyMigrations(client, migrationIds = conversationMigrations.map((migration) => migration.id)) {
+  const selected = conversationMigrations.filter((migration) => migrationIds.includes(migration.id));
+  for (const migration of selected) {
+    await client.query(migration.sql);
+  }
+}
 
 function docker(args, { timeoutMs = 120_000 } = {}) {
   const { execFileSync } = requireFromPostgresLib("node:child_process");
@@ -180,11 +152,13 @@ async function freeTcpPort() {
 
 /**
  * Start a throwaway PostgreSQL container (loopback-only port, random
- * credentials, unique name), apply the deployed migration's schema, and
+ * credentials, unique name), apply the real migration set — by default the
+ * deployed candidate's full schema; pass `migrationIds` to apply a subset
+ * (e.g. only the pre-tracing migration for legacy-compatibility tests) — and
  * register removal in the test's finally path. Fails the test visibly if
  * removal fails — no silent orphans.
  */
-async function withDisposablePostgres(t, use) {
+async function withDisposablePostgres(t, use, { migrationIds } = {}) {
   const runId = randomUUID().slice(0, 8);
   const containerName = `${CONTAINER_PREFIX}${runId}`;
   const port = await freeTcpPort();
@@ -233,7 +207,7 @@ async function withDisposablePostgres(t, use) {
     }
   }
   try {
-    await client.query(SCHEMA_SQL);
+    await applyMigrations(client, migrationIds);
     await use({ client, databaseUrl });
   } finally {
     await client.end().catch(() => {});
@@ -263,6 +237,79 @@ async function seedCompletedTurn(client, marker, replyNote = "synthetic") {
     [`fake reply for ${marker.slice(-6)} (${replyNote})`, turnId],
   );
   return { turnId, userId: user.rows[0].id, replyId: reply.rows[0].id };
+}
+
+/**
+ * Attach a full trace chain to an already-seeded turn: the attempt, its
+ * context (referencing the turn's messages), pattern snapshot, decision
+ * (+ probability), and chat (+ per-message sources, per-choice records).
+ * Returns the trace row ids so assertions can verify exactly what remains.
+ */
+async function seedTraceChainForTurn(client, { turnId, userId, replyId, contextSourceMessageIds = [] }) {
+  const attemptId = randomUUID();
+  await client.query(
+    "INSERT INTO trace_attempt (id, turn_id, attempt, lease_owner, outcome, finished_at) VALUES ($1, $2, 1, 'test-worker', 'published', now())",
+    [attemptId, turnId],
+  );
+  const contextMessageIds = [userId, replyId, ...contextSourceMessageIds];
+  await client.query(
+    "INSERT INTO trace_attempt_context (attempt_id, position, message_id) SELECT $1, s.position, s.message_id FROM unnest($2::int[], $3::uuid[]) AS s(position, message_id)",
+    [attemptId, contextMessageIds.map((_, index) => index), contextMessageIds],
+  );
+  await client.query(
+    "INSERT INTO trace_attempt_pattern (attempt_id, position, pattern_id, selection_description, response_guidance) VALUES ($1, 0, 'pattern-a', 'selection description', 'response guidance')",
+    [attemptId],
+  );
+  const decisionId = randomUUID();
+  await client.query(
+    "INSERT INTO trace_attempt_decision (id, attempt_id, state, question_id, question_type, request_model, instructions, choice, confidence, response_model)"
+    + " VALUES ($1, $2, 'responded', 'q1', 'pattern_selection', 'test-model', 'instructions', 'pattern-a', 0.9, 'test-model')",
+    [decisionId, attemptId],
+  );
+  await client.query(
+    "INSERT INTO trace_attempt_decision_probability (decision_id, option_id, value) VALUES ($1, 'pattern-a', 0.9)",
+    [decisionId],
+  );
+  const chatId = randomUUID();
+  await client.query(
+    "INSERT INTO trace_attempt_chat (id, attempt_id, state, request_model, response_model, reply_content) VALUES ($1, $2, 'responded', 'test-model', 'test-model', 'synthetic reply')",
+    [chatId, attemptId],
+  );
+  const sourceMessageIds = [userId, ...contextSourceMessageIds];
+  await client.query(
+    "INSERT INTO trace_attempt_chat_message (chat_id, position, role, content, source_message_id) SELECT $1, s.position, 'user', 'synthetic content', s.source_message_id FROM unnest($2::int[], $3::uuid[]) AS s(position, source_message_id)",
+    [chatId, sourceMessageIds.map((_, index) => index), sourceMessageIds],
+  );
+  await client.query(
+    "INSERT INTO trace_attempt_chat_choice (chat_id, position, finish_reason, content) VALUES ($1, 0, 'stop', 'synthetic reply')",
+    [chatId],
+  );
+  return { attemptId, decisionId, chatId };
+}
+
+/** Counts of trace rows for one turn (used to assert exact preservation). */
+async function countTraceRows(client, turnId) {
+  const result = await client.query(
+    "SELECT (SELECT count(*) FROM trace_attempt WHERE turn_id = $1) AS \"attempts\","
+    + " (SELECT count(*) FROM trace_attempt_context c JOIN trace_attempt a ON a.id = c.attempt_id WHERE a.turn_id = $1) AS \"contexts\","
+    + " (SELECT count(*) FROM trace_attempt_pattern p JOIN trace_attempt a ON a.id = p.attempt_id WHERE a.turn_id = $1) AS \"patterns\","
+    + " (SELECT count(*) FROM trace_attempt_decision d JOIN trace_attempt a ON a.id = d.attempt_id WHERE a.turn_id = $1) AS \"decisions\","
+    + " (SELECT count(*) FROM trace_attempt_decision_probability p JOIN trace_attempt_decision d ON d.id = p.decision_id JOIN trace_attempt a ON a.id = d.attempt_id WHERE a.turn_id = $1) AS \"decisionProbabilities\","
+    + " (SELECT count(*) FROM trace_attempt_chat ch JOIN trace_attempt a ON a.id = ch.attempt_id WHERE a.turn_id = $1) AS \"chats\","
+    + " (SELECT count(*) FROM trace_attempt_chat_message m JOIN trace_attempt_chat ch ON ch.id = m.chat_id JOIN trace_attempt a ON a.id = ch.attempt_id WHERE a.turn_id = $1) AS \"chatMessages\","
+    + " (SELECT count(*) FROM trace_attempt_chat_choice c JOIN trace_attempt_chat ch ON ch.id = c.chat_id JOIN trace_attempt a ON a.id = ch.attempt_id WHERE a.turn_id = $1) AS \"chatChoices\"",
+    [turnId],
+  );
+  return {
+    attempts: Number(result.rows[0].attempts),
+    contexts: Number(result.rows[0].contexts),
+    patterns: Number(result.rows[0].patterns),
+    decisions: Number(result.rows[0].decisions),
+    decisionProbabilities: Number(result.rows[0].decisionProbabilities),
+    chats: Number(result.rows[0].chats),
+    chatMessages: Number(result.rows[0].chatMessages),
+    chatChoices: Number(result.rows[0].chatChoices),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -833,6 +880,260 @@ test("full-turn deletion transaction: deletes exactly the exclusive turn's rows"
     // The unrelated turn is untouched.
     const otherRows = await db.query("SELECT count(*)::int AS n FROM conversation_message WHERE turn_id = $1", [other.turnId]);
     assert.equal(otherRows.rows[0].n, 2);
+  });
+});
+
+test("full-turn deletion transaction: legacy schema without trace tables still deletes cleanly", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    const payload = { action: "delete-full-turn", turnId: seeded.turnId, messageId: seeded.userId, marker };
+    const script = buildPodActionScript(payload);
+    const result = await runPodScript(databaseUrl, script);
+    assert.equal(result.deleted, true, "the legacy path must still delete the turn");
+    assert.equal(result.trace.present, false, "the legacy path must report no trace tables present");
+    assert.equal(result.trace.refused, false);
+    assert.equal(result.trace.foreignReferences, 0);
+    assert.deepEqual(result.trace.deletedCounts, {}, "the legacy path must delete no trace rows");
+    const remaining = await db.query("SELECT count(*)::int AS n FROM conversation_message WHERE turn_id = $1", [seeded.turnId]);
+    assert.equal(remaining.rows[0].n, 0);
+    const turnGone = await db.query("SELECT count(*)::int AS n FROM conversation_turn WHERE id = $1", [seeded.turnId]);
+    assert.equal(turnGone.rows[0].n, 0);
+  }, { migrationIds: ["0001_conversation_work"] });
+});
+
+test("full-turn deletion transaction: trace rows of the exclusive turn are deleted exactly", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    await seedTraceChainForTurn(db, seeded);
+    const before = await countTraceRows(db, seeded.turnId);
+    assert.equal(before.attempts, 1, "seed precondition: one attempt");
+    assert.equal(before.chatChoices, 1, "seed precondition: one chat choice");
+
+    const payload = { action: "delete-full-turn", turnId: seeded.turnId, messageId: seeded.userId, marker };
+    const script = buildPodActionScript(payload);
+    const result = await runPodScript(databaseUrl, script);
+    assert.equal(result.deleted, true);
+    assert.equal(result.trace.present, true, "the trace phase must run on the tracing schema");
+    assert.equal(result.trace.refused, false);
+    assert.deepEqual(
+      Object.values(result.trace.deletedCounts).map(Number).filter((n) => n > 0).length,
+      8,
+      "all eight trace tables must report deletions for a fully traced turn",
+    );
+    const after = await countTraceRows(db, seeded.turnId);
+    assert.deepEqual(after, {
+      attempts: 0, contexts: 0, patterns: 0, decisions: 0,
+      decisionProbabilities: 0, chats: 0, chatMessages: 0, chatChoices: 0,
+    }, "all eight trace row kinds must go to zero for the deleted turn");
+    const anyTrace = await db.query("SELECT count(*)::int AS n FROM trace_attempt");
+    assert.equal(anyTrace.rows[0].n, 0, "no trace rows may remain at all in this test database");
+  });
+});
+
+test("full-turn deletion transaction: unrelated turns' messages and trace rows are preserved", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    await seedTraceChainForTurn(db, seeded);
+    // An unrelated turn with its own messages and its own trace chain.
+    const other = await seedCompletedTurn(db, buildMarker());
+    await seedTraceChainForTurn(db, other);
+
+    const payload = { action: "delete-full-turn", turnId: seeded.turnId, messageId: seeded.userId, marker };
+    const script = buildPodActionScript(payload);
+    const result = await runPodScript(databaseUrl, script);
+    assert.equal(result.deleted, true);
+    assert.equal(result.trace.refused, false);
+
+    // The unrelated turn's rows are all intact.
+    const otherMessages = await db.query("SELECT count(*)::int AS n FROM conversation_message WHERE turn_id = $1", [other.turnId]);
+    assert.equal(otherMessages.rows[0].n, 2);
+    const otherTrace = await countTraceRows(db, other.turnId);
+    assert.deepEqual(otherTrace, {
+      attempts: 1, contexts: 2, patterns: 1, decisions: 1,
+      decisionProbabilities: 1, chats: 1, chatMessages: 1, chatChoices: 1,
+    }, "the unrelated turn's trace chain must be fully preserved");
+    const otherTurn = await db.query("SELECT count(*)::int AS n FROM conversation_turn WHERE id = $1", [other.turnId]);
+    assert.equal(otherTurn.rows[0].n, 1);
+  });
+});
+
+test("full-turn deletion transaction: a foreign trace reference refuses and rolls back everything", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    await seedTraceChainForTurn(db, seeded);
+    // A later, unrelated turn whose chat trace cites one of the smoke turn's
+    // messages as context history (the worker legitimately records prior
+    // conversation history in later turns' chat snapshots).
+    const later = await seedCompletedTurn(db, buildMarker());
+    await db.query(
+      "INSERT INTO trace_attempt (id, turn_id, attempt, lease_owner, outcome, finished_at) VALUES ($1, $2, 1, 'test-worker', 'published', now())",
+      [randomUUID(), later.turnId],
+    );
+    const laterChatId = (await db.query(
+      "INSERT INTO trace_attempt_chat (attempt_id, state, request_model, response_model, reply_content) SELECT a.id, 'responded', 'test-model', 'test-model', 'later reply' FROM trace_attempt a WHERE a.turn_id = $1 RETURNING id",
+      [later.turnId],
+    )).rows[0].id;
+    await db.query(
+      "INSERT INTO trace_attempt_chat_message (chat_id, position, role, content, source_message_id) VALUES ($1, 0, 'user', 'history', $2)",
+      [laterChatId, seeded.replyId],
+    );
+
+    const payload = { action: "delete-full-turn", turnId: seeded.turnId, messageId: seeded.userId, marker };
+    const script = buildPodActionScript(payload);
+    const result = await runPodScript(databaseUrl, script);
+    assert.equal(result.deleted, false, "the delete must be refused");
+    assert.equal(result.reason, "foreign-trace-references");
+    assert.equal(result.trace.refused, true, "the trace guard must be what refused");
+    assert.equal(result.trace.foreignReferences >= 1, true, "at least one foreign reference must be reported");
+
+    // Nothing was deleted: the smoke turn's messages, turn, and trace chain
+    // all remain, and the later turn's trace is intact too.
+    const smokeMessages = await db.query("SELECT count(*)::int AS n FROM conversation_message WHERE turn_id = $1", [seeded.turnId]);
+    assert.equal(smokeMessages.rows[0].n, 2, "the smoke turn's messages must be retained");
+    const smokeTurn = await db.query("SELECT count(*)::int AS n FROM conversation_turn WHERE id = $1", [seeded.turnId]);
+    assert.equal(smokeTurn.rows[0].n, 1, "the smoke turn must be retained");
+    const smokeTrace = await countTraceRows(db, seeded.turnId);
+    assert.equal(smokeTrace.attempts, 1, "the smoke turn's trace chain must be retained");
+    const laterTrace = await countTraceRows(db, later.turnId);
+    assert.equal(laterTrace.attempts, 1, "the later turn's trace must be retained");
+    const laterChatMessages = await db.query(
+      "SELECT count(*)::int AS n FROM trace_attempt_chat_message m JOIN trace_attempt_chat ch ON ch.id = m.chat_id JOIN trace_attempt a ON a.id = ch.attempt_id WHERE a.turn_id = $1",
+      [later.turnId],
+    );
+    assert.equal(laterChatMessages.rows[0].n, 1, "the foreign reference itself must be untouched");
+  });
+});
+
+test("trace attempt comprehensive success path: all tracing tables populated and correlated", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    const trace = await seedTraceChainForTurn(db, seeded);
+
+    // Domain tables are intact and linked to the turn.
+    const turn = (await db.query("SELECT id, status, lease_owner, completed_at FROM conversation_turn WHERE id = $1", [seeded.turnId])).rows[0];
+    assert.equal(turn.status, "completed");
+    assert.ok(turn.lease_owner, "the turn must record its lease owner");
+
+    // All trace tables reference the same attempt id.
+    const contextAttemptIds = (await db.query("SELECT DISTINCT attempt_id FROM trace_attempt_context")).rows.map((r) => r.attempt_id);
+    assert.deepEqual(contextAttemptIds, [trace.attemptId]);
+    const decisionAttemptIds = (await db.query("SELECT attempt_id FROM trace_attempt_decision WHERE id = $1", [trace.decisionId])).rows.map((r) => r.attempt_id);
+    assert.deepEqual(decisionAttemptIds, [trace.attemptId]);
+    const chatAttemptIds = (await db.query("SELECT attempt_id FROM trace_attempt_chat WHERE id = $1", [trace.chatId])).rows.map((r) => r.attempt_id);
+    assert.deepEqual(chatAttemptIds, [trace.attemptId]);
+
+    // Trace-to-domain correlation: the attempt points back to the turn, and
+    // the context references the turn's actual messages.
+    const attempt = (await db.query("SELECT turn_id, outcome FROM trace_attempt WHERE id = $1", [trace.attemptId])).rows[0];
+    assert.equal(attempt.turn_id, seeded.turnId);
+    assert.equal(attempt.outcome, "published");
+    const contextMessageIds = (await db.query(
+      "SELECT message_id FROM trace_attempt_context WHERE attempt_id = $1 ORDER BY position",
+      [trace.attemptId],
+    )).rows.map((r) => r.message_id);
+    assert.deepEqual(contextMessageIds, [seeded.userId, seeded.replyId]);
+  });
+});
+
+test("trace attempt decision logic: decision fields and probability distribution recorded correctly", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    const trace = await seedTraceChainForTurn(db, seeded);
+
+    const decision = (await db.query(
+      "SELECT state, question_id, question_type, request_model, choice, confidence, response_model FROM trace_attempt_decision WHERE id = $1",
+      [trace.decisionId],
+    )).rows[0];
+    assert.equal(decision.state, "responded");
+    assert.equal(decision.question_id, "q1");
+    assert.equal(decision.question_type, "pattern_selection");
+    assert.equal(decision.request_model, "test-model");
+    assert.equal(decision.choice, "pattern-a");
+    assert.ok(Number(decision.confidence) >= 0 && Number(decision.confidence) <= 1, "confidence must be within [0, 1]");
+    assert.equal(decision.response_model, "test-model");
+
+    const probabilities = (await db.query(
+      "SELECT option_id, value FROM trace_attempt_decision_probability WHERE decision_id = $1 ORDER BY option_id",
+      [trace.decisionId],
+    )).rows;
+    assert.equal(probabilities.length, 1);
+    assert.equal(probabilities[0].option_id, "pattern-a");
+    assert.ok(Number(probabilities[0].value) >= 0 && Number(probabilities[0].value) <= 1, "probability must be within [0, 1]");
+  });
+});
+
+test("trace attempt chat message linking: messages grouped under the same chat and attempt", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    // A prior user message from an earlier turn, cited as history by the chat.
+    const prior = await seedCompletedTurn(db, buildMarker());
+    const trace = await seedTraceChainForTurn(db, { ...seeded, contextSourceMessageIds: [prior.userId] });
+
+    const chatMessages = (await db.query(
+      "SELECT position, role, content, source_message_id FROM trace_attempt_chat_message WHERE chat_id = $1 ORDER BY position",
+      [trace.chatId],
+    )).rows;
+    assert.equal(chatMessages.length, 2, "the chat must record two messages: the current user message and the prior history");
+    assert.equal(chatMessages[0].role, "user");
+    assert.equal(chatMessages[0].content, "synthetic content");
+    assert.equal(chatMessages[0].source_message_id, seeded.userId, "the first chat message must cite the current user message");
+    assert.equal(chatMessages[1].source_message_id, prior.userId, "the second chat message must cite the prior history message");
+
+    const choice = (await db.query(
+      "SELECT finish_reason, content FROM trace_attempt_chat_choice WHERE chat_id = $1 ORDER BY position LIMIT 1",
+      [trace.chatId],
+    )).rows[0];
+    assert.equal(choice.finish_reason, "stop");
+    assert.equal(choice.content, "synthetic reply");
+  });
+});
+
+test("trace attempt partial state: removing one trace record preserves the rest", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    const trace = await seedTraceChainForTurn(db, seeded);
+
+    // Delete only the decision record; the attempt and chat traces must remain.
+    await db.query("DELETE FROM trace_attempt_decision_probability WHERE decision_id = $1", [trace.decisionId]);
+    await db.query("DELETE FROM trace_attempt_decision WHERE id = $1", [trace.decisionId]);
+
+    const remaining = await countTraceRows(db, seeded.turnId);
+    assert.equal(remaining.attempts, 1, "the attempt must remain");
+    assert.equal(remaining.decisions, 0, "the decision must be gone");
+    assert.equal(remaining.decisionProbabilities, 0, "the decision's probabilities must be gone");
+    assert.equal(remaining.chats, 1, "the chat record must remain");
+    assert.equal(remaining.chatMessages, 1, "the chat's messages must remain");
+    assert.equal(remaining.chatChoices, 1, "the chat's choices must remain");
+
+    // Delete only the chat record; the attempt and decision must remain.
+    await db.query("DELETE FROM trace_attempt_chat_choice WHERE chat_id = $1", [trace.chatId]);
+    await db.query("DELETE FROM trace_attempt_chat_message WHERE chat_id = $1", [trace.chatId]);
+    await db.query("DELETE FROM trace_attempt_chat WHERE id = $1", [trace.chatId]);
+    const afterChat = await countTraceRows(db, seeded.turnId);
+    assert.equal(afterChat.attempts, 1, "the attempt must still remain");
+    assert.equal(afterChat.chats, 0, "the chat must be gone");
+    assert.equal(afterChat.contexts, 2, "the attempt's context must remain untouched");
+
+    // Finally, delete the attempt itself; no orphan records remain.
+    await db.query("DELETE FROM trace_attempt_context WHERE attempt_id = $1", [trace.attemptId]);
+    await db.query("DELETE FROM trace_attempt_pattern WHERE attempt_id = $1", [trace.attemptId]);
+    await db.query("DELETE FROM trace_attempt WHERE id = $1", [trace.attemptId]);
+    const final = await countTraceRows(db, seeded.turnId);
+    assert.deepEqual(final, {
+      attempts: 0, contexts: 0, patterns: 0, decisions: 0,
+      decisionProbabilities: 0, chats: 0, chatMessages: 0, chatChoices: 0,
+    }, "the turn's messages must remain while the trace rows are fully removable");
+
+    const messages = (await db.query("SELECT count(*)::int AS n FROM conversation_message WHERE turn_id = $1", [seeded.turnId])).rows[0];
+    assert.equal(messages.n, 2, "the turn's messages must remain while the trace rows are fully removable");
   });
 });
 
