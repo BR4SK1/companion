@@ -57,6 +57,7 @@ import type {
   ChatOutcomeTrace,
   ChatOutcomeTracePayload,
   ChatRequestTracePayload,
+  ChatIdentity,
   ConversationMessage,
   ConversationTurn,
   DecisionOutcomeTracePayload,
@@ -72,6 +73,7 @@ import type {
   TurnTraceReport,
   TurnWork,
 } from "./types.ts";
+import { IdentityConfigurationError } from "./types.ts";
 
 /**
  * Thrown by the composition edge when a fenced trace write reports that the
@@ -370,6 +372,12 @@ export interface ConversationStore {
     leaseOwner: string;
   }): Promise<boolean>;
   getEnabledResponsePatterns(): Promise<readonly ResponsePattern[]>;
+  /**
+   * The owner-authored chat identity as provisioned in `chat_identity`.
+   * Fail-closed: a missing or empty identity row is an
+   * `IdentityConfigurationError`, never a silently-degraded prompt.
+   */
+  getChatIdentity(): Promise<ChatIdentity>;
   getThreadContext(params: ThreadContextParams): Promise<
     readonly ConversationMessage[]
   >;
@@ -1021,14 +1029,21 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
         "chat trace messageSources must align with the request messages",
       );
     }
+    if (payload.messageChunks.length !== payload.request.messages.length) {
+      throw new Error(
+        "chat trace messageChunks must align with the request messages",
+      );
+    }
     const chat = await client.query<{ id: string }>(
       `INSERT INTO trace_attempt_chat
-         (attempt_id, state, request_model, temperature, max_tokens)
-       VALUES ($1, 'requested', $2, $3, $4)
+         (attempt_id, state, request_model, temperature, max_tokens,
+          identity_revision)
+       VALUES ($1, 'requested', $2, $3, $4, $5)
        ON CONFLICT (attempt_id) DO UPDATE SET
          request_model = EXCLUDED.request_model,
          temperature = EXCLUDED.temperature,
          max_tokens = EXCLUDED.max_tokens,
+         identity_revision = EXCLUDED.identity_revision,
          recorded_at = now()
        RETURNING id`,
       [
@@ -1036,6 +1051,7 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
         payload.request.model,
         payload.request.temperature ?? null,
         payload.request.max_tokens ?? null,
+        payload.identityRevision,
       ],
     );
     const chatRow = chat.rows[0];
@@ -1051,16 +1067,17 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     if (payload.request.messages.length > 0) {
       await client.query(
         `INSERT INTO trace_attempt_chat_message
-           (chat_id, position, role, content, source_message_id)
-         SELECT $1, s.position, s.role, s.content, s.source_message_id
-         FROM unnest($2::int[], $3::text[], $4::text[], $5::uuid[])
-              AS s(position, role, content, source_message_id)`,
+           (chat_id, position, role, content, source_message_id, chunk)
+         SELECT $1, s.position, s.role, s.content, s.source_message_id, s.chunk
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::uuid[], $6::text[])
+              AS s(position, role, content, source_message_id, chunk)`,
         [
           chatRow.id,
           payload.request.messages.map((_, index) => index),
           payload.request.messages.map((message) => message.role),
           payload.request.messages.map((message) => message.content),
           payload.messageSources.map((source) => source),
+          payload.messageChunks.map((chunk) => chunk),
         ],
       );
     }
@@ -1085,6 +1102,11 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     if (payload.messageSources.length !== payload.request.messages.length) {
       throw new Error(
         "chat trace messageSources must align with the request messages",
+      );
+    }
+    if (payload.messageChunks.length !== payload.request.messages.length) {
+      throw new Error(
+        "chat trace messageChunks must align with the request messages",
       );
     }
     const outcome = payload.outcome;
@@ -1121,15 +1143,17 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     const chat = await client.query<{ id: string }>(
       `INSERT INTO trace_attempt_chat
          (attempt_id, state, request_model, temperature, max_tokens,
+          identity_revision,
           response_id, response_model, reply_content, application_rejection,
           error_kind, error_message, error_body,
           usage_prompt_tokens, usage_completion_tokens, usage_total_tokens)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        ON CONFLICT (attempt_id) DO UPDATE SET
          state = EXCLUDED.state,
          request_model = EXCLUDED.request_model,
          temperature = EXCLUDED.temperature,
          max_tokens = EXCLUDED.max_tokens,
+         identity_revision = EXCLUDED.identity_revision,
          response_id = EXCLUDED.response_id,
          response_model = EXCLUDED.response_model,
          reply_content = EXCLUDED.reply_content,
@@ -1148,6 +1172,7 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
         payload.request.model,
         payload.request.temperature ?? null,
         payload.request.max_tokens ?? null,
+        payload.identityRevision,
         responseId,
         responseModel,
         replyContent,
@@ -1173,16 +1198,17 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     if (payload.request.messages.length > 0) {
       await client.query(
         `INSERT INTO trace_attempt_chat_message
-           (chat_id, position, role, content, source_message_id)
-         SELECT $1, s.position, s.role, s.content, s.source_message_id
-         FROM unnest($2::int[], $3::text[], $4::text[], $5::uuid[])
-              AS s(position, role, content, source_message_id)`,
+           (chat_id, position, role, content, source_message_id, chunk)
+         SELECT $1, s.position, s.role, s.content, s.source_message_id, s.chunk
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::uuid[], $6::text[])
+              AS s(position, role, content, source_message_id, chunk)`,
         [
           chatRow.id,
           payload.request.messages.map((_, index) => index),
           payload.request.messages.map((message) => message.role),
           payload.request.messages.map((message) => message.content),
           payload.messageSources.map((source) => source),
+          payload.messageChunks.map((chunk) => chunk),
         ],
       );
     }
@@ -1407,6 +1433,7 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     request_model: string;
     temperature: string | null;
     max_tokens: number | null;
+    identity_revision: number | null;
     response_id: string | null;
     response_model: string | null;
     reply_content: string | null;
@@ -1530,7 +1557,8 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
           }
           // Chat trace (one row per attempt, when the chat was recorded).
           const chatResult = await client.query<ChatRow>(
-            `SELECT state, request_model, temperature, max_tokens, response_id,
+            `SELECT state, request_model, temperature, max_tokens,
+                    identity_revision, response_id,
                     response_model, reply_content, application_rejection,
                     error_kind, error_message,
                     error_body, usage_prompt_tokens,
@@ -1546,8 +1574,9 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
               role: string;
               content: string;
               source_message_id: string | null;
+              chunk: string | null;
             }>(
-              `SELECT position, role, content, source_message_id
+              `SELECT position, role, content, source_message_id, chunk
                FROM trace_attempt_chat_message WHERE chat_id = (
                  SELECT id FROM trace_attempt_chat WHERE attempt_id = $1
                ) ORDER BY position`,
@@ -1568,6 +1597,10 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
               requestModel: chatRow.request_model,
               temperature: chatRow.temperature !== null ? Number(chatRow.temperature) : null,
               maxTokens: chatRow.max_tokens,
+              identityRevision:
+                chatRow.identity_revision === null
+                  ? null
+                  : Number(chatRow.identity_revision),
               responseId: chatRow.response_id,
               state: chatRow.state,
               errorKind: chatRow.error_kind,
@@ -1584,6 +1617,7 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
                 role: row.role as TraceChatMessage["role"],
                 content: row.content,
                 sourceMessageId: row.source_message_id,
+                chunk: row.chunk as TraceChatMessage["chunk"],
               })),
               choices: chatChoicesResult.rows.map((row) => ({
                 position: row.position,
@@ -1636,6 +1670,36 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
        ORDER BY position, id`,
     );
     return result.rows.map(mapPattern);
+  }
+
+  /**
+   * The owner-authored chat identity, read fresh per turn so owner edits
+   * take effect on the next turn without a restart. Fail-closed: the
+   * identity is required configuration, and a missing or empty row is an
+   * `IdentityConfigurationError` — never a silently-degraded prompt or an
+   * invented persona. (The table's CHECK constraint already forbids empty
+   * content; the loader check keeps the failure honest even against a
+   * schema that predates it.)
+   */
+  async function getChatIdentity(): Promise<ChatIdentity> {
+    const result = await pool.query<{
+      content: string;
+      revision: number;
+    }>(
+      `SELECT content, revision FROM chat_identity WHERE id = 'identity'`,
+    );
+    const row = result.rows[0];
+    if (row === undefined) {
+      throw new IdentityConfigurationError(
+        "chat_identity has no 'identity' row; provision the owner-authored identity before chat can run",
+      );
+    }
+    if (row.content.trim().length === 0) {
+      throw new IdentityConfigurationError(
+        "chat_identity row 'identity' has empty content; provision non-empty identity text",
+      );
+    }
+    return { content: row.content, revision: Number(row.revision) };
   }
 
   /**
@@ -1847,6 +1911,7 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     failTurn,
     markAttemptFenced,
     getEnabledResponsePatterns,
+    getChatIdentity,
     getThreadContext,
     getThreadPage,
     getThreadStatus,

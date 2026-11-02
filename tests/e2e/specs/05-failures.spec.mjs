@@ -16,7 +16,7 @@
 import { expect, test } from "@playwright/test";
 
 import { messagePost, threadGet, uniqueKey } from "../helpers/api.mjs";
-import { seedPatterns } from "../helpers/db.mjs";
+import { seedPatterns, seedIdentity } from "../helpers/db.mjs";
 import { waitForQuiescent } from "../helpers/quiesce.mjs";
 import {
   chatRecords,
@@ -34,6 +34,7 @@ test.beforeAll(async () => {
   await waitForQuiescent();
   await resetMode();
   await seedPatterns();
+  await seedIdentity();
   await resetRecords();
 });
 

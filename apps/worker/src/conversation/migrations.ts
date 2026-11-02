@@ -294,6 +294,43 @@ CREATE TABLE trace_attempt_chat_choice (
 );
 `;
 
+/**
+ * Chat identity: the owner-authored identity/persona text sent as the
+ * leading system message of every chat request. It is runtime configuration
+ * exactly like `response_pattern`: provisioned per deployment (one singleton
+ * row, authored by the owner through SQL), never seeded by migrations, and
+ * never code or repository content. The schema is generic structural shape —
+ * no personal text lives here, only the table the owner authors.
+ *
+ * `revision` is a plain counter the owner bumps on each edit; every chat
+ * boundary trace records the revision it used, so a trace identifies which
+ * version of the identity was in effect without duplicating its content.
+ *
+ * The tracing additions stay metadata-only:
+ * - `trace_attempt_chat.identity_revision` — which identity revision the
+ *   request carried (null for rows recorded before this migration).
+ * - `trace_attempt_chat_message.chunk` — which assembly chunk each recorded
+ *   message belongs to (identity/profiles/temporal/recall/guidance or a
+ *   conversation message; null for rows recorded before this migration).
+ * Neither duplicates prompt content: the exact rendered text was already
+ * recorded in `trace_attempt_chat_message` by design; these columns classify
+ * it.
+ */
+const CREATE_CHAT_IDENTITY = `
+CREATE TABLE chat_identity (
+  id text PRIMARY KEY,
+  content text NOT NULL,
+  revision integer NOT NULL DEFAULT 1 CHECK (revision >= 1),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT chat_identity_content_nonempty CHECK (length(btrim(content)) > 0)
+);
+
+ALTER TABLE trace_attempt_chat ADD COLUMN identity_revision integer;
+
+ALTER TABLE trace_attempt_chat_message ADD COLUMN chunk text
+  CHECK (chunk IN ('identity', 'profiles', 'temporal', 'recall', 'guidance', 'conversation'));
+`;
+
 export const conversationMigrations: readonly Migration[] = [
   {
     id: "0001_conversation_work",
@@ -302,5 +339,9 @@ export const conversationMigrations: readonly Migration[] = [
   {
     id: "0002_conversation_tracing",
     sql: CREATE_CONVERSATION_TRACING,
+  },
+  {
+    id: "0004_chat_identity",
+    sql: CREATE_CHAT_IDENTITY,
   },
 ];

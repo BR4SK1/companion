@@ -54,6 +54,14 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
     pool = createPostgresPool({ connectionString: DATABASE_URL });
     store = createConversationStore(pool);
     await runMigrations(pool, conversationMigrations);
+    // The chat identity is required runtime configuration: provision a
+    // generic fixture row for the engine cycle below (configuration, not
+    // per-test data, so the truncate leaves it in place).
+    await pool.query(
+      `INSERT INTO chat_identity (id, content, revision)
+       VALUES ('identity', 'Integration fixture identity: generic test text.', 1)
+       ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content`,
+    );
     server = createApiServer({
       store,
       token: TOKEN,
@@ -399,6 +407,7 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
               },
             ],
           }),
+          loadIdentity: () => store.getChatIdentity(),
           loadPatterns: () => store.getEnabledResponsePatterns(),
           loadContext: (turnId) => store.getThreadContext({ turnId, limit: 50 }),
         }),

@@ -7,7 +7,7 @@
 import { expect, test } from "@playwright/test";
 
 import { threadGet } from "../helpers/api.mjs";
-import { disablePatterns } from "../helpers/db.mjs";
+import { disablePatterns, seedIdentity, E2E_IDENTITY } from "../helpers/db.mjs";
 import { waitForQuiescent } from "../helpers/quiesce.mjs";
 import {
   chatRecords,
@@ -23,6 +23,7 @@ test.beforeAll(async () => {
   await waitForQuiescent();
   await resetMode();
   await disablePatterns();
+  await seedIdentity();
   await resetRecords();
 });
 
@@ -44,7 +45,10 @@ test("without enabled patterns chat runs without decision calls or guidance", as
   const chats = await chatRecords();
   expect(chats.length).toBeGreaterThanOrEqual(1);
   const chat = chats.at(-1).body;
-  expect(chat.messages[0].role).not.toBe("system");
+  // The only system message is the seeded identity; no guidance chunk is
+  // sent because no pattern was selected.
+  const systemMessages = chat.messages.filter((message) => message.role === "system");
+  expect(systemMessages).toEqual([{ role: "system", content: E2E_IDENTITY }]);
   expect(chat.messages.some((message) => message.role === "user" && message.content === text)).toBe(true);
 
   const thread = await threadGet(context);

@@ -1,11 +1,13 @@
 /**
  * Memory context rendering for the chat request.
  *
- * Ports the source worker's prompt integration to a single memory system
- * message assembled per turn: the per-day profile sheets first (stable,
- * fingerprint-tagged), then the recent temporal memories, then the per-turn
- * canonical recall results. The message is synthetic — in the chat trace it
- * is recorded with a null message source, like response guidance.
+ * Builds the individual memory sections the turn processor sends as
+ * separate synthetic system messages (one chunk each): the generated subject
+ * profiles (stable, fingerprint-tagged), the recent temporal memories, and
+ * the per-turn canonical recall results. Each section is synthetic — in the
+ * chat trace it is recorded with a null message source and its chunk
+ * classification, like the identity and guidance system messages. A section
+ * that renders nothing contributes no chunk at all.
  */
 
 import type { CanonicalRecallItem, ObservationProfile } from "./types.ts";
@@ -121,25 +123,6 @@ export function renderProfileSection(
 
 function escapeXmlAttribute(text: string): string {
   return text.replace(/"/g, "&quot;");
-}
-
-/**
- * Assemble the per-turn memory system message from its three sections. Each
- * section is optional; the message exists only when at least one section
- * rendered.
- */
-export function buildMemorySystemMessage(sections: {
-  readonly profileSection?: string;
-  readonly temporalContext?: string;
-  readonly memoryContext?: string;
-}): string | undefined {
-  const parts = [
-    sections.profileSection,
-    sections.temporalContext,
-    sections.memoryContext,
-  ].filter((section): section is string => typeof section === "string" && section.length > 0);
-  if (parts.length === 0) return undefined;
-  return parts.join("\n\n");
 }
 
 export const __internal = {

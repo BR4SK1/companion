@@ -319,6 +319,7 @@ async function preflight() {
     queuedUserMessages: db.queuedUserMessages,
     inFlightTurns: db.inFlightTurns,
     enabledPatterns: db.enabledPatterns,
+    identityProvisioned: db.identityProvisioned,
     baselineMessages: db.baselineMessages,
     baselineTurns: db.baselineTurns,
     newestMessageAgeMinutes: db.newestMessageAgeMinutes,
@@ -335,6 +336,11 @@ async function preflight() {
   if (db.queuedUserMessages !== 0 || db.inFlightTurns !== 0) {
     throw new Error(
       `the dev thread is not quiescent (queued=${String(db.queuedUserMessages)}, inFlight=${String(db.inFlightTurns)}) — refusing to send`,
+    );
+  }
+  if (db.identityProvisioned !== 1) {
+    throw new Error(
+      "chat_identity is not provisioned in the deployed environment — a full turn cannot publish without the owner-authored identity; provision it and rerun",
     );
   }
   evidence.provider.expectedCalls = db.enabledPatterns > 0 ? "decision + chat (2)" : "chat only (decision skipped: no enabled patterns)";
