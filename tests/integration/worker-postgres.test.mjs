@@ -29,6 +29,7 @@ import {
   createConversationStore,
   TraceWriteFencedError,
 } from "../../apps/worker/src/conversation/store.ts";
+import { IdentityConfigurationError } from "../../apps/worker/src/conversation/types.ts";
 import { processTurnWork } from "../../apps/worker/src/work/processor.ts";
 import { runEngineOnce } from "../../apps/worker/src/work/engine.ts";
 import {
@@ -54,6 +55,17 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     // worker applies the conversation and memory domain migrations together
     // (see main.ts), so every test below assumes both domain schemas exist.
     await runMigrations(pool, [...conversationMigrations, ...memoryMigrations]);
+    // The chat identity is required runtime configuration (like
+    // response_pattern): provision a generic fixture row so engine cycles
+    // can run. It is configuration, not per-test data, so the beforeEach
+    // truncate leaves it in place; the fail-closed test manages its own
+    // delete/restore.
+    await pool.query(
+      `INSERT INTO chat_identity (id, content, revision)
+       VALUES ('identity', 'Integration fixture identity: generic test text.', 1)
+       ON CONFLICT (id) DO UPDATE SET
+         content = EXCLUDED.content, revision = EXCLUDED.revision`,
+    );
   });
 
   after(async () => {
@@ -82,21 +94,132 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       ...memoryMigrations,
     ]);
     assert.deepEqual(second.applied, []);
+    // Ids are feature-owned labels, not a global sequence: the composition
+    // array applies the conversation domain's migrations (0001, 0002, 0004)
+    // before the memory domain's (0003), because memory tables hold foreign
+    // keys into conversation tables.
     assert.deepEqual(second.alreadyApplied, [
       "0001_conversation_work",
       "0002_conversation_tracing",
+      "0004_chat_identity",
       "0003_memory_work",
     ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
        WHERE table_schema = 'public'
-         AND table_name IN ('conversation_message', 'conversation_turn', 'response_pattern')
+         AND table_name IN ('conversation_message', 'conversation_turn', 'response_pattern', 'chat_identity')
        ORDER BY table_name`,
     );
     assert.deepEqual(
       tables.rows.map((row) => row.table_name),
-      ["conversation_message", "conversation_turn", "response_pattern"],
+      [
+        "chat_identity",
+        "conversation_message",
+        "conversation_turn",
+        "response_pattern",
+      ],
     );  });
+
+  it("reads the provisioned chat identity and fails closed without one", async () => {
+    const identity = await store.getChatIdentity();
+    assert.equal(
+      identity.content,
+      "Integration fixture identity: generic test text.",
+    );
+    assert.equal(identity.revision, 1);
+
+    // Missing row: the typed configuration error, never a silent default.
+    await pool.query("DELETE FROM chat_identity WHERE id = 'identity'");
+    try {
+      await assert.rejects(
+        () => store.getChatIdentity(),
+        (error) => {
+          assert.ok(error instanceof IdentityConfigurationError);
+          assert.ok(error.message.includes("chat_identity"));
+          return true;
+        },
+      );
+    } finally {
+      // Restore the fixture row the rest of the suite assumes.
+      await pool.query(
+        `INSERT INTO chat_identity (id, content, revision)
+         VALUES ('identity', 'Integration fixture identity: generic test text.', 1)`,
+      );
+    }
+    const restored = await store.getChatIdentity();
+    assert.equal(restored.revision, 1);
+  });
+
+  it("fails the turn as a configuration error when identity is missing, with no provider calls", async () => {
+    const decisionResponse = (choice) => ({
+      model: "decision-model-build",
+      answers: { [DECISION_QUESTION_ID]: { type: "choice", choice } },
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    const chatResponse = (content) => ({
+      id: "chat-x",
+      model: "chat-model-build",
+      choices: [
+        { message: { role: "assistant", content }, finish_reason: "stop" },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+    await store.appendUserMessage({ content: "no identity" });
+    const decisionCalls = [];
+    const chatCalls = [];
+    await pool.query("DELETE FROM chat_identity WHERE id = 'identity'");
+    try {
+      const result = await runEngineOnce({
+        store,
+        processTurn: (work, { leaseOwner }) =>
+          processTurnWork(work, {
+            decisionModel: "decision-model",
+            chatModel: "chat-model",
+            callDecisions: async (request) => {
+              decisionCalls.push(request);
+              return decisionResponse("concise");
+            },
+            callChat: async () => {
+              chatCalls.push("chat");
+              return chatResponse("unreachable");
+            },
+            loadIdentity: () => store.getChatIdentity(),
+            loadPatterns: () => store.getEnabledResponsePatterns(),
+            loadContext: (turnId) =>
+              store.getThreadContext({ turnId, limit: 40 }),
+          }),
+        leaseSeconds: 60,
+        pollSeconds: 1,
+        ownerLabel: "identity-missing",
+      });
+      assert.equal(result, "worked");
+
+      const turn = await pool.query(
+        "SELECT status, error FROM conversation_turn",
+      );
+      assert.equal(turn.rows[0].status, "failed");
+      assert.ok(
+        turn.rows[0].error.includes("chat_identity"),
+        `expected the configuration error on the turn, got: ${turn.rows[0].error}`,
+      );
+      // Fail-closed: no snapshot, no decision spend, no chat call.
+      assert.equal(decisionCalls.length, 0);
+      assert.equal(chatCalls.length, 0);
+      const snapshots = await pool.query(
+        "SELECT count(*)::int AS n FROM trace_attempt",
+      );
+      assert.equal(snapshots.rows[0].n, 1); // the attempt row exists (created at claim)
+      const chats = await pool.query(
+        "SELECT count(*)::int AS n FROM trace_attempt_chat",
+      );
+      assert.equal(chats.rows[0].n, 0);
+    } finally {
+      await pool.query(
+        `INSERT INTO chat_identity (id, content, revision)
+         VALUES ('identity', 'Integration fixture identity: generic test text.', 1)`,
+      );
+    }
+  });
 
   it("ingests user messages idempotently by client key", async () => {
     const first = await store.appendUserMessage({
@@ -290,6 +413,48 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.deepEqual(
       t2Context.map((message) => `${message.role}:${message.content}`),
       ["user:u1", "assistant:r1"],
+    );
+  });
+
+  it("bounds the context to the most recent 40 prior messages, sent oldest-to-newest", async () => {
+    // 45 prior turns, each one user message plus its reply (conversation
+    // order: u_i, r_i); then a live turn claims the pending message.
+    for (let index = 1; index <= 45; index += 1) {
+      const turn = await pool.query(
+        `INSERT INTO conversation_turn (id, status, created_at, completed_at)
+         VALUES (gen_random_uuid(), 'completed', now(), now()) RETURNING id`,
+      );
+      const turnId = turn.rows[0].id;
+      await pool.query(
+        `INSERT INTO conversation_message (role, content, turn_id) VALUES ('user', $1, $2)`,
+        [`u${String(index)}`, turnId],
+      );
+      await pool.query(
+        `INSERT INTO conversation_message (role, content, turn_id) VALUES ('assistant', $1, $2)`,
+        [`r${String(index)}`, turnId],
+      );
+    }
+
+    await store.appendUserMessage({ content: "current" });
+    const claim = await store.claimNextTurn({ owner: "o-40", leaseSeconds: 60 });
+    assert.equal(claim.kind, "claimed");
+
+    const window = await store.getThreadContext({
+      turnId: claim.work.turn.id,
+      limit: 40,
+    });
+    assert.equal(window.length, 40);
+    // Exactly the most recent 40 conversation-order messages: turn 26's user
+    // message through turn 45's reply — oldest first, newest last.
+    assert.deepEqual(
+      window.map((message) => message.content),
+      [
+        "u26", "r26", "u27", "r27", "u28", "r28", "u29", "r29", "u30", "r30",
+        "u31", "r31", "u32", "r32", "u33", "r33", "u34", "r34", "u35", "r35",
+        "u36", "r36", "u37", "r37", "u38", "r38", "u39", "r39", "u40", "r40",
+        "u41", "r41", "u42", "r42", "u43", "r43", "u44", "r44", "u45", "r45",
+      ],
+      "limit 40 must select the most recent 40 messages and send them oldest-to-newest",
     );
   });
 
@@ -614,6 +779,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       payload: {
         request: { model: "chat-model", messages: [{ role: "user", content: "stale" }] },
         messageSources: [null],
+        messageChunks: ["conversation"],
+        identityRevision: 1,
       },
     });
     assert.equal(staleChatRequest, false);
@@ -623,6 +790,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       payload: {
         request: { model: "chat-model", messages: [{ role: "user", content: "stale" }] },
         messageSources: [null],
+        messageChunks: ["conversation"],
+        identityRevision: 1,
         outcome: {
           kind: "failed",
           errorKind: "error",
@@ -771,6 +940,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
               usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 },
             };
           },
+          loadIdentity: () => store.getChatIdentity(),
           loadPatterns: () => store.getEnabledResponsePatterns(),
           loadContext: (turnId) =>
             store.getThreadContext({ turnId, limit: 50 }),
@@ -826,10 +996,15 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.ok(JSON.stringify(decisionCalls[0]).includes("Longer structured explanations"));
     assert.ok(!JSON.stringify(decisionCalls[0]).includes("Explain step by step."));
 
-    // The chat request carries the guidance as a system message plus both grouped messages.
+    // The chat request carries the identity as the leading system message,
+    // then the guidance as a second system message, plus both grouped messages.
     const roles = chatCalls[0].messages.map((message) => message.role);
-    assert.deepEqual(roles, ["system", "user", "user"]);
-    assert.equal(chatCalls[0].messages[0].content, "Explain step by step.");
+    assert.deepEqual(roles, ["system", "system", "user", "user"]);
+    assert.equal(
+      chatCalls[0].messages[0].content,
+      "Integration fixture identity: generic test text.",
+    );
+    assert.equal(chatCalls[0].messages[1].content, "Explain step by step.");
 
     const turn = await pool.query(
       "SELECT status, selected_pattern_id, decision, error FROM conversation_turn",
@@ -914,16 +1089,18 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       { option_id: "detailed", value: "0.75" },
     ]);
 
-    // The chat boundary: request messages (with source linkage), response,
-    // usage, and the published reply content, in the final responded state.
+    // The chat boundary: request messages (with source linkage and chunk
+    // classification), response, usage, the identity revision, and the
+    // published reply content, in the final responded state.
     const chat = await pool.query(
-      `SELECT state, request_model, response_id, response_model, reply_content,
+      `SELECT state, request_model, identity_revision, response_id, response_model, reply_content,
               usage_prompt_tokens, usage_completion_tokens, usage_total_tokens
        FROM trace_attempt_chat`,
     );
     assert.equal(chat.rows.length, 1);
     assert.equal(chat.rows[0].state, "responded");
     assert.equal(chat.rows[0].request_model, "chat-model");
+    assert.equal(chat.rows[0].identity_revision, 1);
     assert.equal(chat.rows[0].response_id, "chat-1");
     assert.equal(chat.rows[0].response_model, "chat-model-build");
     assert.equal(chat.rows[0].reply_content, "here is the answer");
@@ -932,17 +1109,23 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       [9, 4, 13],
     );
     const chatMessages = await pool.query(
-      `SELECT position, role, content, source_message_id
+      `SELECT position, role, content, source_message_id, chunk
        FROM trace_attempt_chat_message ORDER BY position`,
     );
-    assert.deepEqual(chatMessages.rows.map((row) => row.role), ["system", "user", "user"]);
-    assert.equal(chatMessages.rows[0].source_message_id, null); // guidance has no source
-    assert.equal(chatMessages.rows[0].content, "Explain step by step.");
-    assert.ok(chatMessages.rows[1].source_message_id !== null);
+    assert.deepEqual(chatMessages.rows.map((row) => row.role), ["system", "system", "user", "user"]);
+    assert.deepEqual(
+      chatMessages.rows.map((row) => row.chunk),
+      ["identity", "guidance", "conversation", "conversation"],
+    );
+    assert.equal(chatMessages.rows[0].source_message_id, null); // identity has no source
+    assert.equal(chatMessages.rows[0].content, "Integration fixture identity: generic test text.");
+    assert.equal(chatMessages.rows[1].source_message_id, null); // guidance has no source
+    assert.equal(chatMessages.rows[1].content, "Explain step by step.");
     assert.ok(chatMessages.rows[2].source_message_id !== null);
+    assert.ok(chatMessages.rows[3].source_message_id !== null);
     assert.notEqual(
-      chatMessages.rows[1].source_message_id,
       chatMessages.rows[2].source_message_id,
+      chatMessages.rows[3].source_message_id,
     );
 
     // Nothing else to do.
@@ -982,6 +1165,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       chatModel: "chat-model",
       callDecisions: async () => decisionResponse("concise"),
       callChat: async () => chatResponse("unobserved reply"),
+      loadIdentity: () => store.getChatIdentity(),
       loadPatterns: () => store.getEnabledResponsePatterns(),
       loadContext: (turnId) =>
         store.getThreadContext({ turnId, limit: 50 }),
@@ -1008,7 +1192,11 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.equal(firstOutcome.reply, "reply one");
     assert.deepEqual(
       firstChatCalls[0].messages.map((message) => `${message.role}:${message.content}`),
-      ["system:Answer in one short paragraph.", "user:first question"],
+      [
+        "system:Integration fixture identity: generic test text.",
+        "system:Answer in one short paragraph.",
+        "user:first question",
+      ],
     );
     const published = await store.publishReply({
       turnId: firstClaim.work.turn.id,
@@ -1055,6 +1243,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.deepEqual(
       secondChatCalls[0].messages.map((message) => `${message.role}:${message.content}`),
       [
+        "system:Integration fixture identity: generic test text.",
         "system:Answer in one short paragraph.",
         "user:first question",
         "assistant:reply one",
@@ -1092,6 +1281,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
               ],
             };
           },
+          loadIdentity: () => store.getChatIdentity(),
           loadPatterns: () => store.getEnabledResponsePatterns(),
           loadContext: (turnId) =>
             store.getThreadContext({ turnId, limit: 50 }),
@@ -1103,7 +1293,11 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.equal(chatCalls.length, 1);
     assert.deepEqual(
       chatCalls[0].messages.map((message) => message.role),
-      ["user"],
+      ["system", "user"],
+    );
+    assert.equal(
+      chatCalls[0].messages[0].content,
+      "Integration fixture identity: generic test text.",
     );
     const turn = await pool.query(
       "SELECT status, selected_pattern_id, decision FROM conversation_turn",
@@ -1127,6 +1321,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           callChat: async () => {
             throw new Error("chat must not be called");
           },
+          loadIdentity: () => store.getChatIdentity(),
           loadPatterns: () =>
             Promise.resolve([
               {
@@ -1182,6 +1377,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           callChat: async () => {
             throw new Error("chat must not be called");
           },
+          loadIdentity: () => store.getChatIdentity(),
           loadPatterns: () => store.getEnabledResponsePatterns(),
           loadContext: (turnId) =>
             store.getThreadContext({ turnId, limit: 50 }),
@@ -1279,6 +1475,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           callChat: async () => ({
             wrong: "shape",
           }),
+          loadIdentity: () => store.getChatIdentity(),
           loadPatterns: () => Promise.resolve([]),
           loadContext: (turnId) =>
             store.getThreadContext({ turnId, limit: 50 }),
@@ -1324,10 +1521,12 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     // The chat messages were recorded with the request (boundary survives
     // the contract failure), and the attempt is terminally failed.
     const chatMessages = await pool.query(
-      "SELECT role, source_message_id FROM trace_attempt_chat_message ORDER BY position",
+      "SELECT role, source_message_id, chunk FROM trace_attempt_chat_message ORDER BY position",
     );
-    assert.deepEqual(chatMessages.rows.map((row) => row.role), ["user"]);
-    assert.ok(chatMessages.rows[0].source_message_id !== null);
+    assert.deepEqual(chatMessages.rows.map((row) => row.role), ["system", "user"]);
+    assert.deepEqual(chatMessages.rows.map((row) => row.chunk), ["identity", "conversation"]);
+    assert.equal(chatMessages.rows[0].source_message_id, null);
+    assert.ok(chatMessages.rows[1].source_message_id !== null);
     const attempt = await pool.query(
       "SELECT outcome, finished_at IS NOT NULL AS finished FROM trace_attempt",
     );
@@ -1367,6 +1566,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           callChat: async () => {
             throw new Error("chat endpoint exploded");
           },
+          loadIdentity: () => store.getChatIdentity(),
           loadPatterns: () => store.getEnabledResponsePatterns(),
           loadContext: (turnId) =>
             store.getThreadContext({ turnId, limit: 50 }),
@@ -1578,6 +1778,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       payload: {
         request: { model: "chat-model", messages: [{ role: "user", content: "stale" }] },
         messageSources: [null],
+        messageChunks: ["conversation"],
+        identityRevision: 1,
         outcome: {
           kind: "failed",
           errorKind: "error",
@@ -1610,6 +1812,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       payload: {
         request: freshChatRequest,
         messageSources: [null, messageId],
+        messageChunks: ["guidance", "conversation"],
+        identityRevision: 1,
       },
     });
     assert.equal(freshRequestRecorded, true);
@@ -1619,6 +1823,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       payload: {
         request: freshChatRequest,
         messageSources: [null, messageId],
+        messageChunks: ["guidance", "conversation"],
+        identityRevision: 1,
         outcome: {
           kind: "responded",
           response: {
@@ -1692,9 +1898,26 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           payload: {
             request: chatRequest,
             messageSources: [messageId, messageId],
+            messageChunks: ["conversation"],
+            identityRevision: 1,
           },
         }),
       /messageSources must align/,
+    );
+    // A misaligned messageChunks payload fails the same way.
+    await assert.rejects(
+      () =>
+        store.recordChatRequest({
+          turnId: claim.work.turn.id,
+          leaseOwner: "owner-atomic",
+          payload: {
+            request: chatRequest,
+            messageSources: [messageId],
+            messageChunks: ["conversation", "conversation"],
+            identityRevision: 1,
+          },
+        }),
+      /messageChunks must align/,
     );
     const afterFailure = await pool.query(
       `SELECT (SELECT status FROM conversation_turn WHERE id = $1) AS status,
@@ -1716,7 +1939,12 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     const requested = await store.recordChatRequest({
       turnId: claim.work.turn.id,
       leaseOwner: "owner-atomic",
-      payload: { request: chatRequest, messageSources: [messageId] },
+      payload: {
+        request: chatRequest,
+        messageSources: [messageId],
+        messageChunks: ["conversation"],
+        identityRevision: 1,
+      },
     });
     assert.equal(requested, true);
     const requestedRow = await pool.query(
@@ -1730,6 +1958,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       payload: {
         request: chatRequest,
         messageSources: [messageId],
+        messageChunks: ["conversation"],
+        identityRevision: 1,
         outcome: {
           kind: "responded",
           response: {
@@ -1838,15 +2068,25 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     });
     const chatRequest = buildChatRequest({
       model: "chat-model",
+      identity: "Integration fixture identity: generic test text.",
       history: [],
       turnMessages: claim.work.messages,
       guidance: "Answer in one short paragraph.",
     });
-    const messageSources = [null, claim.work.messages[0].id];
+    const messageSources = [
+      null,
+      null,
+      claim.work.messages[0].id,
+    ];
     await store.recordChatRequest({
       turnId,
       leaseOwner: "owner-report",
-      payload: { request: chatRequest, messageSources },
+      payload: {
+        request: chatRequest,
+        messageSources,
+        messageChunks: ["identity", "guidance", "conversation"],
+        identityRevision: 1,
+      },
     });
     await store.recordChatOutcome({
       turnId,
@@ -1854,6 +2094,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       payload: {
         request: chatRequest,
         messageSources,
+        messageChunks: ["identity", "guidance", "conversation"],
+        identityRevision: 1,
         outcome: {
           kind: "responded",
           response: {
@@ -1918,13 +2160,23 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.equal(attempt.decision.selection, "selected");
     assert.equal(attempt.decision.rejectionReason, null);
 
-    // The chat boundary in the report: request messages with source linkage,
-    // choices, usage, and the reply.
+    // The chat boundary in the report: request messages with source linkage
+    // and chunk classification, choices, usage, the identity revision, and
+    // the reply.
     assert.notEqual(attempt.chat, null);
     assert.equal(attempt.chat.state, "responded");
+    assert.equal(attempt.chat.identityRevision, 1);
     assert.deepEqual(
-      attempt.chat.messages.map((message) => [message.role, message.sourceMessageId]),
-      [["system", null], ["user", claim.work.messages[0].id]],
+      attempt.chat.messages.map((message) => [
+        message.role,
+        message.sourceMessageId,
+        message.chunk,
+      ]),
+      [
+        ["system", null, "identity"],
+        ["system", null, "guidance"],
+        ["user", claim.work.messages[0].id, "conversation"],
+      ],
     );
     assert.deepEqual(
       attempt.chat.choices.map((choice) => [choice.finishReason, choice.content]),
@@ -1940,15 +2192,20 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
 
   it("preserves a legacy pre-tracing turn and its decision JSONB through the tracing migration", async () => {
     // Roll the database back to its pre-tracing shape: drop the tracing
-    // tables and their migration bookkeeping row, keep the domain tables.
+    // tables and their migration bookkeeping rows, keep the domain tables.
+    // The chat-identity migration (0004) ALTERs the tracing tables, so it is
+    // rolled back and re-applied together with 0002 — the same order the
+    // conversation domain's migration array supplies.
     await pool.query(
       `DROP TABLE IF EXISTS
          trace_attempt_chat_choice, trace_attempt_chat_message, trace_attempt_chat,
          trace_attempt_decision_probability, trace_attempt_decision,
-         trace_attempt_pattern, trace_attempt_context, trace_attempt CASCADE`,
+         trace_attempt_pattern, trace_attempt_context, trace_attempt,
+         chat_identity CASCADE`,
     );
     await pool.query(
-      `DELETE FROM companion_schema_migration WHERE id = '0002_conversation_tracing'`,
+      `DELETE FROM companion_schema_migration
+       WHERE id IN ('0002_conversation_tracing', '0004_chat_identity')`,
     );
 
     // A legacy turn exactly as pre-tracing code wrote it.
@@ -1966,9 +2223,12 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       [legacyTurnId],
     );
 
-    // The tracing migration applies cleanly over the legacy data.
+    // The tracing migrations apply cleanly over the legacy data.
     const applied = await runMigrations(pool, conversationMigrations);
-    assert.deepEqual(applied.applied, ["0002_conversation_tracing"]);
+    assert.deepEqual(applied.applied, [
+      "0002_conversation_tracing",
+      "0004_chat_identity",
+    ]);
 
     // The legacy row is untouched: the decision JSONB is exactly as inserted,
     // and no attempt rows were fabricated for it.
@@ -1997,6 +2257,13 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       model: "legacy-model",
     });
     assert.equal(report.attempts.length, 0);
+
+    // The rolled-back-and-reapplied chat-identity table starts empty again:
+    // re-provision the fixture row the rest of the suite assumes.
+    await pool.query(
+      `INSERT INTO chat_identity (id, content, revision)
+       VALUES ('identity', 'Integration fixture identity: generic test text.', 1)`,
+    );
   });
 
   /**
@@ -2103,6 +2370,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           chatWasCalled = true;
           throw new Error("chat must not be called after decision failure");
         },
+        loadIdentity: () => store.getChatIdentity(),
         loadPatterns: () => store.getEnabledResponsePatterns(),
         loadContext: (turnId) =>
           store.getThreadContext({ turnId, limit: 50 }),
@@ -2147,6 +2415,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         callChat: async () => {
           throw new Error("chat must not be called after decision failure");
         },
+        loadIdentity: () => store.getChatIdentity(),
         loadPatterns: () => store.getEnabledResponsePatterns(),
         loadContext: (turnId) =>
           store.getThreadContext({ turnId, limit: 50 }),
@@ -2185,6 +2454,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           model: "chat-model-build",
           choices: [],
         }),
+        loadIdentity: () => store.getChatIdentity(),
         loadPatterns: () => store.getEnabledResponsePatterns(),
         loadContext: (turnId) =>
           store.getThreadContext({ turnId, limit: 50 }),
@@ -2218,6 +2488,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
 
     const chatRequest = buildChatRequest({
       model: "chat-model",
+      identity: "Integration fixture identity: generic test text.",
       history: [],
       turnMessages: claim.work.messages,
       guidance: null,
@@ -2237,7 +2508,15 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       leaseOwner: "owner-a",
       payload: {
         request: chatRequest,
-        messageSources: claim.work.messages.map((message) => message.id),
+        messageSources: [
+          null,
+          ...claim.work.messages.map((message) => message.id),
+        ],
+        messageChunks: [
+          "identity",
+          ...claim.work.messages.map(() => "conversation"),
+        ],
+        identityRevision: 1,
         outcome: {
           kind: "responded",
           response,
@@ -2323,6 +2602,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           chatCalled += 1;
           throw new Error("chat must not be reached");
         },
+        loadIdentity: () => store.getChatIdentity(),
         loadPatterns: () => store.getEnabledResponsePatterns(),
         loadContext: (turnId) =>
           store.getThreadContext({ turnId, limit: 50 }),
@@ -2389,6 +2669,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           chatCalled += 1;
           throw new Error("chat must not be reached after a fenced outcome write");
         },
+        loadIdentity: () => store.getChatIdentity(),
         loadPatterns: () => store.getEnabledResponsePatterns(),
         loadContext: (turnId) =>
           store.getThreadContext({ turnId, limit: 50 }),
@@ -2457,6 +2738,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
             usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
           };
         },
+        loadIdentity: () => store.getChatIdentity(),
         loadPatterns: () => store.getEnabledResponsePatterns(),
         loadContext: (turnId) =>
           store.getThreadContext({ turnId, limit: 50 }),
@@ -2617,11 +2899,20 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       payload: {
         request: buildChatRequest({
           model: "chat-model",
+          identity: "Integration fixture identity: generic test text.",
           history: [],
           turnMessages: claim.work.messages,
           guidance: null,
         }),
-        messageSources: claim.work.messages.map((message) => message.id),
+        messageSources: [
+          null,
+          ...claim.work.messages.map((message) => message.id),
+        ],
+        messageChunks: [
+          "identity",
+          ...claim.work.messages.map(() => "conversation"),
+        ],
+        identityRevision: 1,
         outcome: {
           kind: "responded",
           response: {

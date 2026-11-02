@@ -99,12 +99,19 @@ export function renderChat(chat: TraceChat): readonly string[] {
   } else {
     lines.push("    max_tokens: (not set)");
   }
+  if (chat.identityRevision !== null) {
+    lines.push(`    identity revision: ${String(chat.identityRevision)}`);
+  } else {
+    lines.push("    identity revision: (not recorded)");
+  }
   lines.push("    messages sent:");
   for (const message of chat.messages) {
     const source =
       message.sourceMessageId !== null
         ? ` [message ${message.sourceMessageId}]`
-        : " (synthetic guidance)";
+        : message.chunk !== null
+          ? ` (synthetic ${message.chunk})`
+          : " (synthetic, unclassified)";
     lines.push(
       `      ${String(message.position)}: ${message.role}: ${JSON.stringify(message.content)}${source}`,
     );

@@ -208,6 +208,20 @@ async function withDisposablePostgres(t, use, { migrationIds } = {}) {
   }
   try {
     await applyMigrations(client, migrationIds);
+    // The chat identity is required runtime configuration: the runner's
+    // preflight refuses to send without it, so the disposable database
+    // carries a generic fixture row (never real content). Legacy-schema
+    // subsets (0001 only) predate the table, so this is conditional.
+    const identityTable = await client.query(
+      "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='chat_identity') AS present",
+    );
+    if (identityTable.rows[0].present) {
+      await client.query(
+        `INSERT INTO chat_identity (id, content, revision)
+         VALUES ('identity', 'Deployed-smoke fixture identity: generic test text.', 1)
+         ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content`,
+      );
+    }
     await use({ client, databaseUrl });
   } finally {
     await client.end().catch(() => {});

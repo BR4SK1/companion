@@ -349,6 +349,12 @@ async function main(): Promise<void> {
                 timeoutMs: config.openrouter.chatTimeoutMs,
               }),
             loadPatterns: () => store.getEnabledResponsePatterns(),
+            // Required, fail-closed configuration: a missing or empty
+            // identity row is an IdentityConfigurationError that fails the
+            // attempt before any snapshot, decision, or provider call — the
+            // prompt is never assembled with an invented persona. Read fresh
+            // per turn, so owner edits apply on the next turn.
+            loadIdentity: () => store.getChatIdentity(),
             loadContext: (turnId) =>
               store.getThreadContext({
                 turnId,

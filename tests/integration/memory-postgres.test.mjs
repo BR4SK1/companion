@@ -53,7 +53,6 @@ import { getTemporalPeriod } from "../../apps/worker/src/memory/temporal/periods
 import { getTemporalSummaryPromptContext } from "../../apps/worker/src/memory/temporal/store.ts";
 import { generateProfileIfNeeded, getProfileDocument } from "../../apps/worker/src/memory/profiles-v2.ts";
 import {
-  buildMemorySystemMessage,
   renderProfileSection,
 } from "../../apps/worker/src/memory/chat-context.ts";
 import { buildChatRequest } from "../../apps/worker/src/work/chat.ts";
@@ -1002,16 +1001,16 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     );
     const v2 = await getProfileDocument(pool, "user");
     assert.ok(v2 !== null);
-    const chatMessage = buildMemorySystemMessage({
-      profileSection: renderProfileSection({ profile: v2 }),
-      temporalContext: context.recentText,
-    });
-    assert.ok(chatMessage !== undefined);
-    assert.ok(chatMessage.includes("The owner likes morning tea."));
-    assert.ok(chatMessage.includes("<recent_memories>"));
-    assert.ok(chatMessage.includes("<this_morning"));
-    assert.ok(!chatMessage.includes("<profile_memories>"));
-    assert.ok(!chatMessage.includes("Settled, steady mornings."));
+    // Each section renders independently; the chat prompt assembles them as
+    // separate chunks (see work/chat.ts), so here the renderers are checked
+    // directly.
+    const profileChunk = renderProfileSection({ profile: v2 });
+    assert.ok(profileChunk !== undefined);
+    assert.ok(profileChunk.includes("The owner likes morning tea."));
+    assert.ok(context.recentText.includes("<recent_memories>"));
+    assert.ok(context.recentText.includes("<this_morning"));
+    assert.ok(!profileChunk.includes("<profile_memories>"));
+    assert.ok(!profileChunk.includes("Settled, steady mornings."));
   });
 
   it("records metadata-only operation traces", async () => {
@@ -1049,33 +1048,40 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     }
   });
 
-  it("sends the memory context as a synthetic system message after guidance", async () => {
+  it("sends identity, separated memory chunks, and guidance as synthetic system messages", async () => {
     const history = [];
     const turnMessages = [{ id: "m-1", role: "user", content: "What tea do I like?" }];
     const request = buildChatRequest({
       model: "test-model",
+      identity: "FIXTURE IDENTITY",
       history,
       turnMessages,
+      profiles: "PROFILE",
+      recall: "MEMORY CONTEXT",
       guidance: "PATTERN GUIDANCE",
-      memoryContext: "MEMORY CONTEXT",
     });
     assert.equal(request.messages[0].role, "system");
-    assert.equal(request.messages[0].content, "PATTERN GUIDANCE");
-    assert.equal(request.messages[1].role, "system");
-    assert.equal(request.messages[1].content, "MEMORY CONTEXT");
-    assert.equal(request.messages[2].content, "What tea do I like?");
+    assert.equal(request.messages[0].content, "FIXTURE IDENTITY");
+    assert.equal(request.messages[1].content, "PROFILE");
+    assert.equal(request.messages[2].content, "MEMORY CONTEXT");
+    assert.equal(request.messages[3].content, "PATTERN GUIDANCE");
+    assert.equal(request.messages[4].content, "What tea do I like?");
 
-    // Without memory there is no second system message (guidance only).
+    // Without memory or guidance only the identity system message remains.
     const bare = buildChatRequest({
       model: "test-model",
+      identity: "FIXTURE IDENTITY",
       history,
       turnMessages,
       guidance: null,
     });
-    assert.equal(bare.messages.length, 1);
+    assert.deepEqual(
+      bare.messages.map((message) => `${message.role}:${message.content}`),
+      ["system:FIXTURE IDENTITY", "user:What tea do I like?"],
+    );
 
-    // The processor renders the loaded sections into that message and
-    // records a null source for it; loader failures never fail the turn.
+    // The processor sends each loaded section as its own message and records
+    // a null source for each; loader failures never fail the turn.
     const outcome = await processTurnWork(
       {
         turn: { id: "turn-1", status: "in_flight", attempt: 1, lease_owner: "o", lease_expires_at: new Date() },
@@ -1096,6 +1102,7 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
           ],
           usage: { prompt_tokens: 9, completion_tokens: 4, total_tokens: 13 },
         }),
+        loadIdentity: async () => ({ content: "FIXTURE IDENTITY", revision: 1 }),
         loadPatterns: async () => [],
         loadContext: async () => [],
         loadMemoryContext: async ({ userText }) => ({

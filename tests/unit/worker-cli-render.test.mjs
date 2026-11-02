@@ -45,6 +45,7 @@ const baseChat = {
   requestModel: "chat-model",
   temperature: null,
   maxTokens: null,
+  identityRevision: null,
   responseId: null,
   state: null,
   responseModel: null,
@@ -188,18 +189,23 @@ describe("worker trace CLI rendering", () => {
       temperature: 0.5,
       maxTokens: 256,
       messages: [
-        { position: 0, role: "system", content: "guidance", sourceMessageId: null },
+        { position: 0, role: "system", content: "guidance", sourceMessageId: null, chunk: "guidance" },
         {
           position: 1,
           role: "user",
           content: "hello",
           sourceMessageId: "11111111-1111-1111-1111-111111111111",
+          chunk: "conversation",
         },
       ],
     });
     assert.ok(lines.some((line) => line.includes("state: requested")));
     assert.ok(lines.some((line) => line.includes("temperature: 0.5")));
     assert.ok(lines.some((line) => line.includes("max_tokens: 256")));
+    assert.ok(
+      lines.some((line) => line.includes("identity revision: (not recorded)")),
+      `expected the identity-revision marker, got:\n${lines.join("\n")}`,
+    );
     assert.ok(
       lines.some((line) => line.includes("0: system: \"guidance\" (synthetic guidance)")),
       `expected the synthetic guidance marker, got:\n${lines.join("\n")}`,

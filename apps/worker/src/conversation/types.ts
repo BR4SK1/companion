@@ -17,6 +17,46 @@ import type { ChatRequest, ChatResponse } from "@companion/openrouter/chat";
 
 export type MessageRole = "user" | "assistant";
 
+/**
+ * Which assembly chunk a chat-request message belongs to. Synthetic system
+ * messages are classified by their source (identity, generated subject
+ * profiles, temporal memory, long-term recall, selected response-pattern
+ * guidance); every conversation message is `conversation`. The classification
+ * is trace metadata only — the rendered text itself is already recorded in
+ * the chat boundary as sent.
+ */
+export type ChatChunkName =
+  | "identity"
+  | "profiles"
+  | "temporal"
+  | "recall"
+  | "guidance"
+  | "conversation";
+
+/**
+ * The owner-authored chat identity/persona as provisioned in the
+ * `chat_identity` table (singleton row, runtime configuration like
+ * `response_pattern`). The content is configuration text supplied at
+ * runtime, never code or repository content; `revision` is the owner-managed
+ * counter recorded on each chat boundary trace.
+ */
+export interface ChatIdentity {
+  readonly content: string;
+  readonly revision: number;
+}
+
+/**
+ * The chat identity is required configuration: a missing or empty identity
+ * is a configuration error, never a silently-degraded prompt or an invented
+ * persona.
+ */
+export class IdentityConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "IdentityConfigurationError";
+  }
+}
+
 /** One message of the single continuous visible thread, in `seq` order. */
 export interface ConversationMessage {
   readonly id: string;
@@ -157,6 +197,14 @@ export type DecisionSelectionTrace =
 export interface ChatRequestTracePayload {
   readonly request: ChatRequest;
   readonly messageSources: readonly (string | null)[];
+  /**
+   * Chunk classification per request message, index-aligned with
+   * `messageSources`. Synthetic messages carry their chunk name; every
+   * conversation message is `conversation`.
+   */
+  readonly messageChunks: readonly ChatChunkName[];
+  /** The `chat_identity` revision the request carried. */
+  readonly identityRevision: number;
 }
 
 /**
@@ -190,6 +238,8 @@ export type ChatOutcomeTrace =
 export interface ChatOutcomeTracePayload {
   readonly request: ChatRequest;
   readonly messageSources: readonly (string | null)[];
+  readonly messageChunks: readonly ChatChunkName[];
+  readonly identityRevision: number;
   readonly outcome: ChatOutcomeTrace;
 }
 
@@ -259,6 +309,8 @@ export interface TraceChatMessage {
   readonly role: "system" | "user" | "assistant";
   readonly content: string;
   readonly sourceMessageId: string | null;
+  /** Assembly-chunk classification; null for rows recorded pre-0004. */
+  readonly chunk: ChatChunkName | null;
 }
 
 /** One choice returned by the attempt's chat response. */
@@ -273,6 +325,8 @@ export interface TraceChat {
   readonly requestModel: string;
   readonly temperature: number | null;
   readonly maxTokens: number | null;
+  /** The `chat_identity` revision the request carried; null pre-0004. */
+  readonly identityRevision: number | null;
   readonly responseId: string | null;
   readonly state: string | null;
   readonly responseModel: string | null;

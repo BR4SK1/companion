@@ -16,7 +16,6 @@ import {
 } from "../../apps/worker/src/memory/recall.ts";
 import {
   buildCanonicalMemoryContextForPrompt,
-  buildMemorySystemMessage,
   renderProfileSection,
 } from "../../apps/worker/src/memory/chat-context.ts";
 
@@ -212,22 +211,6 @@ describe("canonical memory context rendering", () => {
     );
     assert.equal(renderProfileSection(undefined), undefined);
     assert.equal(renderProfileSection(null), undefined);
-  });
-
-  it("joins the memory system message in profile, temporal, recall order", () => {
-    assert.equal(
-      buildMemorySystemMessage({
-        profileSection: "PROFILES",
-        temporalContext: "TEMPORAL",
-        memoryContext: "RECALL",
-      }),
-      "PROFILES\n\nTEMPORAL\n\nRECALL",
-    );
-    assert.equal(
-      buildMemorySystemMessage({ memoryContext: "RECALL" }),
-      "RECALL",
-    );
-    assert.equal(buildMemorySystemMessage({}), undefined);
   });
 });
 

@@ -230,9 +230,10 @@ describe("pattern selection from a validated exchange", () => {
 });
 
 describe("chat request assembly", () => {
-  it("sends history then the turn's messages, oldest first", () => {
+  it("sends identity, history, then the turn's messages, oldest first", () => {
     const request = buildChatRequest({
       model: "chat-model",
+      identity: "IDENTITY",
       history: [message(1, "user", "earlier"), message(2, "assistant", "reply")],
       turnMessages: [message(3, "user", "new one"), message(4, "user", "and another")],
       guidance: null,
@@ -241,6 +242,7 @@ describe("chat request assembly", () => {
     assert.deepEqual(
       request.messages.map((m) => `${m.role}:${m.content}`),
       [
+        "system:IDENTITY",
         "user:earlier",
         "assistant:reply",
         "user:new one",
@@ -249,29 +251,114 @@ describe("chat request assembly", () => {
     );
   });
 
-  it("puts the selected pattern's guidance in a leading system message", () => {
+  it("orders identity, memory chunks, guidance, then conversation", () => {
     const request = buildChatRequest({
       model: "chat-model",
-      history: [],
-      turnMessages: [message(1, "user", "hi")],
+      identity: "IDENTITY",
+      profiles: "PROFILES",
+      temporal: "TEMPORAL",
+      recall: "RECALL",
+      history: [message(1, "user", "earlier")],
+      turnMessages: [message(2, "user", "new one")],
       guidance: "Answer in one short paragraph.",
     });
-    assert.equal(request.messages.length, 2);
-    assert.equal(request.messages[0].role, "system");
-    assert.equal(request.messages[0].content, "Answer in one short paragraph.");
-    assert.equal(request.messages[1].role, "user");
+    assert.deepEqual(
+      request.messages.map((m) => `${m.role}:${m.content}`),
+      [
+        "system:IDENTITY",
+        "system:PROFILES",
+        "system:TEMPORAL",
+        "system:RECALL",
+        "system:Answer in one short paragraph.",
+        "user:earlier",
+        "user:new one",
+      ],
+    );
   });
 
-  it("sends no system message when no pattern was selected", () => {
+  it("keeps every conversation message's role exactly as persisted", () => {
     const request = buildChatRequest({
       model: "chat-model",
-      history: [],
-      turnMessages: [message(1, "user", "hi")],
+      identity: "IDENTITY",
+      history: [message(1, "user", "q1"), message(2, "assistant", "a1")],
+      turnMessages: [message(3, "user", "q2")],
       guidance: null,
     });
     assert.deepEqual(
       request.messages.map((m) => m.role),
-      ["user"],
+      ["system", "user", "assistant", "user"],
+    );
+  });
+
+  it("sends no guidance message when no pattern was selected", () => {
+    const request = buildChatRequest({
+      model: "chat-model",
+      identity: "IDENTITY",
+      history: [],
+      turnMessages: [message(1, "user", "hi")],
+      guidance: null,
+    });
+    // Only the identity system message plus the turn's messages.
+    assert.deepEqual(
+      request.messages.map((m) => `${m.role}:${m.content}`),
+      ["system:IDENTITY", "user:hi"],
+    );
+  });
+
+  it("preserves exact chronological order across a larger-than-limit window", () => {
+    // The store bounds the prior-turn snapshot to the most recent window
+    // (see getThreadContext); assembly receives that window and must send
+    // it in the same oldest-to-newest order, unchanged.
+    const history = [];
+    for (let seq = 1; seq <= 45; seq += 1) {
+      history.push(
+        message(seq, seq % 2 === 1 ? "user" : "assistant", `msg-${String(seq)}`),
+      );
+    }
+    const request = buildChatRequest({
+      model: "chat-model",
+      identity: "IDENTITY",
+      history,
+      turnMessages: [message(46, "user", "latest")],
+      guidance: null,
+    });
+    const conversation = request.messages.slice(1);
+    assert.equal(conversation.length, 46);
+    assert.deepEqual(
+      conversation.map((m) => m.content),
+      [
+        ...Array.from({ length: 45 }, (_, index) => `msg-${String(index + 1)}`),
+        "latest",
+      ],
+      "the bounded window must be sent oldest-to-newest with nothing reordered",
+    );
+    // The oldest message comes first even though limiting selects the tail.
+    assert.equal(conversation[0].content, "msg-1");
+    assert.equal(conversation[conversation.length - 1].content, "latest");
+  });
+
+  it("sends a grouped turn's messages together, in seq order, after history", () => {
+    const request = buildChatRequest({
+      model: "chat-model",
+      identity: "IDENTITY",
+      history: [message(1, "user", "q1"), message(2, "assistant", "a1")],
+      turnMessages: [
+        message(3, "user", "part one"),
+        message(4, "user", "part two"),
+        message(5, "user", "part three"),
+      ],
+      guidance: null,
+    });
+    assert.deepEqual(
+      request.messages.map((m) => `${m.role}:${m.content}`),
+      [
+        "system:IDENTITY",
+        "user:q1",
+        "assistant:a1",
+        "user:part one",
+        "user:part two",
+        "user:part three",
+      ],
     );
   });
 });
@@ -289,7 +376,7 @@ describe("worker configuration", () => {
     const config = loadWorkerConfig(validEnv);
     assert.equal(config.leaseSeconds, 60);
     assert.equal(config.pollSeconds, 1);
-    assert.equal(config.contextMessageLimit, 50);
+    assert.equal(config.contextMessageLimit, 40);
     assert.equal(config.openrouter.chatTimeoutMs, 120000);
     assert.equal(config.openrouter.decisionTimeoutMs, 30000);
     assert.ok(config.openrouter.chatUrl.startsWith("https://"));

@@ -10,7 +10,7 @@
 import { expect, test } from "@playwright/test";
 
 import { gateOrigin, messagePost, threadGet, uniqueKey } from "../helpers/api.mjs";
-import { PATTERNS, seedPatterns } from "../helpers/db.mjs";
+import { PATTERNS, seedPatterns, seedIdentity, E2E_IDENTITY } from "../helpers/db.mjs";
 import { waitForQuiescent } from "../helpers/quiesce.mjs";
 import {
   chatRecords,
@@ -30,6 +30,7 @@ test.beforeAll(async () => {
   await waitForQuiescent();
   await resetMode();
   await seedPatterns();
+  await seedIdentity();
   await resetRecords();
 });
 
@@ -82,13 +83,15 @@ test.describe("accept, answer, persist", () => {
     expect(decision.questions.response_pattern.criteria["e2e-detail"]).toBe(PATTERNS[1].selectionDescription);
     expect(decision.questions.response_pattern.instructions).toBeTruthy();
 
-    // The chat generation used the selected pattern's response guidance as
-    // the leading system message (the provider answers with the first
-    // offered option, i.e. the first seeded pattern).
+    // The chat generation carries the seeded identity as the leading system
+    // message and the selected pattern's response guidance as the second
+    // (the provider answers with the first offered option, i.e. the first
+    // seeded pattern).
     const chats = await chatRecords();
     expect(chats.length).toBeGreaterThanOrEqual(1);
     const chat = chats.at(-1).body;
-    expect(chat.messages[0]).toEqual({ role: "system", content: greetingGuidance });
+    expect(chat.messages[0]).toEqual({ role: "system", content: E2E_IDENTITY });
+    expect(chat.messages[1]).toEqual({ role: "system", content: greetingGuidance });
     expect(chat.messages.some((message) => message.role === "user" && message.content === text)).toBe(true);
     expect(chat.model).toBe("e2e-fake-chat-model");
   });
@@ -134,16 +137,18 @@ test.describe("accept, answer, persist", () => {
     expect(chats.length).toBe(chatsBefore + 2);
     const secondTurnRequest = chats.at(-1).body;
     const roles = secondTurnRequest.messages.map((message) => message.role);
-    // Leading guidance, then prior context and this turn's message.
+    // Leading identity, then guidance, then prior context and this turn's
+    // message.
     expect(roles[0]).toBe("system");
-    expect(secondTurnRequest.messages[0].content).toBe(greetingGuidance);
+    expect(secondTurnRequest.messages[0].content).toBe(E2E_IDENTITY);
+    expect(secondTurnRequest.messages[1].content).toBe(greetingGuidance);
     const contents = secondTurnRequest.messages.map((message) => message.content);
     const firstIndex = contents.indexOf(first);
     const replyAfterFirstIndex = roles.findIndex(
       (role, index) => index > firstIndex && role === "assistant",
     );
     const secondIndex = contents.indexOf(second);
-    expect(firstIndex).toBeGreaterThan(0);
+    expect(firstIndex).toBeGreaterThan(1);
     expect(replyAfterFirstIndex).toBeGreaterThan(firstIndex);
     expect(secondIndex).toBeGreaterThan(replyAfterFirstIndex);
   });

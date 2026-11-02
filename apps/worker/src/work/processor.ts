@@ -6,10 +6,18 @@
  * without network or database and keeps application policy (which models,
  * which endpoints) at the composition edge.
  *
+ * The chat identity is required configuration and is loaded fail-closed
+ * before any snapshot, decision, or provider call: a missing or empty
+ * identity is an `IdentityConfigurationError` that fails the attempt — the
+ * prompt is never assembled with an invented persona.
+ *
  * Memory context (when a loader is provided) is assembled before the chat
- * call and sent as a second system message after the response guidance.
- * Memory work never fails a chat turn: loader errors are logged and the
- * turn proceeds without memory.
+ * call and sent as separate synthetic system messages — generated subject
+ * profiles, temporal memory, and long-term recall each contribute their own
+ * chunk, in that order, after identity and before the selected pattern's
+ * guidance. Empty sections contribute no chunk; memory work never fails a
+ * chat turn: loader errors are logged and the turn proceeds without the
+ * failed section.
  *
  * Tracing boundaries (all injected, all fenced at the store):
  * - `recordSnapshot` — the attempt's input snapshot, before the decision step.
@@ -40,6 +48,7 @@ import type {
   ChatOutcomeTrace,
   ChatOutcomeTracePayload,
   ChatRequestTracePayload,
+  ChatIdentity,
   ConversationMessage,
   DecisionOutcomeTrace,
   DecisionOutcomeTracePayload,
@@ -53,9 +62,8 @@ import {
   DECISION_QUESTION_ID,
   selectResponsePattern,
 } from "./decision.ts";
-import { buildChatRequest } from "./chat.ts";
+import { buildChatPrompt } from "./chat.ts";
 import type { MemoryChatContext } from "../memory/types.ts";
-import { buildMemorySystemMessage } from "../memory/chat-context.ts";
 import { OpenRouterTransportError } from "@companion/openrouter/transport";
 import type {
   ChatRequest,
@@ -80,6 +88,12 @@ export interface TurnProcessorDeps {
   readonly callChat: (request: ChatRequest) => Promise<unknown>;
   /** Enabled response patterns, in their stable presentation order. */
   readonly loadPatterns: () => Promise<readonly ResponsePattern[]>;
+  /**
+   * The owner-authored chat identity, read fresh per turn (fail-closed:
+   * missing identity configuration is an `IdentityConfigurationError` that
+   * fails the attempt before any snapshot, decision, or provider call).
+   */
+  readonly loadIdentity: () => Promise<ChatIdentity>;
   /** Prior-turn context for this turn, oldest first. */
   readonly loadContext: (turnId: string) => Promise<readonly ConversationMessage[]>;
   readonly temperature?: number;
@@ -212,6 +226,11 @@ export async function processTurnWork(
 ): Promise<TurnOutcome> {
   const history = await deps.loadContext(work.turn.id);
   const patterns = await deps.loadPatterns();
+  // The identity is required configuration. It is loaded fail-closed before
+  // the snapshot and every provider call: with identity configuration
+  // missing, the attempt fails here — nothing is invented in its place, and
+  // no decision or chat spend happens against a persona-less prompt.
+  const identity = await deps.loadIdentity();
   const fullContext = [...history, ...work.messages];
 
   // Snapshot boundary: the exact mutable patterns and ordered context this
@@ -330,9 +349,13 @@ export async function processTurnWork(
   }
 
   // Memory context assembly. Memory must never fail a turn: loader errors
-  // are logged and the turn continues without memory context. The assembled
-  // system message is synthetic (null message source in the chat trace).
-  let memoryContext: string | null = null;
+  // are logged and the turn continues without the failed section. Each
+  // loaded section is sent as its own synthetic system message (null message
+  // source in the chat trace); a section that rendered nothing contributes
+  // no chunk at all.
+  let profilesChunk: string | null = null;
+  let temporalChunk: string | null = null;
+  let recallChunk: string | null = null;
   if (deps.loadMemoryContext !== undefined) {
     const userText = work.messages
       .filter((message) => message.role === "user")
@@ -345,51 +368,47 @@ export async function processTurnWork(
           turnId: work.turn.id,
           userText,
         });
-        memoryContext = buildMemorySystemMessage({
-          profileSection: loaded?.profileSection,
-          temporalContext: loaded?.temporalContext,
-          memoryContext: loaded?.memoryContext,
-        }) ?? null;
+        profilesChunk = loaded?.profileSection ?? null;
+        temporalChunk = loaded?.temporalContext ?? null;
+        recallChunk = loaded?.memoryContext ?? null;
       } catch (error) {
         console.warn(
           `[MEMORY] context assembly failed for turn ${work.turn.id}: ${errorMessage(error)}; continuing without memory`,
         );
-        memoryContext = null;
+        profilesChunk = null;
+        temporalChunk = null;
+        recallChunk = null;
       }
     }
   }
 
-  const chatRequest = buildChatRequest({
+  // The assembled prompt is the single source of truth for the wire request
+  // and its trace metadata: chunk classification and source linkage are
+  // index-aligned by construction.
+  const { request: chatRequest, messages: assembledMessages } = buildChatPrompt({
     model: deps.chatModel,
     history,
     turnMessages: work.messages,
+    identity: identity.content,
     guidance: selected !== undefined ? selected.responseGuidance : null,
-    memoryContext,
+    ...(profilesChunk !== null ? { profiles: profilesChunk } : {}),
+    ...(temporalChunk !== null ? { temporal: temporalChunk } : {}),
+    ...(recallChunk !== null ? { recall: recallChunk } : {}),
     ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
     ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
   });
-
-  // Message sources aligned index-by-index with the chat request messages:
-  // null for synthetic system messages (guidance, memory context), the
-  // conversation message id for every other message. Computed before the
-  // call: it is a pure function of the request, and it is recorded with the
-  // request.
-  const messageSources: (string | null)[] = [];
-  if (selected !== undefined) {
-    messageSources.push(null);
-  }
-  if (memoryContext !== null) {
-    messageSources.push(null);
-  }
-  for (const message of fullContext) {
-    messageSources.push(message.id);
-  }
+  const messageSources = assembledMessages.map(
+    (message) => message.sourceMessageId,
+  );
+  const messageChunks = assembledMessages.map((message) => message.chunk);
 
   // Chat request boundary: persisted before the provider call.
   if (deps.recordChatRequest !== undefined) {
     await deps.recordChatRequest({
       request: chatRequest,
       messageSources,
+      messageChunks,
+      identityRevision: identity.revision,
     });
   }
 
@@ -405,6 +424,8 @@ export async function processTurnWork(
         await deps.recordChatOutcome({
           request: chatRequest,
           messageSources,
+          messageChunks,
+          identityRevision: identity.revision,
           outcome: chatFailureTrace(error),
         });
       } catch {
@@ -424,6 +445,8 @@ export async function processTurnWork(
         await deps.recordChatOutcome({
           request: chatRequest,
           messageSources,
+          messageChunks,
+          identityRevision: identity.revision,
           outcome: chatInvalidTrace(error),
         });
       } catch {
@@ -448,6 +471,8 @@ export async function processTurnWork(
     await deps.recordChatOutcome({
       request: chatRequest,
       messageSources,
+      messageChunks,
+      identityRevision: identity.revision,
       outcome: {
         kind: "responded",
         response: chatResponse,

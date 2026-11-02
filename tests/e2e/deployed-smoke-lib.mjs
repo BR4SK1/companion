@@ -217,6 +217,10 @@ try {
     out.queuedUserMessages = await scalar("(SELECT count(*) FROM conversation_message WHERE role='user' AND turn_id IS NULL)");
     out.inFlightTurns = await scalar("(SELECT count(*) FROM conversation_turn WHERE status='in_flight')");
     out.enabledPatterns = await scalar("(SELECT count(*) FROM response_pattern WHERE enabled)");
+    // The chat identity is required runtime configuration: a full turn
+    // cannot publish without it, so a smoke run must fail fast here with a
+    // clear reason instead of a failed turn mid-journey.
+    out.identityProvisioned = await scalar("(SELECT count(*) FROM chat_identity WHERE id = 'identity' AND length(btrim(content)) > 0)");
     out.baselineMessages = await scalar("(SELECT count(*) FROM conversation_message)");
     out.baselineTurns = await scalar("(SELECT count(*) FROM conversation_turn)");
     out.newestMessageAgeMinutes = await scalar("(SELECT round(extract(epoch FROM (now() - max(created_at))) / 60) FROM conversation_message)");

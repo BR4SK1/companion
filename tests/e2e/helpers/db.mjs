@@ -74,6 +74,30 @@ export const PATTERNS = [
 ];
 
 /** Insert or refresh the synthetic response patterns as enabled rows. */
+
+/** The synthetic identity text the chat prompt requires. Generic fixture
+ *  content only: the owner-authored identity is runtime configuration, so
+ *  the throwaway stack seeds its own structural value here. */
+export const E2E_IDENTITY =
+  "E2E-IDENTITY: you are the assistant under test in a disposable stack.";
+
+/** Insert or refresh the synthetic chat identity row the worker requires. */
+export async function seedIdentity() {
+  await psql(
+    `INSERT INTO chat_identity (id, content, revision)
+     VALUES ('identity', '${E2E_IDENTITY}', 1)
+     ON CONFLICT (id) DO UPDATE SET
+       content = EXCLUDED.content, revision = EXCLUDED.revision;`,
+  );
+  const count = await psql(
+    "SELECT count(*) FROM chat_identity WHERE id = 'identity';",
+  );
+  if (count.trim() !== "1") {
+    throw new Error("failed to seed the chat identity row");
+  }
+}
+
+/** Insert or refresh the synthetic response patterns as enabled rows. */
 export async function seedPatterns() {
   const values = PATTERNS.map(
     (pattern) =>
