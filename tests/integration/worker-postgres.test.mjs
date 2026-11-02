@@ -23,6 +23,7 @@ import {
   withTransaction,
 } from "../../libraries/postgres/src/index.ts";
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
+import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import {
   CLAIM_ADVISORY_LOCK_KEY,
   createConversationStore,
@@ -49,9 +50,10 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
   before(async () => {
     pool = createPostgresPool({ connectionString: DATABASE_URL });
     store = createConversationStore(pool);
-    // Fresh application against the provided non-production database; every
-    // test below assumes the domain schema exists.
-    await runMigrations(pool, conversationMigrations);
+    // Fresh application against the provided non-production database; the
+    // worker applies the conversation and memory domain migrations together
+    // (see main.ts), so every test below assumes both domain schemas exist.
+    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations]);
   });
 
   after(async () => {
@@ -61,21 +63,29 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
   });
 
   beforeEach(async () => {
+    // CASCADE: memory-domain child tables reference conversation rows (the
+    // memory suite runs against the same disposable database); truncating
+    // them here keeps the suites order-independent. The memory suite
+    // truncates its own tables before each of its tests.
     await pool.query(
       `TRUNCATE conversation_message, conversation_turn, response_pattern,
         trace_attempt, trace_attempt_context, trace_attempt_pattern,
         trace_attempt_decision, trace_attempt_decision_probability,
         trace_attempt_chat, trace_attempt_chat_message,
-        trace_attempt_chat_choice RESTART IDENTITY`,
+        trace_attempt_chat_choice RESTART IDENTITY CASCADE`,
     );
   });
 
   it("re-applies migrations idempotently with the domain tables present", async () => {
-    const second = await runMigrations(pool, conversationMigrations);
+    const second = await runMigrations(pool, [
+      ...conversationMigrations,
+      ...memoryMigrations,
+    ]);
     assert.deepEqual(second.applied, []);
     assert.deepEqual(second.alreadyApplied, [
       "0001_conversation_work",
       "0002_conversation_tracing",
+      "0003_memory_work",
     ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
@@ -86,8 +96,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.deepEqual(
       tables.rows.map((row) => row.table_name),
       ["conversation_message", "conversation_turn", "response_pattern"],
-    );
-  });
+    );  });
 
   it("ingests user messages idempotently by client key", async () => {
     const first = await store.appendUserMessage({

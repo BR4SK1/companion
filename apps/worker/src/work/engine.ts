@@ -31,6 +31,13 @@ export interface EngineDeps {
   /** Stable-ish label for logs; the claim token itself is always unique. */
   readonly ownerLabel?: string;
   readonly log?: (message: string) => void;
+  /**
+   * Optional post-publication hook, invoked fire-and-forget after a reply is
+   * durably published (not for duplicates, fenced attempts, or failures).
+   * Memory ingestion subscribes here; the hook must never block or fail the
+   * engine cycle, so implementations are expected to enqueue work and return.
+   */
+  readonly onTurnPublished?: (turnId: string) => void | Promise<void>;
 }
 
 export type EngineCycleResult = "worked" | "idle";
@@ -111,6 +118,14 @@ export async function runEngineOnce(deps: EngineDeps): Promise<EngineCycleResult
       log(`reply for turn ${work.turn.id} already published; duplicate no-op`);
     } else {
       log(`published reply for turn ${work.turn.id}`);
+      // Post-publication hook, fire-and-forget: a failing or hanging hook
+      // must never affect the engine cycle, so it is invoked without await.
+      try {
+        const hookResult = deps.onTurnPublished?.(work.turn.id);
+        if (hookResult instanceof Promise) void hookResult.catch(() => undefined);
+      } catch {
+        // synchronous hook errors are swallowed by contract
+      }
     }
   } catch (error) {
     const fail = await deps.store.failTurn({

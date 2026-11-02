@@ -346,7 +346,43 @@ try {
               out.trace.deletedCounts = counts;
             }
           }
-          if (traceRefused) {
+          // Memory-domain rows (migration 0003) can reference this turn's
+          // rows: facts and extraction runs carry turn ids, source-message
+          // links carry message ids, and the ingest watermark / operation
+          // trace can reference the turn. This cleanup's authority is the
+          // smoke's own conversation data only — if any memory row references
+          // the synthetic turn, refuse: deleting the conversation rows would
+          // either fail on the foreign keys or orphan memory state built on
+          // synthetic turns. A deployment without the memory schema (or with
+          // memory unprovisioned, hence no memory rows) skips the guard
+          // entirely, like the trace guard above.
+          out.memory = { present: false, referencingRows: 0, refused: false };
+          let memoryRefused = false;
+          const memoryPresent = await scalar("(SELECT to_regclass('public.memory_fact') IS NOT NULL)");
+          if (memoryPresent === true) {
+            out.memory.present = true;
+            const memoryMessageIds = compRows.map((entry) => entry.id);
+            const memoryReferences = await scalar(
+              "(SELECT " +
+              "(SELECT count(*) FROM memory_fact WHERE turn_id = $2::uuid) + " +
+              "(SELECT count(*) FROM memory_turn_extraction WHERE turn_id = $2::uuid) + " +
+              "(SELECT count(*) FROM memory_run_turn WHERE turn_id = $2::uuid) + " +
+              "(SELECT count(*) FROM memory_ingest_state WHERE watermark_turn_id = $2::uuid) + " +
+              "(SELECT count(*) FROM memory_operation WHERE turn_id = $2::uuid) + " +
+              "(SELECT count(*) FROM memory_fact_source_message WHERE message_id = ANY($1::uuid[])) + " +
+              "(SELECT count(*) FROM memory_temporal_summary_message WHERE message_id = ANY($1::uuid[]))" +
+              ")",
+              [memoryMessageIds, SMOKE_INPUT.turnId],
+            );
+            const memoryTotal = Number(memoryReferences ?? 0);
+            out.memory.referencingRows = memoryTotal;
+            if (memoryTotal > 0) {
+              memoryRefused = true;
+              out.memory.refused = true;
+              out.reason = "memory-rows-reference-turn";
+            }
+          }
+          if (traceRefused || memoryRefused) {
             // Refused mid-transaction: roll back so nothing — not even the
             // trace phase — is partially deleted.
             await client.query("ROLLBACK");

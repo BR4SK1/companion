@@ -83,8 +83,11 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
   });
 
   beforeEach(async () => {
+    // CASCADE: memory-domain child tables reference conversation rows (the
+    // memory suite runs against the same disposable database); truncating
+    // them here keeps the database-backed suites order-independent.
     await pool.query(
-      "TRUNCATE conversation_message, conversation_turn, response_pattern, trace_attempt, trace_attempt_context, trace_attempt_pattern, trace_attempt_decision, trace_attempt_decision_probability, trace_attempt_chat, trace_attempt_chat_message, trace_attempt_chat_choice RESTART IDENTITY",
+      "TRUNCATE conversation_message, conversation_turn, response_pattern, trace_attempt, trace_attempt_context, trace_attempt_pattern, trace_attempt_decision, trace_attempt_decision_probability, trace_attempt_chat, trace_attempt_chat_message, trace_attempt_chat_choice RESTART IDENTITY CASCADE",
     );
   });
 
