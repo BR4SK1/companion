@@ -18,6 +18,18 @@ pnpm --filter @companion/web build      # the suite serves the production build
 pnpm exec playwright test
 ```
 
+### Request scope: full E2E versus local-only
+
+An unqualified request to "run E2E" means a **full E2E run**: this disposable
+local stack **plus** deployed non-production validation, which includes the
+[deployed smoke](#deployed-non-production-smoke-explicitly-acknowledged-real-billable-provider)
+and its real, billable provider calls. The command above runs only the
+fake-provider Playwright suite — it never includes the smoke, which runs only
+through its own documented command. A request explicitly scoped to local-only
+validation (for example "run the local e2e suite") covers exactly this
+fake-provider coverage and nothing deployed. The deployed smoke is also a
+valid request on its own, independent of a full E2E run.
+
 The stack supervisor (`stack.mjs`, started by Playwright as its web server)
 brings up, in order:
 
@@ -139,7 +151,7 @@ on the turn's own recorded request rather than on request counts:
    navigations alike), and HTTP error responses preserved. No messages are
    sent; no provider traffic occurs.
 
-## Deployed non-production smoke (explicitly authorized; real billable provider)
+## Deployed non-production smoke (explicitly acknowledged; real billable provider)
 
 `deployed-dev-smoke.mjs` is deliberately separate from everything above: the
 Playwright suite runs against a disposable local stack and a fake provider,
@@ -148,20 +160,24 @@ through its loopback test-entry gate (`kubectl port-forward` to the pod-local
 gate listener — the gate is never exposed through a Service) and makes **one
 synthetic user message's worth of real, billable OpenRouter calls**.
 
-- It refuses to run without BOTH `E2E_DEPLOYED_SMOKE_ALLOWED=1` (authorizes
+- It refuses to run without BOTH `E2E_DEPLOYED_SMOKE_ALLOWED=1` (acknowledges
   the billable provider call and the non-production database write) and
   `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` (the operator's explicit
   acknowledgement that the dev stack is exclusively theirs for this run):
-  running it is always an explicitly authorized act. Where that
-  authorization comes from depends on the context: outside this
-  repository's ship-it flow it is granted per run; within the ship-it flow
-  it is the owner's standing authorization (recorded 2026-11-01 in
-  [`../../.opencode/skills/ship-it/SKILL.md`](../../.opencode/skills/ship-it/SKILL.md)),
-  which covers this smoke's billable non-production provider calls and its
-  non-production database write, resting on the owner's affirmation that the
-  non-production environment and the accounts associated with this project
-  belong to the owner and are not shared. Both variables remain required in
-  every context, and nothing in the script's guards changes with context.
+  running it is always an explicitly acknowledged act. The owner expects
+  this smoke's billable real-provider calls whenever a full E2E run is
+  requested, and an explicitly requested standalone run of this smoke is
+  equally in scope — they validate the live provider configuration before
+  production — so no separate per-run approval is required merely because
+  the calls are billable, and no per-run re-approval is needed where the
+  owner's standing authorization applies (recorded 2026-11-01 in
+  [`../../.opencode/skills/ship-it/SKILL.md`](../../.opencode/skills/ship-it/SKILL.md),
+  covering this smoke's billable non-production provider calls and its
+  non-production database write and resting on the owner's affirmation that
+  the non-production environment and the accounts associated with this
+  project belong to the owner and are not shared). Both variables remain
+  required in every context, and nothing in the script's guards changes
+  with context.
 - Exclusivity is an operator assertion, NOT a system enforcement. The
   system cannot prevent another user's message from being ingested before or
   during the run, and the worker's chat request includes the thread's

@@ -10,7 +10,7 @@ Owner merge of the pull request is the production-approval action. The intended 
 
 ## Scope and open questions
 
-README only; no values, manifests, secret references, deployment controller, or release automation are included. Define artifact provenance, approval binding, migration compatibility, restart/order/idempotency verification, backup/recovery, and recovery procedures before enabling production promotion. Do not assume database rollback is transactional or guaranteed.
+README only; no values, manifests, secret references, deployment controller, or release automation are included. Define artifact provenance, approval binding, application-level migration compatibility, and restart/order/idempotency verification before enabling production promotion. Operating the external PostgreSQL service — including its backup/recovery and hardening — is that service's own concern, not a gate this project performs or verifies. Do not assume database rollback is transactional or guaranteed.
 
 ## Production values contract
 
