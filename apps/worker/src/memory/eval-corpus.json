@@ -1,0 +1,144 @@
+{
+  "version": 1,
+  "description": "Generic synthetic recall-evaluation corpus: invented observations about unnamed generic activities, with queries and expected results. Contains no personal configuration and no real-world identifiers; point-in-time seeds (first seen == last seen) so the temporal-violation check is exact.",
+  "observations": [
+    {
+      "id": "eval-tea-preference",
+      "kind": "preference",
+      "claim": "Prefers green tea over coffee at lunch",
+      "topics": ["tea", "lunch"],
+      "observedAt": "2026-02-10T18:00:00Z",
+      "evidenceStrength": "strong",
+      "supportCount": 6,
+      "distinctTurnCount": 6,
+      "distinctDayCount": 5
+    },
+    {
+      "id": "eval-tomato-watering",
+      "kind": "habit",
+      "claim": "Waters the tomato plants every morning before work",
+      "topics": ["gardening"],
+      "observedAt": "2026-04-06T12:00:00Z",
+      "evidenceStrength": "strong",
+      "supportCount": 8,
+      "distinctTurnCount": 8,
+      "distinctDayCount": 7
+    },
+    {
+      "id": "eval-river-cycling",
+      "kind": "habit",
+      "claim": "Cycles along the river trail on Saturday mornings",
+      "topics": ["cycling"],
+      "observedAt": "2026-04-11T14:00:00Z",
+      "evidenceStrength": "strong",
+      "supportCount": 5,
+      "distinctTurnCount": 5,
+      "distinctDayCount": 4
+    },
+    {
+      "id": "eval-shellfish-boundary",
+      "kind": "boundary",
+      "claim": "Must avoid shellfish because of an allergy",
+      "topics": ["food", "health"],
+      "observedAt": "2026-01-20T17:00:00Z",
+      "evidenceStrength": "strong",
+      "supportCount": 4,
+      "distinctTurnCount": 4,
+      "distinctDayCount": 3
+    },
+    {
+      "id": "eval-library-visits",
+      "kind": "habit",
+      "claim": "Visits the central library on weekday afternoons",
+      "topics": ["library"],
+      "observedAt": "2026-05-05T19:00:00Z",
+      "evidenceStrength": "supported",
+      "supportCount": 4,
+      "distinctTurnCount": 4,
+      "distinctDayCount": 4
+    },
+    {
+      "id": "eval-garden-bench",
+      "kind": "fact",
+      "claim": "Is building a cedar garden bench for the patio this spring",
+      "topics": ["woodworking"],
+      "observedAt": "2026-03-08T15:00:00Z",
+      "evidenceStrength": "supported",
+      "supportCount": 3,
+      "distinctTurnCount": 3,
+      "distinctDayCount": 2
+    },
+    {
+      "id": "eval-book-club",
+      "kind": "habit",
+      "claim": "Hosts a book club at home on the first Friday of each month",
+      "topics": ["reading"],
+      "observedAt": "2026-05-01T20:00:00Z",
+      "evidenceStrength": "strong",
+      "supportCount": 6,
+      "distinctTurnCount": 6,
+      "distinctDayCount": 5
+    },
+    {
+      "id": "eval-evening-reading",
+      "kind": "preference",
+      "claim": "Reads historical novels every evening before bed",
+      "condition": "when the workday ended on time",
+      "topics": ["reading"],
+      "observedAt": "2026-02-18T21:00:00Z",
+      "evidenceStrength": "supported",
+      "supportCount": 4,
+      "distinctTurnCount": 4,
+      "distinctDayCount": 4
+    },
+    {
+      "id": "eval-night-photography",
+      "kind": "fact",
+      "claim": "Is learning night photography with a tripod",
+      "topics": ["photography"],
+      "observedAt": "2026-01-15T22:00:00Z",
+      "evidenceStrength": "tentative",
+      "supportCount": 2,
+      "distinctTurnCount": 2,
+      "distinctDayCount": 2
+    }
+  ],
+  "queries": [
+    {
+      "query": "green tea coffee lunch",
+      "expect": ["eval-tea-preference"]
+    },
+    {
+      "query": "tomato plants watering schedule",
+      "expect": ["eval-tomato-watering"]
+    },
+    {
+      "query": "river trail cycling",
+      "expect": ["eval-river-cycling"]
+    },
+    {
+      "query": "shellfish allergy",
+      "expect": ["eval-shellfish-boundary"]
+    },
+    {
+      "query": "library visits weekdays",
+      "expect": ["eval-library-visits"]
+    },
+    {
+      "query": "book club reading novels",
+      "expect": ["eval-book-club", "eval-evening-reading"]
+    },
+    {
+      "query": "bench building between 2026-03-01 and 2026-03-20",
+      "expect": ["eval-garden-bench"]
+    },
+    {
+      "query": "between 2026-03-01 and 2026-03-20",
+      "expect": ["eval-garden-bench"]
+    },
+    {
+      "query": "tea between 2026-02-01 and 2026-02-28",
+      "expect": ["eval-tea-preference"]
+    }
+  ]
+}

@@ -2,9 +2,14 @@
  * Per-turn processing: response-pattern decision first, chat second.
  *
  * The processor is transport-agnostic: the caller injects the two capability
- * calls (decision and chat) and the two context loaders. This keeps the
- * orchestration testable without network or database and keeps application
- * policy (which models, which endpoints) at the composition edge.
+ * calls and the context loaders. This keeps the orchestration testable
+ * without network or database and keeps application policy (which models,
+ * which endpoints) at the composition edge.
+ *
+ * Memory context (when a loader is provided) is assembled before the chat
+ * call and sent as a second system message after the response guidance.
+ * Memory work never fails a chat turn: loader errors are logged and the
+ * turn proceeds without memory.
  *
  * Tracing boundaries (all injected, all fenced at the store):
  * - `recordSnapshot` — the attempt's input snapshot, before the decision step.
@@ -49,6 +54,8 @@ import {
   selectResponsePattern,
 } from "./decision.ts";
 import { buildChatRequest } from "./chat.ts";
+import type { MemoryChatContext } from "../memory/types.ts";
+import { buildMemorySystemMessage } from "../memory/chat-context.ts";
 import { OpenRouterTransportError } from "@companion/openrouter/transport";
 import type {
   ChatRequest,
@@ -113,6 +120,16 @@ export interface TurnProcessorDeps {
    * invalid) before publication.
    */
   readonly recordChatOutcome?: (payload: ChatOutcomeTracePayload) => Promise<void>;
+  /**
+   * Assembles the memory context (profiles, temporal memories, canonical
+   * recall) for this turn, from the turn's user text. Memory work must never
+   * fail a chat turn: the processor catches loader errors, logs them, and
+   * continues without memory. Absent when memory is disabled.
+   */
+  readonly loadMemoryContext?: (input: {
+    readonly turnId: string;
+    readonly userText: string;
+  }) => Promise<MemoryChatContext | null>;
 }
 
 /** The terminal result of one attempt, published by the engine. */
@@ -312,21 +329,56 @@ export async function processTurnWork(
     }
   }
 
+  // Memory context assembly. Memory must never fail a turn: loader errors
+  // are logged and the turn continues without memory context. The assembled
+  // system message is synthetic (null message source in the chat trace).
+  let memoryContext: string | null = null;
+  if (deps.loadMemoryContext !== undefined) {
+    const userText = work.messages
+      .filter((message) => message.role === "user")
+      .map((message) => message.content.trim())
+      .filter(Boolean)
+      .join("\n");
+    if (userText.length > 0) {
+      try {
+        const loaded = await deps.loadMemoryContext({
+          turnId: work.turn.id,
+          userText,
+        });
+        memoryContext = buildMemorySystemMessage({
+          profileSection: loaded?.profileSection,
+          temporalContext: loaded?.temporalContext,
+          memoryContext: loaded?.memoryContext,
+        }) ?? null;
+      } catch (error) {
+        console.warn(
+          `[MEMORY] context assembly failed for turn ${work.turn.id}: ${errorMessage(error)}; continuing without memory`,
+        );
+        memoryContext = null;
+      }
+    }
+  }
+
   const chatRequest = buildChatRequest({
     model: deps.chatModel,
     history,
     turnMessages: work.messages,
     guidance: selected !== undefined ? selected.responseGuidance : null,
+    memoryContext,
     ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
     ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
   });
 
   // Message sources aligned index-by-index with the chat request messages:
-  // null for the synthetic guidance system message, the conversation message
-  // id for every other message. Computed before the call: it is a pure
-  // function of the request, and it is recorded with the request.
+  // null for synthetic system messages (guidance, memory context), the
+  // conversation message id for every other message. Computed before the
+  // call: it is a pure function of the request, and it is recorded with the
+  // request.
   const messageSources: (string | null)[] = [];
   if (selected !== undefined) {
+    messageSources.push(null);
+  }
+  if (memoryContext !== null) {
     messageSources.push(null);
   }
   for (const message of fullContext) {

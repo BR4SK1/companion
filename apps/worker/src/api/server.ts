@@ -49,6 +49,8 @@ import {
   ClientKeyConflictError,
   type ConversationStore,
 } from "../conversation/store.ts";
+import type { CanonicalRecallResponse } from "../memory/types.ts";
+import { CanonicalRecallValidationError } from "../memory/recall.ts";
 
 /** Maximum accepted JSON request body size, in bytes. */
 export const MAX_BODY_BYTES = 64 * 1024;
@@ -80,6 +82,18 @@ export interface ApiServerDeps {
    * needs no dependency check and always reports process health only.
    */
   readonly ready?: () => Promise<boolean>;
+  /**
+   * Canonical memory recall by arbitrary query — the general recall surface
+   * (not the per-turn chat assembly, which derives its query from the turn's
+   * user text). The domain owns input validation; a rejected input surfaces
+   * as a validation error to map to 400. Absent when memory is not
+   * provisioned: the route then reports the recall surface as unavailable
+   * rather than serving an empty imitation of it.
+   */
+  readonly recall?: (input: {
+    readonly query: string;
+    readonly limit?: number;
+  }) => Promise<CanonicalRecallResponse>;
 }
 
 export interface ApiServer {
@@ -198,6 +212,33 @@ function parseSendBody(raw: string): ParsedSendBody | undefined {
   return { text, clientKey };
 }
 
+/**
+ * Recall request body: `{query, limit?}`. Shape validation only — the recall
+ * domain owns the semantic validation (length, limit range, timezone rules)
+ * and reports violations as validation errors mapped to 400.
+ */
+function parseRecallBody(raw: string): { query: string; limit?: number } | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return undefined;
+  }
+  const record = parsed as Record<string, unknown>;
+  const query = record.query;
+  const limit = record.limit;
+  if (typeof query !== "string" || query.length === 0) {
+    return undefined;
+  }
+  if (limit !== undefined && (typeof limit !== "number" || !Number.isInteger(limit))) {
+    return undefined;
+  }
+  return limit === undefined ? { query } : { query, limit };
+}
+
 function parseThreadLimit(query: URLSearchParams): number | undefined {
   const raw = query.get("limit");
   if (raw === null) {
@@ -273,7 +314,11 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       return;
     }
 
-    if (url.pathname !== "/v1/messages" && url.pathname !== "/v1/thread") {
+    if (
+      url.pathname !== "/v1/messages" &&
+      url.pathname !== "/v1/thread" &&
+      url.pathname !== "/v1/memory/recall"
+    ) {
       writeGenericError(response, 404, "not_found");
       request.resume();
       return;
@@ -290,6 +335,11 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
     }
     if (url.pathname === "/v1/thread" && request.method !== "GET") {
       writeJson(response, 405, { error: "method_not_allowed" }, { allow: "GET" });
+      request.resume();
+      return;
+    }
+    if (url.pathname === "/v1/memory/recall" && request.method !== "POST") {
+      writeJson(response, 405, { error: "method_not_allowed" }, { allow: "POST" });
       request.resume();
       return;
     }
@@ -360,6 +410,45 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
           hasMore: page.hasMore,
         },
       });
+      return;
+    }
+
+    if (route === "POST /v1/memory/recall") {
+      // The general recall surface exists only when memory is provisioned;
+      // reporting it as unavailable (not 404) distinguishes an unprovisioned
+      // deployment from an unknown route.
+      if (deps.recall === undefined) {
+        writeGenericError(response, 503, "unavailable");
+        return;
+      }
+      const contentType = request.headers["content-type"];
+      if (contentType === undefined || !contentType.toLowerCase().startsWith("application/json")) {
+        writeGenericError(response, 415, "unsupported_media_type");
+        request.resume();
+        return;
+      }
+      const body = await readBody(request, log);
+      if (!body.ok) {
+        writeGenericError(response, body.status, body.kind);
+        return;
+      }
+      const parsed = parseRecallBody(body.body);
+      if (parsed === undefined) {
+        writeGenericError(response, 400, "bad_request");
+        return;
+      }
+      try {
+        const result = await deps.recall(parsed);
+        // Spread into a fresh literal: writeJson's parameter is a string-index
+        // record, which an interface type does not structurally satisfy.
+        writeJson(response, 200, { ...result });
+      } catch (error) {
+        if (error instanceof CanonicalRecallValidationError) {
+          writeJson(response, 400, { error: "invalid_query", message: error.message });
+          return;
+        }
+        throw error;
+      }
       return;
     }
 
