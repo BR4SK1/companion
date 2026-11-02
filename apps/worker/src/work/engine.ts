@@ -22,7 +22,10 @@ import { heartbeatIntervalMs, MIN_LEASE_SECONDS } from "./timing.ts";
 
 export interface EngineDeps {
   readonly store: ConversationStore;
-  readonly processTurn: (work: TurnWork) => Promise<TurnOutcome>;
+  readonly processTurn: (
+    work: TurnWork,
+    context: { readonly leaseOwner: string },
+  ) => Promise<TurnOutcome>;
   readonly leaseSeconds: number;
   readonly pollSeconds: number;
   /** Stable-ish label for logs; the claim token itself is always unique. */
@@ -83,23 +86,28 @@ export async function runEngineOnce(deps: EngineDeps): Promise<EngineCycleResult
   }, heartbeatMs);
 
   try {
-    const outcome = await deps.processTurn(work);
-    // Record diagnostics while the turn is still in flight; fenced-safe, so
-    // a stale worker's diagnostics cannot overwrite a reclaiming worker's.
-    await deps.store.recordTurnDecision({
-      turnId: work.turn.id,
-      leaseOwner: owner,
-      selectedPatternId: outcome.selectedPatternId,
-      decision: outcome.decision,
-    });
+    // The processor records the attempt snapshot (before the decision step),
+    // the decision request (before the provider call), and the decision
+    // outcome (after the call, before the selection step) through the
+    // injected callbacks; the composition edge binds them to the store and
+    // this attempt's lease owner.
+    const outcome = await deps.processTurn(work, { leaseOwner: owner });
     const publish = await deps.store.publishReply({
       turnId: work.turn.id,
       leaseOwner: owner,
       content: outcome.reply,
     });
     if (publish === "fenced") {
+      await deps.store.markAttemptFenced({
+        turnId: work.turn.id,
+        leaseOwner: owner,
+      });
       log(`publication fenced for turn ${work.turn.id}; turn owned elsewhere`);
     } else if (publish === "already_published") {
+      await deps.store.markAttemptFenced({
+        turnId: work.turn.id,
+        leaseOwner: owner,
+      });
       log(`reply for turn ${work.turn.id} already published; duplicate no-op`);
     } else {
       log(`published reply for turn ${work.turn.id}`);
@@ -111,6 +119,10 @@ export async function runEngineOnce(deps: EngineDeps): Promise<EngineCycleResult
       error: errorMessage(error),
     });
     if (fail === "fenced") {
+      await deps.store.markAttemptFenced({
+        turnId: work.turn.id,
+        leaseOwner: owner,
+      });
       log(
         `turn ${work.turn.id} failed but the lease was lost; failure left to the current owner`,
       );

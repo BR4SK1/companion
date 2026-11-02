@@ -5,6 +5,7 @@ export {
   type PostgresConnectionConfig,
   type PostgresPool,
   type PostgresPoolClient,
+  type TransactionOptions,
 } from "./connection.ts";
 export {
   runMigrations,

@@ -46,16 +46,49 @@
 
 import { randomUUID } from "node:crypto";
 
-import type { PostgresPool } from "@companion/postgres";
+import type {
+  PostgresPool,
+  PostgresPoolClient,
+} from "@companion/postgres";
 import { withTransaction } from "@companion/postgres";
 
 import type {
+  AttemptSnapshotPayload,
+  ChatOutcomeTrace,
+  ChatOutcomeTracePayload,
+  ChatRequestTracePayload,
   ConversationMessage,
   ConversationTurn,
+  DecisionOutcomeTracePayload,
+  DecisionRequestTracePayload,
+  DecisionSelectionTrace,
   MessageRole,
   ResponsePattern,
+  TraceChat,
+  TraceChatMessage,
+  TraceContextMessage,
+  TraceDecision,
+  TurnAttemptTrace,
+  TurnTraceReport,
   TurnWork,
 } from "./types.ts";
+
+/**
+ * Thrown by the composition edge when a fenced trace write reports that the
+ * lease is no longer held. The store itself reports a fenced write by
+ * returning `false` (a soft result a caller may choose to handle); the
+ * wiring edge turns that result into this error so a stale attempt stops
+ * processing immediately — no further provider calls, and no selection or
+ * publication decision based on an unrecorded boundary. The engine handles
+ * it through its existing fenced failure path (`failTurn` is itself fenced,
+ * and a fenced failure marks the attempt).
+ */
+export class TraceWriteFencedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TraceWriteFencedError";
+  }
+}
 
 /**
  * Arbitrary but fixed advisory-lock key serializing turn claims and message
@@ -189,6 +222,22 @@ export interface FailTurnParams {
   readonly turnId: string;
   readonly leaseOwner: string;
   readonly error: string;
+  /**
+   * The attempt's input snapshot (patterns + ordered context), recorded
+   * transactionally with the failure when it was taken before the failing
+   * step.
+   */
+  readonly snapshot?: AttemptSnapshotPayload;
+}
+
+export interface RecordAttemptSnapshotParams {
+  readonly turnId: string;
+  readonly leaseOwner: string;
+  readonly snapshot: AttemptSnapshotPayload;
+}
+
+export interface TurnTraceParams {
+  readonly turnId: string;
 }
 
 export interface RenewLeaseParams {
@@ -197,11 +246,53 @@ export interface RenewLeaseParams {
   readonly leaseSeconds: number;
 }
 
-export interface RecordDecisionParams {
+export interface RecordDecisionRequestParams {
   readonly turnId: string;
   readonly leaseOwner: string;
-  readonly selectedPatternId: string | null;
-  readonly decision: unknown;
+  /**
+   * The decision request boundary record: the validated native typed request
+   * as sent, with the question it asks. Written before the provider call, in
+   * its own fenced transaction; the legacy `decision` JSONB column is left
+   * untouched (it holds pre-tracing history only).
+   */
+  readonly trace: DecisionRequestTracePayload;
+}
+
+export interface RecordDecisionOutcomeParams {
+  readonly turnId: string;
+  readonly leaseOwner: string;
+  /**
+   * The decision outcome record: the available outcome after the provider
+   * call (`responded` with the native typed response, `failed` with the
+   * actual transport error, or `invalid` with the validation error), written
+   * before the selection step, in its own fenced transaction; the legacy
+   * `decision` JSONB column is left untouched.
+   */
+  readonly payload: DecisionOutcomeTracePayload;
+}
+
+export interface RecordDecisionSelectionParams {
+  readonly turnId: string;
+  readonly leaseOwner: string;
+  /**
+   * The selection outcome, recorded after the boundary and separately from
+   * it: the chosen pattern id, or the rejection with its reason.
+   */
+  readonly selection: DecisionSelectionTrace;
+}
+
+export interface RecordChatRequestParams {
+  readonly turnId: string;
+  readonly leaseOwner: string;
+  /** The exact chat request as sent, with per-message source linkage. */
+  readonly payload: ChatRequestTracePayload;
+}
+
+export interface RecordChatOutcomeParams {
+  readonly turnId: string;
+  readonly leaseOwner: string;
+  /** The full chat boundary: request plus the available outcome. */
+  readonly payload: ChatOutcomeTracePayload;
 }
 
 export interface ThreadContextParams {
@@ -266,9 +357,18 @@ export interface ConversationStore {
   ): Promise<ConversationMessage>;
   claimNextTurn(params: ClaimParams): Promise<ClaimOutcome>;
   renewLease(params: RenewLeaseParams): Promise<boolean>;
-  recordTurnDecision(params: RecordDecisionParams): Promise<boolean>;
+  recordAttemptSnapshot(params: RecordAttemptSnapshotParams): Promise<boolean>;
+  recordDecisionRequest(params: RecordDecisionRequestParams): Promise<boolean>;
+  recordDecisionOutcome(params: RecordDecisionOutcomeParams): Promise<boolean>;
+  recordDecisionSelection(params: RecordDecisionSelectionParams): Promise<boolean>;
+  recordChatRequest(params: RecordChatRequestParams): Promise<boolean>;
+  recordChatOutcome(params: RecordChatOutcomeParams): Promise<boolean>;
   publishReply(params: PublishReplyParams): Promise<PublishOutcome>;
   failTurn(params: FailTurnParams): Promise<FailOutcome>;
+  markAttemptFenced(params: {
+    turnId: string;
+    leaseOwner: string;
+  }): Promise<boolean>;
   getEnabledResponsePatterns(): Promise<readonly ResponsePattern[]>;
   getThreadContext(params: ThreadContextParams): Promise<
     readonly ConversationMessage[]
@@ -276,6 +376,7 @@ export interface ConversationStore {
   /** Bounded page of the thread in `seq` order (see the notes below). */
   getThreadPage(params: ThreadPageParams): Promise<ThreadPage>;
   getThreadStatus(): Promise<ThreadStatus>;
+  getTurnTraceReport(params: TurnTraceParams): Promise<TurnTraceReport>;
 }
 
 export function createConversationStore(pool: PostgresPool): ConversationStore {
@@ -377,6 +478,22 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
         if (turnRow === undefined) {
           throw new Error("reclaim updated no turn row");
         }
+        // A reclaim is a new attempt: the previous attempt is closed as
+        // superseded inside the same transaction as the lease replacement,
+        // so a crashed old worker cannot be counted on to mark itself —
+        // and its own later fenced writes can never reopen or finalize the
+        // row (its writes guard on finished_at IS NULL).
+        await client.query(
+          `UPDATE trace_attempt
+           SET finished_at = now(), outcome = 'superseded'
+           WHERE turn_id = $1 AND finished_at IS NULL`,
+          [turnRow.id],
+        );
+        await client.query(
+          `INSERT INTO trace_attempt (turn_id, attempt, lease_owner)
+           VALUES ($1, $2, $3)`,
+          [turnRow.id, turnRow.attempt, params.owner],
+        );
         const messages = await client.query<MessageRow>(
           `SELECT ${MESSAGE_COLUMNS} FROM conversation_message
            WHERE turn_id = $1
@@ -424,6 +541,13 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
       if (turnRow === undefined) {
         throw new Error("turn insert returned no row");
       }
+      // The first attempt's trace row is created inside the claim
+      // transaction, so attempts are always correlated with the turn.
+      await client.query(
+        `INSERT INTO trace_attempt (turn_id, attempt, lease_owner)
+         VALUES ($1, $2, $3)`,
+        [turnRow.id, turnRow.attempt, params.owner],
+      );
       await client.query(
         `UPDATE conversation_message
          SET turn_id = $1
@@ -455,23 +579,676 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     return result.rows.length > 0;
   }
 
-  async function recordTurnDecision(
-    params: RecordDecisionParams,
+  /**
+   * Finds the caller's open attempt row (created at claim time) while
+   * verifying the caller still holds a valid lease on the in-flight turn.
+   * Returns the attempt id or null when the write is fenced out.
+   */
+  async function findOpenAttempt(
+    client: PostgresPoolClient,
+    turnId: string,
+    leaseOwner: string,
+  ): Promise<string | null> {
+    const result = await client.query<{ attempt_id: string }>(
+      `SELECT a.id AS attempt_id
+       FROM trace_attempt a
+       JOIN conversation_turn t ON t.id = a.turn_id
+       WHERE a.turn_id = $1 AND a.lease_owner = $2 AND a.finished_at IS NULL
+         AND t.status = 'in_flight' AND t.lease_owner = $2
+         AND t.lease_expires_at > now()`,
+      [turnId, leaseOwner],
+    );
+    const row = result.rows[0];
+    return row?.attempt_id ?? null;
+  }
+
+  /**
+   * The caller's open attempt row without turn-state checks. Only for use
+   * inside transactions that have already fenced the turn transition
+   * themselves (publish/fail): at that point the turn no longer reads as
+   * `in_flight`, so the ordinary fencing lookup above can never match.
+   */
+  async function findOpenAttemptAfterTransition(
+    client: PostgresPoolClient,
+    turnId: string,
+    leaseOwner: string,
+  ): Promise<string | null> {
+    const result = await client.query<{ attempt_id: string }>(
+      `SELECT id AS attempt_id FROM trace_attempt
+       WHERE turn_id = $1 AND lease_owner = $2 AND finished_at IS NULL`,
+      [turnId, leaseOwner],
+    );
+    return result.rows[0]?.attempt_id ?? null;
+  }
+
+  /**
+   * Records the decision request (the validated native typed request as sent,
+   * with the question it asks) before the provider call. Deliberate, not
+   * best-effort: without it the boundary record would exist only for attempts
+   * whose provider call succeeded, so a transport failure would leave no
+   * request behind. Fenced: only the current lease holder of an in-flight
+   * turn may record it. Idempotent per attempt; a duplicate request is a
+   * harmless overwrite of the request fields and never touches the outcome or
+   * the separately recorded selection.
+   */
+  async function recordDecisionRequest(
+    params: RecordDecisionRequestParams,
   ): Promise<boolean> {
-    const result = await pool.query<{ id: string }>(
-      `UPDATE conversation_turn
-       SET selected_pattern_id = $2, decision = $3
-       WHERE id = $1 AND status = 'in_flight'
-         AND lease_owner = $4 AND lease_expires_at > now()
+    return withTransaction(pool, async (client) => {
+      const attemptId = await findOpenAttempt(
+        client,
+        params.turnId,
+        params.leaseOwner,
+      );
+      if (attemptId === null) {
+        return false;
+      }
+      await insertDecisionRequestTrace(client, attemptId, params.trace);
+      return true;
+    });
+  }
+
+  /**
+   * Records the available decision outcome after the provider call: the
+   * native typed response (`responded`), the actual transport error
+   * (`failed`), or the contract validation error (`invalid`) — always before
+   * the selection step, so a rejected selection still leaves every response
+   * detail behind. Failure and invalid writes are best-effort: recording them
+   * must never displace the turn's own failure handling. Fenced: only the
+   * current lease holder of an in-flight turn may record it. Idempotent per
+   * attempt; a duplicate outcome is a harmless overwrite of the outcome
+   * fields and never resets the separately recorded selection outcome.
+   */
+  async function recordDecisionOutcome(
+    params: RecordDecisionOutcomeParams,
+  ): Promise<boolean> {
+    return withTransaction(pool, async (client) => {
+      const attemptId = await findOpenAttempt(
+        client,
+        params.turnId,
+        params.leaseOwner,
+      );
+      if (attemptId === null) {
+        return false;
+      }
+      await insertDecisionOutcomeTrace(client, attemptId, params.payload);
+      return true;
+    });
+  }
+
+  /**
+   * Records how the selection step resolved: the chosen pattern (fenced, in
+   * its own transaction — the turn's `selected_pattern_id` write), or the
+   * rejection with its reason. Separate from the boundary so the boundary's
+   * recorded response is never overwritten or invented over.
+   */
+  async function recordDecisionSelection(
+    params: RecordDecisionSelectionParams,
+  ): Promise<boolean> {
+    return withTransaction(pool, async (client) => {
+      if (params.selection.kind === "selected") {
+        // Fenced pattern selection on the turn: only the current lease
+        // holder of an in-flight turn may record it.
+        const result = await client.query<{ id: string }>(
+          `UPDATE conversation_turn
+           SET selected_pattern_id = $2
+           WHERE id = $1 AND status = 'in_flight'
+             AND lease_owner = $3 AND lease_expires_at > now()
+           RETURNING id`,
+          [
+            params.turnId,
+            params.selection.patternId,
+            params.leaseOwner,
+          ],
+        );
+        if (result.rows.length === 0) {
+          return false;
+        }
+      } else {
+        // A rejection writes no turn state; still fenced by the same
+        // in-flight lease the boundary and other records use.
+        const current = await client.query<{ id: string }>(
+          `SELECT id FROM conversation_turn
+           WHERE id = $1 AND status = 'in_flight'
+             AND lease_owner = $2 AND lease_expires_at > now()`,
+          [params.turnId, params.leaseOwner],
+        );
+        if (current.rows.length === 0) {
+          return false;
+        }
+      }
+      const attemptId = await findOpenAttempt(
+        client,
+        params.turnId,
+        params.leaseOwner,
+      );
+      if (attemptId === null) {
+        return true;
+      }
+      await client.query(
+        `UPDATE trace_attempt_decision
+         SET selection = $2,
+             rejection_reason = $3
+         WHERE attempt_id = $1 AND selection IS NULL`,
+        [
+          attemptId,
+          params.selection.kind,
+          params.selection.kind === "rejected" ? params.selection.reason : null,
+        ],
+      );
+      return true;
+    });
+  }
+
+  /**
+   * Writes the decision request record, in state `requested` before the
+   * provider call: the question as asked (question id/type, instructions as
+   * sent) with the request model. Idempotent per attempt (the attempt row is
+   * unique), so a duplicate request is a harmless overwrite of the request
+   * fields rather than an error; the outcome step below transitions the same
+   * row and never resets the separately recorded selection.
+   */
+  async function insertDecisionRequestTrace(
+    client: PostgresPoolClient,
+    attemptId: string,
+    payload: DecisionRequestTracePayload,
+  ): Promise<void> {
+    const question = payload.request.questions[payload.questionId];
+    if (question === undefined) {
+      throw new Error(
+        `decision trace question ${payload.questionId} not present in the request`,
+      );
+    }
+    const instructions =
+      typeof question.instructions === "string"
+        ? question.instructions
+        : JSON.stringify(question.instructions);
+    await client.query<{ id: string }>(
+      `INSERT INTO trace_attempt_decision
+         (attempt_id, state, question_id, question_type, request_model, instructions)
+       VALUES ($1, 'requested', $2, $3, $4, $5)
+       ON CONFLICT (attempt_id) DO UPDATE SET
+         question_id = EXCLUDED.question_id,
+         question_type = EXCLUDED.question_type,
+         request_model = EXCLUDED.request_model,
+         instructions = EXCLUDED.instructions,
+         recorded_at = now()
        RETURNING id`,
       [
-        params.turnId,
-        params.selectedPatternId,
-        JSON.stringify(params.decision ?? null),
-        params.leaseOwner,
+        attemptId,
+        payload.questionId,
+        question.type,
+        payload.request.model,
+        instructions,
       ],
     );
-    return result.rows.length > 0;
+  }
+
+  /**
+   * Writes the available decision outcome after the provider call: the native
+   * typed response (`responded`), the actual transport error (`failed`), or
+   * the contract validation error (`invalid`). The row is upserted with the
+   * request fields so the write is self-contained even if the request record
+   * was fenced out of an earlier attempt. Idempotent per attempt; the
+   * separately recorded selection is never reset.
+   */
+  async function insertDecisionOutcomeTrace(
+    client: PostgresPoolClient,
+    attemptId: string,
+    payload: DecisionOutcomeTracePayload,
+  ): Promise<void> {
+    const trace = payload.trace;
+    const question = trace.request.questions[trace.questionId];
+    if (question === undefined) {
+      throw new Error(
+        `decision trace question ${trace.questionId} not present in the request`,
+      );
+    }
+    const instructions =
+      typeof question.instructions === "string"
+        ? question.instructions
+        : JSON.stringify(question.instructions);
+    const outcome = payload.outcome;
+    let state: string;
+    let choice: string | null = null;
+    let confidence: number | null = null;
+    let responseModel: string | null = null;
+    let responseProvider: string | null = null;
+    let responseId: string | null = null;
+    let usageInputTokens: number | null = null;
+    let usageOutputTokens: number | null = null;
+    let usageCost: number | null = null;
+    let errorKind: string | null = null;
+    let errorMessage: string | null = null;
+    let errorBody: string | null = null;
+    let probabilities: Readonly<Record<string, number>> | undefined;
+    // Presence is recorded explicitly: a present-but-empty native
+    // distribution (zero child rows) must stay distinguishable from an
+    // absent one, so "no rows" alone cannot stand in for absence.
+    let probabilitiesPresent = false;
+    if (outcome.kind === "responded") {
+      state = "responded";
+      const answer = outcome.trace.response.answers[trace.questionId];
+      if (answer === undefined) {
+        throw new Error(
+          `decision trace answer for ${trace.questionId} not present in the response`,
+        );
+      }
+      if (answer.type === "choice") {
+        choice = answer.choice;
+        confidence = answer.confidence ?? null;
+        probabilities = answer.probabilities;
+        probabilitiesPresent = probabilities !== undefined;
+      }
+      responseModel = outcome.trace.response.model;
+      responseProvider = outcome.trace.response.provider ?? null;
+      responseId = outcome.trace.response.id ?? null;
+      usageInputTokens = outcome.trace.response.usage.input_tokens;
+      usageOutputTokens = outcome.trace.response.usage.output_tokens;
+      usageCost = outcome.trace.response.usage.cost ?? null;
+    } else if (outcome.kind === "failed") {
+      state = "failed";
+      errorKind = outcome.errorKind;
+      errorMessage = outcome.message;
+      errorBody = outcome.body;
+    } else {
+      state = "invalid";
+      errorKind = "invalid";
+      errorMessage = outcome.message;
+    }
+    const upserted = await client.query<{ id: string }>(
+      `INSERT INTO trace_attempt_decision
+         (attempt_id, state, question_id, question_type, request_model, instructions,
+          choice, confidence, probabilities_present,
+          response_model, response_provider, response_id,
+          usage_input_tokens, usage_output_tokens, usage_cost,
+          error_kind, error_message, error_body)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+       ON CONFLICT (attempt_id) DO UPDATE SET
+         state = EXCLUDED.state,
+         question_id = EXCLUDED.question_id,
+         question_type = EXCLUDED.question_type,
+         request_model = EXCLUDED.request_model,
+         instructions = EXCLUDED.instructions,
+         choice = EXCLUDED.choice,
+         confidence = EXCLUDED.confidence,
+         probabilities_present = EXCLUDED.probabilities_present,
+         response_model = EXCLUDED.response_model,
+         response_provider = EXCLUDED.response_provider,
+         response_id = EXCLUDED.response_id,
+         usage_input_tokens = EXCLUDED.usage_input_tokens,
+         usage_output_tokens = EXCLUDED.usage_output_tokens,
+         usage_cost = EXCLUDED.usage_cost,
+         error_kind = EXCLUDED.error_kind,
+         error_message = EXCLUDED.error_message,
+         error_body = EXCLUDED.error_body,
+         recorded_at = now()
+       RETURNING id`,
+      [
+        attemptId,
+        state,
+        trace.questionId,
+        question.type,
+        trace.request.model,
+        instructions,
+        choice,
+        confidence,
+        probabilitiesPresent,
+        responseModel,
+        responseProvider,
+        responseId,
+        usageInputTokens,
+        usageOutputTokens,
+        usageCost,
+        errorKind,
+        errorMessage,
+        errorBody,
+      ],
+    );
+    const decisionRow = upserted.rows[0];
+    if (decisionRow === undefined) {
+      throw new Error("decision trace upsert returned no row");
+    }
+    // Replace the distribution with the freshly recorded one: no rows when
+    // the provider returned none, one row per returned option otherwise.
+    await client.query(
+      `DELETE FROM trace_attempt_decision_probability WHERE decision_id = $1`,
+      [decisionRow.id],
+    );
+    if (probabilities !== undefined) {
+      const optionIds = Object.keys(probabilities);
+      if (optionIds.length > 0) {
+        await client.query(
+          `INSERT INTO trace_attempt_decision_probability (decision_id, option_id, value)
+           SELECT $1, p.option_id, p.value
+           FROM unnest($2::text[], $3::numeric[]) AS p(option_id, value)`,
+          [
+            decisionRow.id,
+            optionIds,
+            optionIds.map((optionId) => String(probabilities[optionId])),
+          ],
+        );
+      }
+    }
+  }
+
+  /**
+   * Records the attempt's input snapshot (mutable patterns and the exact
+   * ordered context) before the decision step. Fenced: only the current
+   * lease holder of the in-flight turn may record it.
+   */
+  async function recordAttemptSnapshot(
+    params: RecordAttemptSnapshotParams,
+  ): Promise<boolean> {
+    return withTransaction(pool, async (client) => {
+      const attemptId = await findOpenAttempt(
+        client,
+        params.turnId,
+        params.leaseOwner,
+      );
+      if (attemptId === null) {
+        return false;
+      }
+      // Idempotent: a second snapshot of the same attempt is a no-op (the
+      // first one is what the attempt actually saw).
+      const marked = await client.query<{ id: string }>(
+        `UPDATE trace_attempt SET snapshot_recorded_at = now()
+         WHERE id = $1 AND snapshot_recorded_at IS NULL
+         RETURNING id`,
+        [attemptId],
+      );
+      if (marked.rows.length === 0) {
+        return true;
+      }
+      await writeAttemptSnapshot(client, attemptId, params.snapshot);
+      return true;
+    });
+  }
+
+  /**
+   * Writes the attempt's input snapshot rows (idempotently guarded by the
+   * caller's snapshot_recorded_at marker). Each row preserves the exact
+   * captured content: the pattern rows as they stood and the message ids in
+   * conversation order.
+   */
+  async function writeAttemptSnapshot(
+    client: PostgresPoolClient,
+    attemptId: string,
+    snapshot: AttemptSnapshotPayload,
+  ): Promise<void> {
+    if (snapshot.patterns.length > 0) {
+      await client.query(
+        `INSERT INTO trace_attempt_pattern
+           (attempt_id, position, pattern_id, selection_description, response_guidance)
+         SELECT $1, s.position, s.pattern_id, s.selection_description, s.response_guidance
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::text[])
+              AS s(position, pattern_id, selection_description, response_guidance)`,
+        [
+          attemptId,
+          snapshot.patterns.map((pattern) => pattern.position),
+          snapshot.patterns.map((pattern) => pattern.id),
+          snapshot.patterns.map((pattern) => pattern.selectionDescription),
+          snapshot.patterns.map((pattern) => pattern.responseGuidance),
+        ],
+      );
+    }
+    if (snapshot.context.length > 0) {
+      await client.query(
+        `INSERT INTO trace_attempt_context (attempt_id, position, message_id)
+         SELECT $1, s.position, s.message_id
+         FROM unnest($2::int[], $3::uuid[]) AS s(position, message_id)`,
+        [
+          attemptId,
+          snapshot.context.map((_, index) => index),
+          snapshot.context.map((message) => message.id),
+        ],
+      );
+    }
+  }
+
+  /**
+   * Writes the chat request record: the exact request as sent, with per-message
+   * source linkage, in state `requested` before the provider call. Fenced and
+   * idempotent per attempt; the outcome step below transitions the same row.
+   */
+  async function insertChatRequestTrace(
+    client: PostgresPoolClient,
+    attemptId: string,
+    payload: ChatRequestTracePayload,
+  ): Promise<void> {
+    if (payload.messageSources.length !== payload.request.messages.length) {
+      throw new Error(
+        "chat trace messageSources must align with the request messages",
+      );
+    }
+    const chat = await client.query<{ id: string }>(
+      `INSERT INTO trace_attempt_chat
+         (attempt_id, state, request_model, temperature, max_tokens)
+       VALUES ($1, 'requested', $2, $3, $4)
+       ON CONFLICT (attempt_id) DO UPDATE SET
+         request_model = EXCLUDED.request_model,
+         temperature = EXCLUDED.temperature,
+         max_tokens = EXCLUDED.max_tokens,
+         recorded_at = now()
+       RETURNING id`,
+      [
+        attemptId,
+        payload.request.model,
+        payload.request.temperature ?? null,
+        payload.request.max_tokens ?? null,
+      ],
+    );
+    const chatRow = chat.rows[0];
+    if (chatRow === undefined) {
+      throw new Error("chat trace upsert returned no row");
+    }
+    // Re-write the exact messages each time: the request is the attempt's
+    // boundary fact, recorded as sent.
+    await client.query(
+      `DELETE FROM trace_attempt_chat_message WHERE chat_id = $1`,
+      [chatRow.id],
+    );
+    if (payload.request.messages.length > 0) {
+      await client.query(
+        `INSERT INTO trace_attempt_chat_message
+           (chat_id, position, role, content, source_message_id)
+         SELECT $1, s.position, s.role, s.content, s.source_message_id
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::uuid[])
+              AS s(position, role, content, source_message_id)`,
+        [
+          chatRow.id,
+          payload.request.messages.map((_, index) => index),
+          payload.request.messages.map((message) => message.role),
+          payload.request.messages.map((message) => message.content),
+          payload.messageSources.map((source) => source),
+        ],
+      );
+    }
+  }
+
+  /**
+   * Writes the available chat outcome after the provider call: the response
+   * (`responded`), the actual transport error (`failed`), or the contract
+   * validation error (`invalid`). A `responded` record carries the
+   * application usability verdict separately: `applicationRejection` names
+   * the reason the application rejected an arrived response (e.g. no
+   * choices) while the response itself is still recorded in full. The row is
+   * upserted with the request fields so the write is self-contained even if
+   * the request record was fenced out of an earlier attempt. Idempotent per
+   * attempt.
+   */
+  async function insertChatOutcomeTrace(
+    client: PostgresPoolClient,
+    attemptId: string,
+    payload: ChatOutcomeTracePayload,
+  ): Promise<void> {
+    if (payload.messageSources.length !== payload.request.messages.length) {
+      throw new Error(
+        "chat trace messageSources must align with the request messages",
+      );
+    }
+    const outcome = payload.outcome;
+    let state: string;
+    let responseId: string | null = null;
+    let responseModel: string | null = null;
+    let replyContent: string | null = null;
+    let applicationRejection: string | null = null;
+    let errorKind: string | null = null;
+    let errorMessage: string | null = null;
+    let errorBody: string | null = null;
+    let usagePromptTokens: number | null = null;
+    let usageCompletionTokens: number | null = null;
+    let usageTotalTokens: number | null = null;
+    if (outcome.kind === "responded") {
+      state = "responded";
+      responseId = outcome.response.id ?? null;
+      responseModel = outcome.response.model;
+      replyContent = outcome.replyContent;
+      applicationRejection = outcome.applicationRejection;
+      usagePromptTokens = outcome.response.usage?.prompt_tokens ?? null;
+      usageCompletionTokens = outcome.response.usage?.completion_tokens ?? null;
+      usageTotalTokens = outcome.response.usage?.total_tokens ?? null;
+    } else if (outcome.kind === "failed") {
+      state = "failed";
+      errorKind = outcome.errorKind;
+      errorMessage = outcome.message;
+      errorBody = outcome.body;
+    } else {
+      state = "invalid";
+      errorKind = "invalid";
+      errorMessage = outcome.message;
+    }
+    const chat = await client.query<{ id: string }>(
+      `INSERT INTO trace_attempt_chat
+         (attempt_id, state, request_model, temperature, max_tokens,
+          response_id, response_model, reply_content, application_rejection,
+          error_kind, error_message, error_body,
+          usage_prompt_tokens, usage_completion_tokens, usage_total_tokens)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+       ON CONFLICT (attempt_id) DO UPDATE SET
+         state = EXCLUDED.state,
+         request_model = EXCLUDED.request_model,
+         temperature = EXCLUDED.temperature,
+         max_tokens = EXCLUDED.max_tokens,
+         response_id = EXCLUDED.response_id,
+         response_model = EXCLUDED.response_model,
+         reply_content = EXCLUDED.reply_content,
+         application_rejection = EXCLUDED.application_rejection,
+         error_kind = EXCLUDED.error_kind,
+         error_message = EXCLUDED.error_message,
+         error_body = EXCLUDED.error_body,
+         usage_prompt_tokens = EXCLUDED.usage_prompt_tokens,
+         usage_completion_tokens = EXCLUDED.usage_completion_tokens,
+         usage_total_tokens = EXCLUDED.usage_total_tokens,
+         recorded_at = now()
+       RETURNING id`,
+      [
+        attemptId,
+        state,
+        payload.request.model,
+        payload.request.temperature ?? null,
+        payload.request.max_tokens ?? null,
+        responseId,
+        responseModel,
+        replyContent,
+        applicationRejection,
+        errorKind,
+        errorMessage,
+        errorBody,
+        usagePromptTokens,
+        usageCompletionTokens,
+        usageTotalTokens,
+      ],
+    );
+    const chatRow = chat.rows[0];
+    if (chatRow === undefined) {
+      throw new Error("chat trace upsert returned no row");
+    }
+    // Re-write the exact messages and choices each time: the request and
+    // response are the attempt's boundary facts, recorded as returned.
+    await client.query(
+      `DELETE FROM trace_attempt_chat_message WHERE chat_id = $1`,
+      [chatRow.id],
+    );
+    if (payload.request.messages.length > 0) {
+      await client.query(
+        `INSERT INTO trace_attempt_chat_message
+           (chat_id, position, role, content, source_message_id)
+         SELECT $1, s.position, s.role, s.content, s.source_message_id
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::uuid[])
+              AS s(position, role, content, source_message_id)`,
+        [
+          chatRow.id,
+          payload.request.messages.map((_, index) => index),
+          payload.request.messages.map((message) => message.role),
+          payload.request.messages.map((message) => message.content),
+          payload.messageSources.map((source) => source),
+        ],
+      );
+    }
+    await client.query(
+      `DELETE FROM trace_attempt_chat_choice WHERE chat_id = $1`,
+      [chatRow.id],
+    );
+    if (outcome.kind === "responded" && outcome.response.choices.length > 0) {
+      await client.query(
+        `INSERT INTO trace_attempt_chat_choice (chat_id, position, finish_reason, content)
+         SELECT $1, s.position, s.finish_reason, s.content
+         FROM unnest($2::int[], $3::text[], $4::text[]) AS s(position, finish_reason, content)`,
+        [
+          chatRow.id,
+          outcome.response.choices.map((_, index) => index),
+          outcome.response.choices.map((choice) => choice.finish_reason ?? null),
+          outcome.response.choices.map((choice) => choice.message.content),
+        ],
+      );
+    }
+  }
+
+  /**
+   * Records the attempt's chat request (exact messages + source linkage)
+   * before the provider call. Fenced: only the current lease holder of the
+   * in-flight turn may record it. Idempotent per attempt.
+   */
+  async function recordChatRequest(
+    params: RecordChatRequestParams,
+  ): Promise<boolean> {
+    return withTransaction(pool, async (client) => {
+      const attemptId = await findOpenAttempt(
+        client,
+        params.turnId,
+        params.leaseOwner,
+      );
+      if (attemptId === null) {
+        return false;
+      }
+      await insertChatRequestTrace(client, attemptId, params.payload);
+      return true;
+    });
+  }
+
+  /**
+   * Records the available chat outcome after the provider call, before
+   * publication: the response (`responded`), the actual transport error
+   * (`failed`), or the contract validation error (`invalid`). Fenced and
+   * idempotent per attempt. Failing here must fail the attempt, not publish
+   * an unrecorded boundary.
+   */
+  async function recordChatOutcome(
+    params: RecordChatOutcomeParams,
+  ): Promise<boolean> {
+    return withTransaction(pool, async (client) => {
+      const attemptId = await findOpenAttempt(
+        client,
+        params.turnId,
+        params.leaseOwner,
+      );
+      if (attemptId === null) {
+        return false;
+      }
+      await insertChatOutcomeTrace(client, attemptId, params.payload);
+      return true;
+    });
   }
 
   async function publishReply(
@@ -494,6 +1271,19 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
            VALUES ('assistant', $1, $2)`,
           [params.content, params.turnId],
         );
+        const attemptId = await findOpenAttemptAfterTransition(
+          client,
+          params.turnId,
+          params.leaseOwner,
+        );
+        if (attemptId !== null) {
+          await client.query(
+            `UPDATE trace_attempt
+             SET finished_at = now(), outcome = 'published'
+             WHERE id = $1 AND finished_at IS NULL`,
+            [attemptId],
+          );
+        }
         return "published";
       }
       // Fenced out, or this exact publication already succeeded earlier
@@ -517,15 +1307,323 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
   }
 
   async function failTurn(params: FailTurnParams): Promise<FailOutcome> {
+    return withTransaction(pool, async (client) => {
+      const result = await client.query<{ id: string }>(
+        `UPDATE conversation_turn
+         SET status = 'failed', error = $2
+         WHERE id = $1 AND status = 'in_flight'
+           AND lease_owner = $3 AND lease_expires_at > now()
+         RETURNING id`,
+        [params.turnId, params.error, params.leaseOwner],
+      );
+      if (result.rows.length === 0) {
+        return "fenced";
+      }
+      const attemptId = await findOpenAttemptAfterTransition(
+        client,
+        params.turnId,
+        params.leaseOwner,
+      );
+      if (attemptId !== null) {
+        if (params.snapshot !== undefined) {
+          await writeAttemptSnapshot(client, attemptId, params.snapshot);
+        }
+        await client.query(
+          `UPDATE trace_attempt
+           SET finished_at = now(), outcome = 'failed'
+           WHERE id = $1 AND finished_at IS NULL`,
+          [attemptId],
+        );
+      }
+      return "failed";
+    });
+  }
+
+  /**
+   * Marks the caller's own attempt row fenced: a stale worker that lost its
+   * lease records its attempt as superseded without touching the turn's
+   * state. Safe against concurrent writers (guarded by finished_at).
+   */
+  async function markAttemptFenced(params: {
+    turnId: string;
+    leaseOwner: string;
+  }): Promise<boolean> {
     const result = await pool.query<{ id: string }>(
-      `UPDATE conversation_turn
-       SET status = 'failed', error = $2
-       WHERE id = $1 AND status = 'in_flight'
-         AND lease_owner = $3 AND lease_expires_at > now()
+      `UPDATE trace_attempt
+       SET finished_at = now(), outcome = 'fenced'
+       WHERE turn_id = $1 AND lease_owner = $2 AND finished_at IS NULL
+         AND EXISTS (
+           SELECT 1 FROM conversation_turn t
+           WHERE t.id = trace_attempt.turn_id
+             AND (t.status <> 'in_flight'
+                  OR t.lease_owner <> trace_attempt.lease_owner)
+         )
        RETURNING id`,
-      [params.turnId, params.error, params.leaseOwner],
+      [params.turnId, params.leaseOwner],
     );
-    return result.rows.length > 0 ? "failed" : "fenced";
+    return result.rows.length > 0;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Read-only trace report assembly
+  // ---------------------------------------------------------------------------
+
+  interface AttemptRow {
+    id: string;
+    attempt: number;
+    lease_owner: string;
+    claimed_at: Date;
+    finished_at: Date | null;
+    outcome: string | null;
+    snapshot_recorded_at: Date | null;
+  }
+
+  interface DecisionRow {
+    id: string;
+    state: string;
+    question_id: string;
+    question_type: string;
+    request_model: string;
+    instructions: string;
+    choice: string | null;
+    confidence: string | null;
+    probabilities_present: boolean;
+    selection: string | null;
+    rejection_reason: string | null;
+    response_model: string | null;
+    response_provider: string | null;
+    response_id: string | null;
+    usage_input_tokens: number | null;
+    usage_output_tokens: number | null;
+    usage_cost: string | null;
+    error_kind: string | null;
+    error_message: string | null;
+    error_body: string | null;
+    recorded_at: Date;
+  }
+
+  interface ChatRow {
+    state: string;
+    request_model: string;
+    temperature: string | null;
+    max_tokens: number | null;
+    response_id: string | null;
+    response_model: string | null;
+    reply_content: string | null;
+    application_rejection: string | null;
+    error_kind: string | null;
+    error_message: string | null;
+    error_body: string | null;
+    usage_prompt_tokens: number | null;
+    usage_completion_tokens: number | null;
+    usage_total_tokens: number | null;
+    recorded_at: Date;
+  }
+
+  /**
+   * Assembles a turn's full trace report from one read-only repeatable-read
+   * transaction on a single pooled client: every query sees the same
+   * committed snapshot, so the turn row and every attempt and boundary row
+   * are mutually consistent even while publication or failure finalization
+   * commits concurrently. READ ONLY is enforced by the server, not caller
+   * discipline: any write inside the transaction fails.
+   */
+  async function getTurnTraceReport(
+    params: TurnTraceParams,
+  ): Promise<TurnTraceReport> {
+    return withTransaction(
+      pool,
+      async (client) => {
+        const turnResult = await client.query<TurnRow>(
+          `SELECT ${TURN_COLUMNS} FROM conversation_turn WHERE id = $1`,
+          [params.turnId],
+        );
+        const turnRow = turnResult.rows[0];
+        if (turnRow === undefined) {
+          throw new Error(`turn ${params.turnId} not found`);
+        }
+        const attemptsResult = await client.query<AttemptRow>(
+          `SELECT id, attempt, lease_owner, claimed_at, finished_at, outcome,
+                  snapshot_recorded_at
+           FROM trace_attempt WHERE turn_id = $1 ORDER BY attempt`,
+          [params.turnId],
+        );
+        const attempts: TurnAttemptTrace[] = [];
+        for (const attemptRow of attemptsResult.rows) {
+          // Context snapshot: the exact ordered messages the attempt saw.
+          const contextResult = await client.query<{
+            position: number;
+            message_id: string;
+            seq: string;
+            role: string;
+            content: string;
+            is_turn_message: boolean;
+          }>(
+            `SELECT c.position, m.id AS message_id, m.seq, m.role, m.content,
+                    (m.turn_id = $2) AS is_turn_message
+             FROM trace_attempt_context c
+             JOIN conversation_message m ON m.id = c.message_id
+             WHERE c.attempt_id = $1
+             ORDER BY c.position`,
+            [attemptRow.id, params.turnId],
+          );
+          // Pattern snapshot: the mutable configuration as it stood.
+          const patternsResult = await client.query<{
+            position: number;
+            pattern_id: string;
+            selection_description: string;
+            response_guidance: string;
+          }>(
+            `SELECT position, pattern_id, selection_description, response_guidance
+             FROM trace_attempt_pattern WHERE attempt_id = $1 ORDER BY position`,
+            [attemptRow.id],
+          );
+          // Decision trace (one row per attempt, when the decision was recorded).
+          const decisionResult = await client.query<DecisionRow>(
+            `SELECT id, state, question_id, question_type, request_model, instructions,
+                    choice, confidence, probabilities_present, selection, rejection_reason,
+                    response_model, response_provider,
+                    response_id, usage_input_tokens, usage_output_tokens,
+                    usage_cost, error_kind, error_message, error_body,
+                    recorded_at
+             FROM trace_attempt_decision WHERE attempt_id = $1`,
+            [attemptRow.id],
+          );
+          let decision: TraceDecision | null = null;
+          const decisionRow = decisionResult.rows[0];
+          if (decisionRow !== undefined) {
+            const probabilitiesResult = await client.query<{
+              option_id: string;
+              value: string;
+            }>(
+              `SELECT option_id, value
+               FROM trace_attempt_decision_probability
+               WHERE decision_id = $1 ORDER BY option_id`,
+              [decisionRow.id],
+            );
+            decision = {
+              state: decisionRow.state,
+              questionId: decisionRow.question_id,
+              questionType: decisionRow.question_type,
+              requestModel: decisionRow.request_model,
+              instructions: decisionRow.instructions,
+              choice: decisionRow.choice,
+              confidence: decisionRow.confidence !== null ? Number(decisionRow.confidence) : null,
+              probabilitiesPresent: decisionRow.probabilities_present,
+              selection: decisionRow.selection,
+              rejectionReason: decisionRow.rejection_reason,
+              responseModel: decisionRow.response_model,
+              responseProvider: decisionRow.response_provider,
+              responseId: decisionRow.response_id,
+              usageInputTokens: decisionRow.usage_input_tokens,
+              usageOutputTokens: decisionRow.usage_output_tokens,
+              usageCost: decisionRow.usage_cost !== null ? Number(decisionRow.usage_cost) : null,
+              errorKind: decisionRow.error_kind,
+              errorMessage: decisionRow.error_message,
+              errorBody: decisionRow.error_body,
+              probabilities: probabilitiesResult.rows.map((row) => ({
+                optionId: row.option_id,
+                value: Number(row.value),
+              })),
+              recordedAt: decisionRow.recorded_at.toISOString(),
+            };
+          }
+          // Chat trace (one row per attempt, when the chat was recorded).
+          const chatResult = await client.query<ChatRow>(
+            `SELECT state, request_model, temperature, max_tokens, response_id,
+                    response_model, reply_content, application_rejection,
+                    error_kind, error_message,
+                    error_body, usage_prompt_tokens,
+                    usage_completion_tokens, usage_total_tokens, recorded_at
+             FROM trace_attempt_chat WHERE attempt_id = $1`,
+            [attemptRow.id],
+          );
+          let chat: TraceChat | null = null;
+          const chatRow = chatResult.rows[0];
+          if (chatRow !== undefined) {
+            const chatMessagesResult = await client.query<{
+              position: number;
+              role: string;
+              content: string;
+              source_message_id: string | null;
+            }>(
+              `SELECT position, role, content, source_message_id
+               FROM trace_attempt_chat_message WHERE chat_id = (
+                 SELECT id FROM trace_attempt_chat WHERE attempt_id = $1
+               ) ORDER BY position`,
+              [attemptRow.id],
+            );
+            const chatChoicesResult = await client.query<{
+              position: number;
+              finish_reason: string | null;
+              content: string;
+            }>(
+              `SELECT position, finish_reason, content
+               FROM trace_attempt_chat_choice WHERE chat_id = (
+                 SELECT id FROM trace_attempt_chat WHERE attempt_id = $1
+               ) ORDER BY position`,
+              [attemptRow.id],
+            );
+            chat = {
+              requestModel: chatRow.request_model,
+              temperature: chatRow.temperature !== null ? Number(chatRow.temperature) : null,
+              maxTokens: chatRow.max_tokens,
+              responseId: chatRow.response_id,
+              state: chatRow.state,
+              errorKind: chatRow.error_kind,
+              errorMessage: chatRow.error_message,
+              errorBody: chatRow.error_body,
+              responseModel: chatRow.response_model,
+              replyContent: chatRow.reply_content,
+              applicationRejection: chatRow.application_rejection,
+              usagePromptTokens: chatRow.usage_prompt_tokens,
+              usageCompletionTokens: chatRow.usage_completion_tokens,
+              usageTotalTokens: chatRow.usage_total_tokens,
+              messages: chatMessagesResult.rows.map((row) => ({
+                position: row.position,
+                role: row.role as TraceChatMessage["role"],
+                content: row.content,
+                sourceMessageId: row.source_message_id,
+              })),
+              choices: chatChoicesResult.rows.map((row) => ({
+                position: row.position,
+                finishReason: row.finish_reason,
+                content: row.content,
+              })),
+              recordedAt: chatRow.recorded_at.toISOString(),
+            };
+          }
+          attempts.push({
+            id: attemptRow.id,
+            turnId: params.turnId,
+            attempt: attemptRow.attempt,
+            leaseOwner: attemptRow.lease_owner,
+            claimedAt: attemptRow.claimed_at.toISOString(),
+            finishedAt: attemptRow.finished_at?.toISOString() ?? null,
+            outcome: attemptRow.outcome as TurnAttemptTrace["outcome"],
+            snapshotRecordedAt: attemptRow.snapshot_recorded_at?.toISOString() ?? null,
+            context: contextResult.rows.map((row) => ({
+              position: row.position,
+              messageId: row.message_id,
+              seq: Number(row.seq),
+              role: row.role as TraceContextMessage["role"],
+              content: row.content,
+              fromTurn: row.is_turn_message,
+            })),
+            patterns: patternsResult.rows.map((row) => ({
+              position: row.position,
+              patternId: row.pattern_id,
+              selectionDescription: row.selection_description,
+              responseGuidance: row.response_guidance,
+            })),
+            decision,
+            chat,
+          });
+        }
+        return { turn: mapTurn(turnRow), attempts };
+      },
+      { readOnly: true, isolationLevel: "repeatable read" },
+    );
   }
 
   async function getEnabledResponsePatterns(): Promise<
@@ -739,12 +1837,19 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     appendUserMessage,
     claimNextTurn,
     renewLease,
-    recordTurnDecision,
+    recordAttemptSnapshot,
+    recordDecisionRequest,
+    recordDecisionOutcome,
+    recordDecisionSelection,
+    recordChatRequest,
+    recordChatOutcome,
     publishReply,
     failTurn,
+    markAttemptFenced,
     getEnabledResponsePatterns,
     getThreadContext,
     getThreadPage,
     getThreadStatus,
+    getTurnTraceReport,
   };
 }

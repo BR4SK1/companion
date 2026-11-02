@@ -16,14 +16,26 @@ import { describe, it, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { closePostgresPool, createPostgresPool, runMigrations } from "../../libraries/postgres/src/index.ts";
+import {
+  closePostgresPool,
+  createPostgresPool,
+  runMigrations,
+  withTransaction,
+} from "../../libraries/postgres/src/index.ts";
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import {
   CLAIM_ADVISORY_LOCK_KEY,
   createConversationStore,
+  TraceWriteFencedError,
 } from "../../apps/worker/src/conversation/store.ts";
 import { processTurnWork } from "../../apps/worker/src/work/processor.ts";
 import { runEngineOnce } from "../../apps/worker/src/work/engine.ts";
+import {
+  DECISION_QUESTION_ID,
+  buildPatternChoiceRequest,
+} from "../../apps/worker/src/work/decision.ts";
+import { buildChatRequest } from "../../apps/worker/src/work/chat.ts";
+import { renderReport } from "../../apps/worker/src/cli.ts";
 
 const DATABASE_URL = process.env.WORKER_TEST_DATABASE_URL;
 const hasDatabase =
@@ -50,14 +62,21 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
 
   beforeEach(async () => {
     await pool.query(
-      "TRUNCATE conversation_message, conversation_turn, response_pattern RESTART IDENTITY",
+      `TRUNCATE conversation_message, conversation_turn, response_pattern,
+        trace_attempt, trace_attempt_context, trace_attempt_pattern,
+        trace_attempt_decision, trace_attempt_decision_probability,
+        trace_attempt_chat, trace_attempt_chat_message,
+        trace_attempt_chat_choice RESTART IDENTITY`,
     );
   });
 
   it("re-applies migrations idempotently with the domain tables present", async () => {
     const second = await runMigrations(pool, conversationMigrations);
     assert.deepEqual(second.applied, []);
-    assert.deepEqual(second.alreadyApplied, ["0001_conversation_work"]);
+    assert.deepEqual(second.alreadyApplied, [
+      "0001_conversation_work",
+      "0002_conversation_tracing",
+    ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
        WHERE table_schema = 'public'
@@ -557,13 +576,53 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       content: "stale reply",
     });
     assert.equal(stalePublish, "fenced");
-    const staleDecision = await store.recordTurnDecision({
+    // The stale owner can no longer record any trace boundary: every trace
+    // write is fenced by the in-flight lease the fresh owner now holds.
+    const staleRequest = await store.recordDecisionRequest({
       turnId: first.work.turn.id,
       leaseOwner: "stale-owner",
-      selectedPatternId: "concise",
-      decision: { choice: "concise" },
+      trace: {
+        questionId: DECISION_QUESTION_ID,
+        request: {
+          model: "decision-model",
+          questions: {
+            [DECISION_QUESTION_ID]: { instructions: "pick a pattern" },
+          },
+          state: { conversation: [] },
+        },
+      },
     });
-    assert.equal(staleDecision, false);
+    assert.equal(staleRequest, false);
+    const staleSelection = await store.recordDecisionSelection({
+      turnId: first.work.turn.id,
+      leaseOwner: "stale-owner",
+      selection: { kind: "rejected", reason: "stale owner" },
+    });
+    assert.equal(staleSelection, false);
+    const staleChatRequest = await store.recordChatRequest({
+      turnId: first.work.turn.id,
+      leaseOwner: "stale-owner",
+      payload: {
+        request: { model: "chat-model", messages: [{ role: "user", content: "stale" }] },
+        messageSources: [null],
+      },
+    });
+    assert.equal(staleChatRequest, false);
+    const staleChatOutcome = await store.recordChatOutcome({
+      turnId: first.work.turn.id,
+      leaseOwner: "stale-owner",
+      payload: {
+        request: { model: "chat-model", messages: [{ role: "user", content: "stale" }] },
+        messageSources: [null],
+        outcome: {
+          kind: "failed",
+          errorKind: "error",
+          message: "stale failure",
+          body: null,
+        },
+      },
+    });
+    assert.equal(staleChatOutcome, false);
     const staleFail = await store.failTurn({
       turnId: first.work.turn.id,
       leaseOwner: "stale-owner",
@@ -671,7 +730,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     const chatCalls = [];
     const outcome = await runEngineOnce({
       store,
-      processTurn: (work) =>
+      processTurn: (work, { leaseOwner }) =>
         processTurnWork(work, {
           decisionModel: "decision-model",
           chatModel: "chat-model",
@@ -706,6 +765,42 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
           loadPatterns: () => store.getEnabledResponsePatterns(),
           loadContext: (turnId) =>
             store.getThreadContext({ turnId, limit: 50 }),
+          recordSnapshot: (snapshot) =>
+            store.recordAttemptSnapshot({
+              turnId: work.turn.id,
+              leaseOwner,
+              snapshot,
+            }),
+          recordDecisionRequest: (payload) =>
+            store.recordDecisionRequest({
+              turnId: work.turn.id,
+              leaseOwner,
+              trace: payload.trace,
+            }),
+          recordDecisionOutcome: (payload) =>
+            store.recordDecisionOutcome({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+          recordDecisionSelection: (payload) =>
+            store.recordDecisionSelection({
+              turnId: work.turn.id,
+              leaseOwner,
+              selection: payload.selection,
+            }),
+          recordChatRequest: (payload) =>
+            store.recordChatRequest({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+          recordChatOutcome: (payload) =>
+            store.recordChatOutcome({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
         }),
       leaseSeconds: 60,
       pollSeconds: 1,
@@ -733,11 +828,10 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.equal(turn.rows[0].status, "completed");
     assert.equal(turn.rows[0].selected_pattern_id, "detailed");
     assert.equal(turn.rows[0].error, null);
-    assert.equal(turn.rows[0].decision.choice, "detailed");
-    assert.deepEqual(turn.rows[0].decision.probabilities, {
-      concise: 0.25,
-      detailed: 0.75,
-    });
+    // The legacy decision JSONB column stays untouched for new work: decision
+    // diagnostics now live in the relational trace tables, and pre-tracing
+    // history is preserved in the column without new fabricated rows.
+    assert.equal(turn.rows[0].decision, null);
 
     const replies = await pool.query(
       "SELECT content FROM conversation_message WHERE role = 'assistant'",
@@ -745,6 +839,101 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.deepEqual(
       replies.rows.map((row) => row.content),
       ["here is the answer"],
+    );
+
+    // The attempt trace: one attempt, snapshot recorded, published outcome.
+    const attempt = await pool.query(
+      `SELECT attempt, outcome, finished_at IS NOT NULL AS finished,
+              snapshot_recorded_at IS NOT NULL AS snapshotted
+       FROM trace_attempt`,
+    );
+    assert.equal(attempt.rows.length, 1);
+    assert.equal(attempt.rows[0].attempt, 1);
+    assert.equal(attempt.rows[0].outcome, "published");
+    assert.equal(attempt.rows[0].finished, true);
+    assert.equal(attempt.rows[0].snapshotted, true);
+
+    // The snapshot: mutable patterns (both, with full content) and the exact
+    // ordered context (the turn's own grouped messages only — no prior turns).
+    const snapPatterns = await pool.query(
+      `SELECT position, pattern_id, selection_description, response_guidance
+       FROM trace_attempt_pattern ORDER BY position`,
+    );
+    assert.deepEqual(
+      snapPatterns.rows.map((row) => [
+        row.pattern_id,
+        row.selection_description,
+        row.response_guidance,
+      ]),
+      [
+        ["concise", "Short factual replies fit here.", "Answer in one short paragraph."],
+        ["detailed", "Longer structured explanations fit here.", "Explain step by step."],
+      ],
+    );
+    const turnMessages = await pool.query(
+      "SELECT id, content FROM conversation_message WHERE role = 'user' AND turn_id IS NOT NULL ORDER BY seq",
+    );
+    const snapContext = await pool.query(
+      `SELECT position, message_id FROM trace_attempt_context ORDER BY position`,
+    );
+    assert.deepEqual(
+      snapContext.rows.map((row) => row.message_id),
+      turnMessages.rows.map((row) => row.id),
+    );
+
+    // The decision boundary: native typed values in relational columns, with
+    // the selection recorded separately before the chat step.
+    const decision = await pool.query(
+      `SELECT question_id, question_type, request_model, choice, confidence,
+              selection, rejection_reason,
+              response_model, usage_input_tokens, usage_output_tokens
+       FROM trace_attempt_decision`,
+    );
+    assert.equal(decision.rows.length, 1);
+    assert.equal(decision.rows[0].question_id, "response_pattern");
+    assert.equal(decision.rows[0].choice, "detailed");
+    assert.equal(decision.rows[0].confidence, null); // absent stays absent
+    assert.equal(decision.rows[0].selection, "selected");
+    assert.equal(decision.rows[0].rejection_reason, null);
+    assert.equal(decision.rows[0].usage_input_tokens, 5);
+    assert.equal(decision.rows[0].usage_output_tokens, 2);
+    const probabilities = await pool.query(
+      "SELECT option_id, value FROM trace_attempt_decision_probability ORDER BY option_id",
+    );
+    assert.deepEqual(probabilities.rows, [
+      { option_id: "concise", value: "0.25" },
+      { option_id: "detailed", value: "0.75" },
+    ]);
+
+    // The chat boundary: request messages (with source linkage), response,
+    // usage, and the published reply content, in the final responded state.
+    const chat = await pool.query(
+      `SELECT state, request_model, response_id, response_model, reply_content,
+              usage_prompt_tokens, usage_completion_tokens, usage_total_tokens
+       FROM trace_attempt_chat`,
+    );
+    assert.equal(chat.rows.length, 1);
+    assert.equal(chat.rows[0].state, "responded");
+    assert.equal(chat.rows[0].request_model, "chat-model");
+    assert.equal(chat.rows[0].response_id, "chat-1");
+    assert.equal(chat.rows[0].response_model, "chat-model-build");
+    assert.equal(chat.rows[0].reply_content, "here is the answer");
+    assert.deepEqual(
+      [chat.rows[0].usage_prompt_tokens, chat.rows[0].usage_completion_tokens, chat.rows[0].usage_total_tokens],
+      [9, 4, 13],
+    );
+    const chatMessages = await pool.query(
+      `SELECT position, role, content, source_message_id
+       FROM trace_attempt_chat_message ORDER BY position`,
+    );
+    assert.deepEqual(chatMessages.rows.map((row) => row.role), ["system", "user", "user"]);
+    assert.equal(chatMessages.rows[0].source_message_id, null); // guidance has no source
+    assert.equal(chatMessages.rows[0].content, "Explain step by step.");
+    assert.ok(chatMessages.rows[1].source_message_id !== null);
+    assert.ok(chatMessages.rows[2].source_message_id !== null);
+    assert.notEqual(
+      chatMessages.rows[1].source_message_id,
+      chatMessages.rows[2].source_message_id,
     );
 
     // Nothing else to do.
@@ -955,5 +1144,1523 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       "SELECT count(*)::int AS n FROM conversation_message WHERE role = 'assistant'",
     );
     assert.equal(replies.rows[0].n, 0);
+  });
+
+  it("records the decision boundary before a rejected selection, leaving every response detail behind", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'Short factual replies fit here.', 'Answer in one short paragraph.', 0)`,
+    );
+    await store.appendUserMessage({ content: "reject me" });
+    const outcome = await runEngineOnce({
+      store,
+      processTurn: (work, { leaseOwner }) =>
+        processTurnWork(work, {
+          decisionModel: "decision-model",
+          chatModel: "chat-model",
+          callDecisions: async () => ({
+            model: "decision-model-build",
+            answers: {
+              response_pattern: {
+                type: "choice",
+                choice: "no-such-pattern",
+                confidence: 0.4,
+                probabilities: { concise: 0.3, "no-such-pattern": 0.7 },
+              },
+            },
+            usage: { input_tokens: 6, output_tokens: 3 },
+          }),
+          callChat: async () => {
+            throw new Error("chat must not be called");
+          },
+          loadPatterns: () => store.getEnabledResponsePatterns(),
+          loadContext: (turnId) =>
+            store.getThreadContext({ turnId, limit: 50 }),
+          recordSnapshot: (snapshot) =>
+            store.recordAttemptSnapshot({
+              turnId: work.turn.id,
+              leaseOwner,
+              snapshot,
+            }),
+          recordDecisionRequest: (payload) =>
+            store.recordDecisionRequest({
+              turnId: work.turn.id,
+              leaseOwner,
+              trace: payload.trace,
+            }),
+          recordDecisionOutcome: (payload) =>
+            store.recordDecisionOutcome({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+          recordDecisionSelection: (payload) =>
+            store.recordDecisionSelection({
+              turnId: work.turn.id,
+              leaseOwner,
+              selection: payload.selection,
+            }),
+          recordChatRequest: (payload) =>
+            store.recordChatRequest({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+          recordChatOutcome: (payload) =>
+            store.recordChatOutcome({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+        }),
+      leaseSeconds: 60,
+      pollSeconds: 1,
+    });
+    assert.equal(outcome, "worked");
+
+    // The boundary survived the rejected selection: the full native response
+    // (choice, confidence, probabilities, usage) is intact even though the
+    // selection step rejected it and the turn failed.
+    const decision = await pool.query(
+      `SELECT choice, confidence, selection, rejection_reason,
+              response_model, usage_input_tokens, usage_output_tokens
+       FROM trace_attempt_decision`,
+    );
+    assert.equal(decision.rows.length, 1);
+    assert.equal(decision.rows[0].choice, "no-such-pattern");
+    assert.equal(Number(decision.rows[0].confidence), 0.4);
+    assert.equal(decision.rows[0].selection, "rejected");
+    assert.ok(decision.rows[0].rejection_reason.length > 0);
+    assert.equal(decision.rows[0].response_model, "decision-model-build");
+    assert.equal(decision.rows[0].usage_input_tokens, 6);
+    assert.equal(decision.rows[0].usage_output_tokens, 3);
+    const probabilities = await pool.query(
+      "SELECT option_id, value FROM trace_attempt_decision_probability ORDER BY option_id",
+    );
+    assert.deepEqual(
+      probabilities.rows.map((row) => [row.option_id, Number(row.value)]),
+      [["concise", 0.3], ["no-such-pattern", 0.7]],
+    );
+
+    // The turn is failed with no chat boundary and no reply.
+    const turn = await pool.query(
+      "SELECT status, selected_pattern_id FROM conversation_turn",
+    );
+    assert.equal(turn.rows[0].status, "failed");
+    assert.equal(turn.rows[0].selected_pattern_id, null);
+    const chat = await pool.query("SELECT count(*)::int AS n FROM trace_attempt_chat");
+    assert.equal(chat.rows[0].n, 0);
+    const replies = await pool.query(
+      "SELECT count(*)::int AS n FROM conversation_message WHERE role = 'assistant'",
+    );
+    assert.equal(replies.rows[0].n, 0);
+  });
+
+  it("records a chat request before the call and the invalid outcome after a contract failure", async () => {
+    await store.appendUserMessage({ content: "break the contract" });
+    const result = await runEngineOnce({
+      store,
+      processTurn: (work, { leaseOwner }) =>
+        processTurnWork(work, {
+          decisionModel: "decision-model",
+          chatModel: "chat-model",
+          callDecisions: async () => {
+            throw new Error("decision must not be called");
+          },
+          callChat: async () => ({
+            wrong: "shape",
+          }),
+          loadPatterns: () => Promise.resolve([]),
+          loadContext: (turnId) =>
+            store.getThreadContext({ turnId, limit: 50 }),
+          recordSnapshot: (snapshot) =>
+            store.recordAttemptSnapshot({
+              turnId: work.turn.id,
+              leaseOwner,
+              snapshot,
+            }),
+          recordChatRequest: (payload) =>
+            store.recordChatRequest({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+          recordChatOutcome: (payload) =>
+            store.recordChatOutcome({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+        }),
+      leaseSeconds: 60,
+      pollSeconds: 1,
+    });
+    assert.equal(result, "worked");
+
+    // The chat row went through both boundary steps: requested before the
+    // call, then transitioned to the invalid state with the validation error.
+    const chat = await pool.query(
+      `SELECT state, request_model, response_id, reply_content,
+              error_kind, error_message
+       FROM trace_attempt_chat`,
+    );
+    assert.equal(chat.rows.length, 1);
+    assert.equal(chat.rows[0].state, "invalid");
+    assert.equal(chat.rows[0].request_model, "chat-model");
+    assert.equal(chat.rows[0].response_id, null);
+    assert.equal(chat.rows[0].reply_content, null);
+    assert.equal(chat.rows[0].error_kind, "invalid");
+    assert.ok(chat.rows[0].error_message.length > 0);
+
+    // The chat messages were recorded with the request (boundary survives
+    // the contract failure), and the attempt is terminally failed.
+    const chatMessages = await pool.query(
+      "SELECT role, source_message_id FROM trace_attempt_chat_message ORDER BY position",
+    );
+    assert.deepEqual(chatMessages.rows.map((row) => row.role), ["user"]);
+    assert.ok(chatMessages.rows[0].source_message_id !== null);
+    const attempt = await pool.query(
+      "SELECT outcome, finished_at IS NOT NULL AS finished FROM trace_attempt",
+    );
+    assert.equal(attempt.rows[0].outcome, "failed");
+    assert.equal(attempt.rows[0].finished, true);
+    const turn = await pool.query("SELECT status FROM conversation_turn");
+    assert.equal(turn.rows[0].status, "failed");
+    const replies = await pool.query(
+      "SELECT count(*)::int AS n FROM conversation_message WHERE role = 'assistant'",
+    );
+    assert.equal(replies.rows[0].n, 0);
+  });
+
+  it("records the decision trace before a chat failure, with the attempt failed", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'Short factual replies fit here.', 'Answer in one short paragraph.', 0)`,
+    );
+    await store.appendUserMessage({ content: "hello" });
+    const result = await runEngineOnce({
+      store,
+      processTurn: (work, { leaseOwner }) =>
+        processTurnWork(work, {
+          decisionModel: "decision-model",
+          chatModel: "chat-model",
+          callDecisions: async () => ({
+            model: "decision-model-build",
+            answers: {
+              response_pattern: {
+                type: "choice",
+                choice: "concise",
+                probabilities: { concise: 1 },
+              },
+            },
+            usage: { input_tokens: 3, output_tokens: 1 },
+          }),
+          callChat: async () => {
+            throw new Error("chat endpoint exploded");
+          },
+          loadPatterns: () => store.getEnabledResponsePatterns(),
+          loadContext: (turnId) =>
+            store.getThreadContext({ turnId, limit: 50 }),
+          recordSnapshot: (snapshot) =>
+            store.recordAttemptSnapshot({
+              turnId: work.turn.id,
+              leaseOwner,
+              snapshot,
+            }),
+          recordDecisionRequest: (payload) =>
+            store.recordDecisionRequest({
+              turnId: work.turn.id,
+              leaseOwner,
+              trace: payload.trace,
+            }),
+          recordDecisionOutcome: (payload) =>
+            store.recordDecisionOutcome({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+          recordDecisionSelection: (payload) =>
+            store.recordDecisionSelection({
+              turnId: work.turn.id,
+              leaseOwner,
+              selection: payload.selection,
+            }),
+          recordChatRequest: (payload) =>
+            store.recordChatRequest({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+          recordChatOutcome: (payload) =>
+            store.recordChatOutcome({
+              turnId: work.turn.id,
+              leaseOwner,
+              payload,
+            }),
+        }),
+      leaseSeconds: 60,
+      pollSeconds: 1,
+    });
+    assert.equal(result, "worked");
+
+    // The decision boundary survived the later chat failure, with the
+    // selection recorded separately before the chat step began.
+    const decision = await pool.query(
+      `SELECT choice, selection, rejection_reason, response_model,
+              usage_input_tokens
+       FROM trace_attempt_decision`,
+    );
+    assert.equal(decision.rows.length, 1);
+    assert.equal(decision.rows[0].choice, "concise");
+    assert.equal(decision.rows[0].selection, "selected");
+    assert.equal(decision.rows[0].rejection_reason, null);
+    assert.equal(decision.rows[0].response_model, "decision-model-build");
+    assert.equal(decision.rows[0].usage_input_tokens, 3);
+
+    // The chat request was recorded before the provider call, and the failed
+    // call transitioned that same row to the honest failure state.
+    const chat = await pool.query(
+      `SELECT state, request_model, response_id, reply_content,
+              error_kind, error_message
+       FROM trace_attempt_chat`,
+    );
+    assert.equal(chat.rows.length, 1);
+    assert.equal(chat.rows[0].state, "failed");
+    assert.equal(chat.rows[0].request_model, "chat-model");
+    assert.equal(chat.rows[0].response_id, null);
+    assert.equal(chat.rows[0].reply_content, null);
+    assert.equal(chat.rows[0].error_kind, "error");
+    assert.equal(chat.rows[0].error_message, "chat endpoint exploded");
+
+    // The attempt is terminally failed, fenced-safe, with no reply published.
+    const attempt = await pool.query(
+      `SELECT outcome, finished_at IS NOT NULL AS finished FROM trace_attempt`,
+    );
+    assert.equal(attempt.rows.length, 1);
+    assert.equal(attempt.rows[0].outcome, "failed");
+    assert.equal(attempt.rows[0].finished, true);
+    const turn = await pool.query(
+      "SELECT status, selected_pattern_id FROM conversation_turn",
+    );
+    assert.equal(turn.rows[0].status, "failed");
+    assert.equal(turn.rows[0].selected_pattern_id, "concise");
+    const replies = await pool.query(
+      "SELECT count(*)::int AS n FROM conversation_message WHERE role = 'assistant'",
+    );
+    assert.equal(replies.rows[0].n, 0);
+  });
+
+  it("preserves each attempt's pattern snapshot when the mutable patterns change between attempts", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'v1 selection', 'v1 guidance', 0)`,
+    );
+    await store.appendUserMessage({ content: "needs two attempts" });
+    const first = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 1 });
+    assert.equal(first.kind, "claimed");
+
+    // Attempt 1 snapshots the v1 configuration.
+    const context = await store.getThreadContext({
+      turnId: first.work.turn.id,
+      limit: 50,
+    });
+    const snap1 = await store.recordAttemptSnapshot({
+      turnId: first.work.turn.id,
+      leaseOwner: "owner-a",
+      snapshot: { context, patterns: await store.getEnabledResponsePatterns() },
+    });
+    assert.equal(snap1, true);
+
+    // The lease expires and the configuration is edited before the reclaim.
+    await sleep(1100);
+    await pool.query(
+      `UPDATE response_pattern
+       SET selection_description = 'v2 selection', response_guidance = 'v2 guidance'
+       WHERE id = 'concise'`,
+    );
+    const reclaimed = await store.claimNextTurn({ owner: "owner-b", leaseSeconds: 60 });
+    assert.equal(reclaimed.kind, "claimed");
+    const snap2 = await store.recordAttemptSnapshot({
+      turnId: first.work.turn.id,
+      leaseOwner: "owner-b",
+      snapshot: {
+        context,
+        patterns: await store.getEnabledResponsePatterns(),
+      },
+    });
+    assert.equal(snap2, true);
+
+    // A duplicate snapshot of the same attempt is an idempotent no-op: the
+    // first snapshot is what the attempt actually saw.
+    const snapAgain = await store.recordAttemptSnapshot({
+      turnId: first.work.turn.id,
+      leaseOwner: "owner-b",
+      snapshot: {
+        context: [],
+        patterns: [
+          {
+            id: "concise",
+            selectionDescription: "overwritten",
+            responseGuidance: "overwritten",
+            position: 0,
+          },
+        ],
+      },
+    });
+    assert.equal(snapAgain, true);
+
+    const snaps = await pool.query(
+      `SELECT t.attempt, p.selection_description, p.response_guidance
+       FROM trace_attempt t JOIN trace_attempt_pattern p ON p.attempt_id = t.id
+       ORDER BY t.attempt`,
+    );
+    assert.deepEqual(
+      snaps.rows.map((row) => [row.attempt, row.selection_description, row.response_guidance]),
+      [
+        [1, "v1 selection", "v1 guidance"],
+        [2, "v2 selection", "v2 guidance"],
+      ],
+    );
+  });
+
+  it("records fenced and superseded attempts across a lease reclaim", async () => {
+    await store.appendUserMessage({ content: "reclaim me" });
+    const first = await store.claimNextTurn({ owner: "stale-owner", leaseSeconds: 1 });
+    assert.equal(first.kind, "claimed");
+    await sleep(1100);
+    const reclaimed = await store.claimNextTurn({ owner: "fresh-owner", leaseSeconds: 60 });
+    assert.equal(reclaimed.kind, "claimed");
+
+    // The reclaim atomically superseded the stale worker's open attempt in
+    // the same transaction as the lease replacement: no self-report is
+    // needed, and a late self-report is an idempotent no-op.
+    const fenced = await store.markAttemptFenced({
+      turnId: first.work.turn.id,
+      leaseOwner: "stale-owner",
+    });
+    assert.equal(fenced, false);
+    const superseded = await pool.query(
+      `SELECT outcome, finished_at IS NOT NULL AS finished
+       FROM trace_attempt WHERE attempt = 1`,
+    );
+    assert.equal(superseded.rows[0].outcome, "superseded");
+    assert.equal(superseded.rows[0].finished, true);
+
+    // The stale owner cannot record any trace boundary either: every write
+    // is fenced by the in-flight lease the fresh owner now holds.
+    const staleRequest = await store.recordDecisionRequest({
+      turnId: first.work.turn.id,
+      leaseOwner: "stale-owner",
+      trace: {
+        questionId: DECISION_QUESTION_ID,
+        request: {
+          model: "decision-model",
+          questions: {
+            [DECISION_QUESTION_ID]: { instructions: "pick a pattern" },
+          },
+          state: { conversation: [] },
+        },
+      },
+    });
+    assert.equal(staleRequest, false);
+    const staleChatOutcome = await store.recordChatOutcome({
+      turnId: first.work.turn.id,
+      leaseOwner: "stale-owner",
+      payload: {
+        request: { model: "chat-model", messages: [{ role: "user", content: "stale" }] },
+        messageSources: [null],
+        outcome: {
+          kind: "failed",
+          errorKind: "error",
+          message: "stale failure",
+          body: null,
+        },
+      },
+    });
+    assert.equal(staleChatOutcome, false);
+    const stalePublish = await store.publishReply({
+      turnId: first.work.turn.id,
+      leaseOwner: "stale-owner",
+      content: "stale reply",
+    });
+    assert.equal(stalePublish, "fenced");
+
+    // The fresh owner records its chat boundary (request before the call,
+    // outcome after), then publishes.
+    const messageId = reclaimed.work.messages[0].id;
+    const freshChatRequest = {
+      model: "chat-model",
+      messages: [
+        { role: "system", content: "guidance" },
+        { role: "user", content: "reclaim me" },
+      ],
+    };
+    const freshRequestRecorded = await store.recordChatRequest({
+      turnId: first.work.turn.id,
+      leaseOwner: "fresh-owner",
+      payload: {
+        request: freshChatRequest,
+        messageSources: [null, messageId],
+      },
+    });
+    assert.equal(freshRequestRecorded, true);
+    const freshOutcomeRecorded = await store.recordChatOutcome({
+      turnId: first.work.turn.id,
+      leaseOwner: "fresh-owner",
+      payload: {
+        request: freshChatRequest,
+        messageSources: [null, messageId],
+        outcome: {
+          kind: "responded",
+          response: {
+            id: "chat-r1",
+            model: "chat-model-build",
+            choices: [
+              {
+                message: { role: "assistant", content: "fresh reply" },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+          },
+          replyContent: "fresh reply",
+        },
+      },
+    });
+    assert.equal(freshOutcomeRecorded, true);
+    const published = await store.publishReply({
+      turnId: first.work.turn.id,
+      leaseOwner: "fresh-owner",
+      content: "fresh reply",
+    });
+    assert.equal(published, "published");
+
+    const attempts = await pool.query(
+      `SELECT attempt, lease_owner, outcome, finished_at IS NOT NULL AS finished
+       FROM trace_attempt ORDER BY attempt`,
+    );
+    assert.deepEqual(
+      attempts.rows.map((row) => [row.attempt, row.lease_owner, row.outcome]),
+      [
+        [1, "stale-owner", "superseded"],
+        [2, "fresh-owner", "published"],
+      ],
+    );
+    // Only the published attempt carries a chat boundary record.
+    const chatRows = await pool.query(
+      `SELECT t.attempt, c.request_model, c.reply_content
+       FROM trace_attempt t JOIN trace_attempt_chat c ON c.attempt_id = t.id
+       ORDER BY t.attempt`,
+    );
+    assert.deepEqual(
+      chatRows.rows.map((row) => [row.attempt, row.request_model, row.reply_content]),
+      [[2, "chat-model", "fresh reply"]],
+    );
+    const turn = await pool.query(
+      "SELECT status FROM conversation_turn WHERE id = $1",
+      [first.work.turn.id],
+    );
+    assert.equal(turn.rows[0].status, "completed");
+  });
+
+  it("records the chat boundary atomically before publication", async () => {
+    await store.appendUserMessage({ content: "atomic" });
+    const claim = await store.claimNextTurn({ owner: "owner-atomic", leaseSeconds: 60 });
+    assert.equal(claim.kind, "claimed");
+    const messageId = claim.work.messages[0].id;
+    const chatRequest = {
+      model: "chat-model",
+      messages: [{ role: "user", content: "atomic" }],
+    };
+
+    // A misaligned messageSources payload fails the whole record
+    // transaction: no chat row, no chat messages, and the attempt stays open.
+    await assert.rejects(
+      () =>
+        store.recordChatRequest({
+          turnId: claim.work.turn.id,
+          leaseOwner: "owner-atomic",
+          payload: {
+            request: chatRequest,
+            messageSources: [messageId, messageId],
+          },
+        }),
+      /messageSources must align/,
+    );
+    const afterFailure = await pool.query(
+      `SELECT (SELECT status FROM conversation_turn WHERE id = $1) AS status,
+              (SELECT count(*)::int FROM conversation_message
+                WHERE turn_id = $1 AND role = 'assistant') AS replies,
+              (SELECT count(*)::int FROM trace_attempt_chat) AS chats,
+              (SELECT count(*)::int FROM trace_attempt_chat_message) AS chat_messages,
+              (SELECT finished_at IS NULL FROM trace_attempt WHERE turn_id = $1) AS attempt_open`,
+      [claim.work.turn.id],
+    );
+    assert.equal(afterFailure.rows[0].status, "in_flight");
+    assert.equal(afterFailure.rows[0].replies, 0);
+    assert.equal(afterFailure.rows[0].chats, 0);
+    assert.equal(afterFailure.rows[0].chat_messages, 0);
+    assert.equal(afterFailure.rows[0].attempt_open, true);
+
+    // The corrected request record writes the request in 'requested' state,
+    // then the outcome transitions that same row before publication.
+    const requested = await store.recordChatRequest({
+      turnId: claim.work.turn.id,
+      leaseOwner: "owner-atomic",
+      payload: { request: chatRequest, messageSources: [messageId] },
+    });
+    assert.equal(requested, true);
+    const requestedRow = await pool.query(
+      "SELECT state FROM trace_attempt_chat",
+    );
+    assert.equal(requestedRow.rows[0].state, "requested");
+
+    const outcomeRecorded = await store.recordChatOutcome({
+      turnId: claim.work.turn.id,
+      leaseOwner: "owner-atomic",
+      payload: {
+        request: chatRequest,
+        messageSources: [messageId],
+        outcome: {
+          kind: "responded",
+          response: {
+            id: "chat-a1",
+            model: "chat-model-build",
+            choices: [
+              {
+                message: { role: "assistant", content: "atomic reply" },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 },
+          },
+          replyContent: "atomic reply",
+        },
+      },
+    });
+    assert.equal(outcomeRecorded, true);
+
+    // Publication completes the turn; the trace row survives untouched.
+    const published = await store.publishReply({
+      turnId: claim.work.turn.id,
+      leaseOwner: "owner-atomic",
+      content: "atomic reply",
+    });
+    assert.equal(published, "published");
+    const afterSuccess = await pool.query(
+      `SELECT (SELECT status FROM conversation_turn WHERE id = $1) AS status,
+              (SELECT count(*)::int FROM conversation_message
+                WHERE turn_id = $1 AND role = 'assistant') AS replies,
+              (SELECT state FROM trace_attempt_chat
+                WHERE reply_content = 'atomic reply') AS state,
+              (SELECT outcome FROM trace_attempt WHERE turn_id = $1) AS outcome`,
+      [claim.work.turn.id],
+    );
+    assert.equal(afterSuccess.rows[0].status, "completed");
+    assert.equal(afterSuccess.rows[0].replies, 1);
+    assert.equal(afterSuccess.rows[0].state, "responded");
+    assert.equal(afterSuccess.rows[0].outcome, "published");
+  });
+
+  it("assembles the turn trace report with every recorded boundary", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'Short factual replies fit here.', 'Answer in one short paragraph.', 0)`,
+    );
+    await store.appendUserMessage({ content: "report me" });
+    const claim = await store.claimNextTurn({ owner: "owner-report", leaseSeconds: 60 });
+    assert.equal(claim.kind, "claimed");
+    const turnId = claim.work.turn.id;
+
+    const history = await store.getThreadContext({ turnId, limit: 50 });
+    const context = [...history, ...claim.work.messages];
+    const patterns = await store.getEnabledResponsePatterns();
+    await store.recordAttemptSnapshot({
+      turnId,
+      leaseOwner: "owner-report",
+      snapshot: { context, patterns },
+    });
+    const decisionRequest = buildPatternChoiceRequest({
+      model: "decision-model",
+      patterns,
+      state: {
+        conversation: claim.work.messages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+      },
+    });
+    const decisionResponse = {
+      model: "decision-model-build",
+      answers: {
+        response_pattern: {
+          type: "choice",
+          choice: "concise",
+          confidence: 0.9,
+          probabilities: { concise: 0.9 },
+        },
+      },
+      usage: { input_tokens: 4, output_tokens: 2 },
+    };
+    await store.recordDecisionRequest({
+      turnId,
+      leaseOwner: "owner-report",
+      trace: { questionId: DECISION_QUESTION_ID, request: decisionRequest },
+    });
+    await store.recordDecisionOutcome({
+      turnId,
+      leaseOwner: "owner-report",
+      payload: {
+        trace: { questionId: DECISION_QUESTION_ID, request: decisionRequest },
+        outcome: {
+          kind: "responded",
+          trace: {
+            questionId: DECISION_QUESTION_ID,
+            request: decisionRequest,
+            response: decisionResponse,
+          },
+        },
+      },
+    });
+    await store.recordDecisionSelection({
+      turnId,
+      leaseOwner: "owner-report",
+      selection: { kind: "selected", patternId: "concise" },
+    });
+    const chatRequest = buildChatRequest({
+      model: "chat-model",
+      history: [],
+      turnMessages: claim.work.messages,
+      guidance: "Answer in one short paragraph.",
+    });
+    const messageSources = [null, claim.work.messages[0].id];
+    await store.recordChatRequest({
+      turnId,
+      leaseOwner: "owner-report",
+      payload: { request: chatRequest, messageSources },
+    });
+    await store.recordChatOutcome({
+      turnId,
+      leaseOwner: "owner-report",
+      payload: {
+        request: chatRequest,
+        messageSources,
+        outcome: {
+          kind: "responded",
+          response: {
+            id: "chat-report",
+            model: "chat-model-build",
+            choices: [
+              {
+                message: { role: "assistant", content: "reported reply" },
+                finish_reason: "stop",
+              },
+            ],
+            usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+          },
+          replyContent: "reported reply",
+        },
+      },
+    });
+    const published = await store.publishReply({
+      turnId,
+      leaseOwner: "owner-report",
+      content: "reported reply",
+    });
+    assert.equal(published, "published");
+
+    const report = await store.getTurnTraceReport({ turnId });
+    assert.equal(report.turn.id, turnId);
+    assert.equal(report.turn.status, "completed");
+    assert.equal(report.turn.selectedPatternId, "concise");
+    assert.equal(report.attempts.length, 1);
+
+    const attempt = report.attempts[0];
+    assert.equal(attempt.attempt, 1);
+    assert.equal(attempt.leaseOwner, "owner-report");
+    assert.equal(attempt.outcome, "published");
+    assert.notEqual(attempt.finishedAt, null);
+    assert.notEqual(attempt.snapshotRecordedAt, null);
+
+    // The context snapshot: the turn's own message in order, fromTurn true.
+    assert.deepEqual(
+      attempt.context.map((message) => [message.position, message.role, message.content, message.fromTurn]),
+      [[0, "user", "report me", true]],
+    );
+    // The pattern snapshot: the offered configuration at attempt time.
+    assert.deepEqual(
+      attempt.patterns.map((pattern) => pattern.patternId),
+      ["concise"],
+    );
+    assert.equal(attempt.patterns[0].selectionDescription, "Short factual replies fit here.");
+    assert.equal(attempt.patterns[0].responseGuidance, "Answer in one short paragraph.");
+
+    // The decision boundary in the report: native values preserved.
+    assert.notEqual(attempt.decision, null);
+    assert.equal(attempt.decision.questionId, "response_pattern");
+    assert.equal(attempt.decision.questionType, "choice");
+    assert.equal(attempt.decision.choice, "concise");
+    assert.equal(attempt.decision.confidence, 0.9);
+    assert.deepEqual(attempt.decision.probabilities, [{ optionId: "concise", value: 0.9 }]);
+    assert.equal(attempt.decision.responseModel, "decision-model-build");
+    assert.equal(attempt.decision.usageInputTokens, 4);
+    assert.equal(attempt.decision.usageOutputTokens, 2);
+    // The selection outcome, recorded separately from the boundary.
+    assert.equal(attempt.decision.selection, "selected");
+    assert.equal(attempt.decision.rejectionReason, null);
+
+    // The chat boundary in the report: request messages with source linkage,
+    // choices, usage, and the reply.
+    assert.notEqual(attempt.chat, null);
+    assert.equal(attempt.chat.state, "responded");
+    assert.deepEqual(
+      attempt.chat.messages.map((message) => [message.role, message.sourceMessageId]),
+      [["system", null], ["user", claim.work.messages[0].id]],
+    );
+    assert.deepEqual(
+      attempt.chat.choices.map((choice) => [choice.finishReason, choice.content]),
+      [["stop", "reported reply"]],
+    );
+    assert.equal(attempt.chat.replyContent, "reported reply");
+    assert.equal(attempt.chat.responseId, "chat-report");
+    assert.deepEqual(
+      [attempt.chat.usagePromptTokens, attempt.chat.usageCompletionTokens, attempt.chat.usageTotalTokens],
+      [5, 3, 8],
+    );
+  });
+
+  it("preserves a legacy pre-tracing turn and its decision JSONB through the tracing migration", async () => {
+    // Roll the database back to its pre-tracing shape: drop the tracing
+    // tables and their migration bookkeeping row, keep the domain tables.
+    await pool.query(
+      `DROP TABLE IF EXISTS
+         trace_attempt_chat_choice, trace_attempt_chat_message, trace_attempt_chat,
+         trace_attempt_decision_probability, trace_attempt_decision,
+         trace_attempt_pattern, trace_attempt_context, trace_attempt CASCADE`,
+    );
+    await pool.query(
+      `DELETE FROM companion_schema_migration WHERE id = '0002_conversation_tracing'`,
+    );
+
+    // A legacy turn exactly as pre-tracing code wrote it.
+    const legacy = await pool.query(
+      `INSERT INTO conversation_turn
+         (id, status, attempt, selected_pattern_id, decision, completed_at)
+       VALUES (gen_random_uuid(), 'completed', 1, 'concise',
+               '{"choice":"concise","confidence":0.9,"model":"legacy-model"}', now())
+       RETURNING id`,
+    );
+    const legacyTurnId = legacy.rows[0].id;
+    await pool.query(
+      `INSERT INTO conversation_message (role, content, turn_id)
+       VALUES ('assistant', 'legacy reply', $1)`,
+      [legacyTurnId],
+    );
+
+    // The tracing migration applies cleanly over the legacy data.
+    const applied = await runMigrations(pool, conversationMigrations);
+    assert.deepEqual(applied.applied, ["0002_conversation_tracing"]);
+
+    // The legacy row is untouched: the decision JSONB is exactly as inserted,
+    // and no attempt rows were fabricated for it.
+    const turn = await pool.query(
+      "SELECT status, selected_pattern_id, decision FROM conversation_turn WHERE id = $1",
+      [legacyTurnId],
+    );
+    assert.deepEqual(turn.rows[0].decision, {
+      choice: "concise",
+      confidence: 0.9,
+      model: "legacy-model",
+    });
+    const attemptRows = await pool.query(
+      "SELECT count(*)::int AS n FROM trace_attempt WHERE turn_id = $1",
+      [legacyTurnId],
+    );
+    assert.equal(attemptRows.rows[0].n, 0);
+
+    // The report presents the legacy turn with no recorded attempts and its
+    // legacy decision JSONB, clearly kept apart from traced attempts.
+    const report = await store.getTurnTraceReport({ turnId: legacyTurnId });
+    assert.equal(report.turn.id, legacyTurnId);
+    assert.deepEqual(report.turn.decision, {
+      choice: "concise",
+      confidence: 0.9,
+      model: "legacy-model",
+    });
+    assert.equal(report.attempts.length, 0);
+  });
+
+  /**
+   * Store-wired tracing deps, exactly as main.ts composes them: every record
+   * dep writes through the real store and refuses to continue when the write
+   * reports fencing (lease lost), so a stale attempt stops processing instead
+   * of proceeding on an unrecorded boundary. These tests therefore verify the
+   * persisted trace and the stop-on-fence behavior, not merely that the
+   * processor called its dependencies.
+   */
+  const tracingDeps = (turnId, leaseOwner) => ({
+    recordSnapshot: async (snapshot) => {
+      const recorded = await store.recordAttemptSnapshot({
+        turnId,
+        leaseOwner,
+        snapshot,
+      });
+      if (!recorded) {
+        throw new TraceWriteFencedError(
+          `snapshot trace write fenced: lease for turn ${turnId} no longer held`,
+        );
+      }
+    },
+    recordDecisionRequest: async (payload) => {
+      const recorded = await store.recordDecisionRequest({
+        turnId,
+        leaseOwner,
+        trace: payload.trace,
+      });
+      if (!recorded) {
+        throw new TraceWriteFencedError(
+          `decision request trace write fenced: lease for turn ${turnId} no longer held`,
+        );
+      }
+    },
+    recordDecisionOutcome: async (payload) => {
+      const recorded = await store.recordDecisionOutcome({
+        turnId,
+        leaseOwner,
+        payload,
+      });
+      if (!recorded) {
+        throw new TraceWriteFencedError(
+          `decision outcome trace write fenced: lease for turn ${turnId} no longer held`,
+        );
+      }
+    },
+    recordDecisionSelection: async (payload) => {
+      const recorded = await store.recordDecisionSelection({
+        turnId,
+        leaseOwner,
+        selection: payload.selection,
+      });
+      if (!recorded) {
+        throw new TraceWriteFencedError(
+          `decision selection trace write fenced: lease for turn ${turnId} no longer held`,
+        );
+      }
+    },
+    recordChatRequest: async (payload) => {
+      const recorded = await store.recordChatRequest({
+        turnId,
+        leaseOwner,
+        payload,
+      });
+      if (!recorded) {
+        throw new TraceWriteFencedError(
+          `chat request trace write fenced: lease for turn ${turnId} no longer held`,
+        );
+      }
+    },
+    recordChatOutcome: async (payload) => {
+      const recorded = await store.recordChatOutcome({
+        turnId,
+        leaseOwner,
+        payload,
+      });
+      if (!recorded) {
+        throw new TraceWriteFencedError(
+          `chat outcome trace write fenced: lease for turn ${turnId} no longer held`,
+        );
+      }
+    },
+  });
+
+  it("records a decision request before the provider call and a failed outcome with the real error when the decision call throws", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'd', 'g', 0)`,
+    );
+    await store.appendUserMessage({ content: "ask for decision failure" });
+    const claim = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 60 });
+    assert.equal(claim.kind, "claimed");
+
+    let chatWasCalled = false;
+    await assert.rejects(
+      processTurnWork(claim.work, {
+        decisionModel: "decision-model",
+        chatModel: "chat-model",
+        callDecisions: async () => {
+          throw new Error("decisions endpoint unreachable");
+        },
+        callChat: async () => {
+          chatWasCalled = true;
+          throw new Error("chat must not be called after decision failure");
+        },
+        loadPatterns: () => store.getEnabledResponsePatterns(),
+        loadContext: (turnId) =>
+          store.getThreadContext({ turnId, limit: 50 }),
+        ...tracingDeps(claim.work.turn.id, "owner-a"),
+      }),
+      /decisions endpoint unreachable/,
+    );
+    assert.equal(chatWasCalled, false);
+
+    // The decision trace exists in the failed state with the real error: the
+    // request was recorded before the failing call (question and instructions
+    // are present), and no response data was invented.
+    const report = await store.getTurnTraceReport({ turnId: claim.work.turn.id });
+    assert.equal(report.attempts.length, 1);
+    const decision = report.attempts[0].decision;
+    assert.notEqual(decision, null);
+    assert.equal(decision.state, "failed");
+    assert.equal(decision.requestModel, "decision-model");
+    assert.ok(decision.instructions.length > 0);
+    assert.equal(decision.errorKind, "error");
+    assert.equal(decision.errorMessage, "decisions endpoint unreachable");
+    assert.equal(decision.errorBody, null);
+    assert.equal(decision.choice, null);
+    assert.equal(decision.responseModel, null);
+    assert.equal(decision.selection, null);
+  });
+
+  it("records an invalid decision outcome when a body arrives but fails the contract", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'd', 'g', 0)`,
+    );
+    await store.appendUserMessage({ content: "ask for decision contract failure" });
+    const claim = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 60 });
+    assert.equal(claim.kind, "claimed");
+
+    await assert.rejects(
+      processTurnWork(claim.work, {
+        decisionModel: "decision-model",
+        chatModel: "chat-model",
+        callDecisions: async () => ({ not: "a decisions envelope" }),
+        callChat: async () => {
+          throw new Error("chat must not be called after decision failure");
+        },
+        loadPatterns: () => store.getEnabledResponsePatterns(),
+        loadContext: (turnId) =>
+          store.getThreadContext({ turnId, limit: 50 }),
+        ...tracingDeps(claim.work.turn.id, "owner-a"),
+      }),
+    );
+
+    // The decision trace is invalid: the offending untyped value is not
+    // persisted (it has no relational home), but the validation error message
+    // is, and the recorded request is still there.
+    const report = await store.getTurnTraceReport({ turnId: claim.work.turn.id });
+    assert.equal(report.attempts.length, 1);
+    const decision = report.attempts[0].decision;
+    assert.notEqual(decision, null);
+    assert.equal(decision.state, "invalid");
+    assert.equal(decision.requestModel, "decision-model");
+    assert.notEqual(decision.errorMessage, null);
+    assert.equal(decision.errorBody, null);
+    assert.equal(decision.choice, null);
+    assert.equal(decision.responseModel, null);
+  });
+
+  it("records a chat invalid outcome with the contract error when the provider returns no choices", async () => {
+    await store.appendUserMessage({ content: "empty chat choices" });
+    const claim = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 60 });
+    assert.equal(claim.kind, "claimed");
+
+    await assert.rejects(
+      processTurnWork(claim.work, {
+        decisionModel: "decision-model",
+        chatModel: "chat-model",
+        callDecisions: async () => {
+          throw new Error("decision must not be called with no patterns");
+        },
+        callChat: async () => ({
+          model: "chat-model-build",
+          choices: [],
+        }),
+        loadPatterns: () => store.getEnabledResponsePatterns(),
+        loadContext: (turnId) =>
+          store.getThreadContext({ turnId, limit: 50 }),
+        ...tracingDeps(claim.work.turn.id, "owner-a"),
+      }),
+      /choices: expected at least one choice/,
+    );
+
+    // The chat contract rejects an empty choices array, so the honest trace
+    // is `invalid` with the real validation error: no response content is
+    // invented, and the report is unambiguous about what arrived.
+    const report = await store.getTurnTraceReport({ turnId: claim.work.turn.id });
+    assert.equal(report.attempts.length, 1);
+    const chat = report.attempts[0].chat;
+    assert.notEqual(chat, null);
+    assert.equal(chat.state, "invalid");
+    assert.equal(chat.errorKind, "invalid");
+    assert.ok(
+      chat.errorMessage.includes("choices: expected at least one choice"),
+      `expected the contract validation error, got: ${chat.errorMessage}`,
+    );
+    assert.equal(chat.replyContent, null);
+    assert.equal(chat.applicationRejection, null);
+    assert.deepEqual(chat.choices, []);
+  });
+
+  it("persists a responded chat outcome carrying an application rejection and renders publication only from the turn outcome", async () => {
+    await store.appendUserMessage({ content: "application rejection path" });
+    const claim = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 60 });
+    assert.equal(claim.kind, "claimed");
+
+    const chatRequest = buildChatRequest({
+      model: "chat-model",
+      history: [],
+      turnMessages: claim.work.messages,
+      guidance: null,
+    });
+    const response = {
+      id: "chat-reject-1",
+      model: "chat-model-build",
+      choices: [
+        {
+          message: { role: "assistant", content: "unusable reply" },
+          finish_reason: "stop",
+        },
+      ],
+    };
+    const recorded = await store.recordChatOutcome({
+      turnId: claim.work.turn.id,
+      leaseOwner: "owner-a",
+      payload: {
+        request: chatRequest,
+        messageSources: claim.work.messages.map((message) => message.id),
+        outcome: {
+          kind: "responded",
+          response,
+          replyContent: null,
+          applicationRejection: "chat response has no usable choices",
+        },
+      },
+    });
+    assert.equal(recorded, true);
+
+    // The row carries the application rejection separately from the transport
+    // outcome: the response arrived, and the application rejected it.
+    const report = await store.getTurnTraceReport({ turnId: claim.work.turn.id });
+    assert.equal(report.attempts.length, 1);
+    const chat = report.attempts[0].chat;
+    assert.notEqual(chat, null);
+    assert.equal(chat.state, "responded");
+    assert.equal(chat.responseModel, "chat-model-build");
+    assert.equal(chat.replyContent, null);
+    assert.equal(chat.applicationRejection, "chat response has no usable choices");
+    assert.deepEqual(
+      chat.choices.map((choice) => choice.content),
+      ["unusable reply"],
+    );
+
+    // The CLI renders the generated reply and the application rejection from
+    // the attempt boundary, and publication only from the turn's actual
+    // status: this turn is still in flight, so nothing was published.
+    const text = renderReport(report);
+    assert.ok(text.includes("status: in_flight"));
+    assert.ok(text.includes("reply published: no"));
+    assert.ok(
+      text.includes('application rejection: "chat response has no usable choices"'),
+      `expected the application rejection in the rendered report, got:\n${text}`,
+    );
+    assert.ok(
+      text.includes("generated reply: (none — response unusable or not returned)"),
+      `expected the no-generated-reply marker, got:\n${text}`,
+    );
+    assert.ok(
+      !text.includes('reply published: "unusable reply"'),
+      "the renderer must not claim publication of a reply the turn never published",
+    );
+  });
+
+  it("stops processing when the lease was lost before processing began, making no provider calls", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'd', 'g', 0)`,
+    );
+    await store.appendUserMessage({ content: "stale before any write" });
+    const first = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 60 });
+    assert.equal(first.kind, "claimed");
+
+    // Expire the lease and reclaim: the stale worker's attempt is superseded
+    // and the turn now belongs to owner-b.
+    await pool.query(
+      `UPDATE conversation_turn
+       SET lease_expires_at = now() - interval '1 second' WHERE id = $1`,
+      [first.work.turn.id],
+    );
+    const reclaim = await store.claimNextTurn({ owner: "owner-b", leaseSeconds: 60 });
+    assert.equal(reclaim.kind, "claimed");
+    assert.equal(reclaim.work.turn.attempt, 2);
+
+    let decisionsCalled = 0;
+    let chatCalled = 0;
+    await assert.rejects(
+      processTurnWork(first.work, {
+        decisionModel: "decision-model",
+        chatModel: "chat-model",
+        callDecisions: async () => {
+          decisionsCalled += 1;
+          return {
+            model: "decision-model-build",
+            answers: {
+              response_pattern: { type: "choice", choice: "concise" },
+            },
+            usage: { input_tokens: 1, output_tokens: 1 },
+          };
+        },
+        callChat: async () => {
+          chatCalled += 1;
+          throw new Error("chat must not be reached");
+        },
+        loadPatterns: () => store.getEnabledResponsePatterns(),
+        loadContext: (turnId) =>
+          store.getThreadContext({ turnId, limit: 50 }),
+        ...tracingDeps(first.work.turn.id, "owner-a"),
+      }),
+      (error) => error instanceof TraceWriteFencedError,
+    );
+    assert.equal(decisionsCalled, 0);
+    assert.equal(chatCalled, 0);
+
+    // Nothing was recorded for the stale attempt, and the turn belongs to
+    // the reclaiming worker.
+    const staleRows = await pool.query(
+      `SELECT count(*)::int AS n
+       FROM trace_attempt_decision d
+       JOIN trace_attempt a ON a.id = d.attempt_id
+       WHERE a.turn_id = $1 AND a.attempt = 1`,
+      [first.work.turn.id],
+    );
+    assert.equal(staleRows.rows[0].n, 0);
+    const turn = await pool.query(
+      "SELECT status, lease_owner, attempt FROM conversation_turn WHERE id = $1",
+      [first.work.turn.id],
+    );
+    assert.equal(turn.rows[0].status, "in_flight");
+    assert.equal(turn.rows[0].lease_owner, "owner-b");
+    assert.equal(turn.rows[0].attempt, 2);
+  });
+
+  it("stops processing when the lease is lost after the decision provider responded, before the outcome is recorded", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'd', 'g', 0)`,
+    );
+    await store.appendUserMessage({ content: "stale after decision response" });
+    const first = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 60 });
+    assert.equal(first.kind, "claimed");
+    const turnId = first.work.turn.id;
+
+    let chatCalled = 0;
+    await assert.rejects(
+      processTurnWork(first.work, {
+        decisionModel: "decision-model",
+        chatModel: "chat-model",
+        callDecisions: async () => {
+          // The lease is lost during the provider call: a reclaiming worker
+          // takes the turn before the response can be recorded.
+          await pool.query(
+            `UPDATE conversation_turn
+             SET lease_expires_at = now() - interval '1 second' WHERE id = $1`,
+            [turnId],
+          );
+          const reclaim = await store.claimNextTurn({ owner: "owner-b", leaseSeconds: 60 });
+          assert.equal(reclaim.kind, "claimed");
+          return {
+            model: "decision-model-build",
+            answers: {
+              response_pattern: { type: "choice", choice: "concise" },
+            },
+            usage: { input_tokens: 1, output_tokens: 1 },
+          };
+        },
+        callChat: async () => {
+          chatCalled += 1;
+          throw new Error("chat must not be reached after a fenced outcome write");
+        },
+        loadPatterns: () => store.getEnabledResponsePatterns(),
+        loadContext: (turnId) =>
+          store.getThreadContext({ turnId, limit: 50 }),
+        ...tracingDeps(turnId, "owner-a"),
+      }),
+      (error) => error instanceof TraceWriteFencedError,
+    );
+    assert.equal(chatCalled, 0);
+
+    // The request boundary survives (written before the call, while the
+    // lease was still held), but no outcome or selection was recorded for
+    // the stale attempt, and no chat work happened.
+    const report = await store.getTurnTraceReport({ turnId });
+    assert.equal(report.attempts.length, 2);
+    const staleAttempt = report.attempts.find((attempt) => attempt.attempt === 1);
+    assert.notEqual(staleAttempt, undefined);
+    assert.equal(staleAttempt.outcome, "superseded");
+    assert.notEqual(staleAttempt.decision, null);
+    assert.equal(staleAttempt.decision.state, "requested");
+    assert.equal(staleAttempt.decision.selection, null);
+    assert.equal(staleAttempt.chat, null);
+    const turn = await pool.query(
+      "SELECT status, lease_owner FROM conversation_turn WHERE id = $1",
+      [turnId],
+    );
+    assert.equal(turn.rows[0].status, "in_flight");
+    assert.equal(turn.rows[0].lease_owner, "owner-b");
+  });
+
+  it("stops processing when the lease is lost after the chat provider responded, before the chat outcome is recorded", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'd', 'g', 0)`,
+    );
+    await store.appendUserMessage({ content: "stale after chat response" });
+    const first = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 60 });
+    assert.equal(first.kind, "claimed");
+    const turnId = first.work.turn.id;
+
+    await assert.rejects(
+      processTurnWork(first.work, {
+        decisionModel: "decision-model",
+        chatModel: "chat-model",
+        callDecisions: async () => ({
+          model: "decision-model-build",
+          answers: {
+            response_pattern: { type: "choice", choice: "concise" },
+          },
+          usage: { input_tokens: 1, output_tokens: 1 },
+        }),
+        callChat: async () => {
+          // The lease is lost during the chat call: a reclaiming worker
+          // takes the turn before the chat outcome can be recorded.
+          await pool.query(
+            `UPDATE conversation_turn
+             SET lease_expires_at = now() - interval '1 second' WHERE id = $1`,
+            [turnId],
+          );
+          const reclaim = await store.claimNextTurn({ owner: "owner-b", leaseSeconds: 60 });
+          assert.equal(reclaim.kind, "claimed");
+          return {
+            model: "chat-model-build",
+            choices: [
+              { message: { role: "assistant", content: "stale reply" }, finish_reason: "stop" },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          };
+        },
+        loadPatterns: () => store.getEnabledResponsePatterns(),
+        loadContext: (turnId) =>
+          store.getThreadContext({ turnId, limit: 50 }),
+        ...tracingDeps(turnId, "owner-a"),
+      }),
+      (error) => error instanceof TraceWriteFencedError,
+    );
+
+    // The chat request boundary survives in `requested` state (written
+    // before the call), nothing was published, and the turn belongs to the
+    // reclaiming worker.
+    const report = await store.getTurnTraceReport({ turnId });
+    assert.equal(report.attempts.length, 2);
+    const staleAttempt = report.attempts.find((attempt) => attempt.attempt === 1);
+    assert.notEqual(staleAttempt, undefined);
+    assert.equal(staleAttempt.outcome, "superseded");
+    assert.notEqual(staleAttempt.chat, null);
+    assert.equal(staleAttempt.chat.state, "requested");
+    const replies = await pool.query(
+      `SELECT count(*)::int AS n FROM conversation_message
+       WHERE turn_id = $1 AND role = 'assistant'`,
+      [turnId],
+    );
+    assert.equal(replies.rows[0].n, 0);
+    const turn = await pool.query(
+      "SELECT status, lease_owner FROM conversation_turn WHERE id = $1",
+      [turnId],
+    );
+    assert.equal(turn.rows[0].status, "in_flight");
+    assert.equal(turn.rows[0].lease_owner, "owner-b");
+  });
+
+  it("distinguishes an absent probability distribution from a present empty one", async () => {
+    await pool.query(
+      `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+       VALUES ('concise', 'd', 'g', 0)`,
+    );
+    const cases = [
+      {
+        name: "absent",
+        answer: { type: "choice", choice: "concise" },
+        expectedPresent: false,
+        expectedRows: 0,
+      },
+      {
+        name: "present-empty",
+        answer: { type: "choice", choice: "concise", probabilities: {} },
+        expectedPresent: true,
+        expectedRows: 0,
+      },
+      {
+        name: "present-with-rows",
+        answer: {
+          type: "choice",
+          choice: "concise",
+          probabilities: { concise: 0.9, detailed: 0.1 },
+        },
+        expectedPresent: true,
+        expectedRows: 2,
+      },
+    ];
+    for (const testCase of cases) {
+      await store.appendUserMessage({ content: `probabilities ${testCase.name}` });
+      const claim = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 60 });
+      assert.equal(claim.kind, "claimed");
+      const patterns = await store.getEnabledResponsePatterns();
+      const request = buildPatternChoiceRequest({
+        model: "decision-model",
+        patterns,
+        state: { conversation: [] },
+      });
+      await store.recordDecisionRequest({
+        turnId: claim.work.turn.id,
+        leaseOwner: "owner-a",
+        trace: { questionId: DECISION_QUESTION_ID, request },
+      });
+      await store.recordDecisionOutcome({
+        turnId: claim.work.turn.id,
+        leaseOwner: "owner-a",
+        payload: {
+          trace: { questionId: DECISION_QUESTION_ID, request },
+          outcome: {
+            kind: "responded",
+            trace: {
+              questionId: DECISION_QUESTION_ID,
+              request,
+              response: {
+                model: "decision-model-build",
+                answers: { response_pattern: testCase.answer },
+                usage: { input_tokens: 1, output_tokens: 1 },
+              },
+            },
+          },
+        },
+      });
+
+      const report = await store.getTurnTraceReport({ turnId: claim.work.turn.id });
+      const decision = report.attempts[0].decision;
+      assert.notEqual(decision, null);
+      assert.equal(
+        decision.probabilitiesPresent,
+        testCase.expectedPresent,
+        `${testCase.name}: presence marker`,
+      );
+      assert.equal(
+        decision.probabilities.length,
+        testCase.expectedRows,
+        `${testCase.name}: child row count`,
+      );
+      // The empty-present case is the point of the marker: zero child rows
+      // with the marker set must not read as absence.
+      if (testCase.name === "present-empty") {
+        const rows = await pool.query(
+          `SELECT count(*)::int AS n
+           FROM trace_attempt_decision_probability p
+           JOIN trace_attempt_decision d ON d.id = p.decision_id
+           WHERE d.attempt_id = $1`,
+          [report.attempts[0].id],
+        );
+        assert.equal(rows.rows[0].n, 0);
+        assert.equal(decision.probabilitiesPresent, true);
+      }
+      // Finalize the turn: an in-flight turn blocks new claims, so the next
+      // loop iteration could not claim otherwise.
+      const failed = await store.failTurn({
+        turnId: claim.work.turn.id,
+        leaseOwner: "owner-a",
+        error: "test finalize",
+      });
+      assert.equal(failed, "failed");
+    }
+  });
+
+  it("reads the turn trace report from one read-only consistent snapshot", async () => {
+    // The report's transaction is READ ONLY, enforced by the server: a write
+    // inside it fails rather than silently mutating.
+    await assert.rejects(
+      withTransaction(
+        pool,
+        async (client) => {
+          await client.query(
+            `INSERT INTO response_pattern (id, selection_description, response_guidance, position)
+             VALUES ('w', 'd', 'g', 0)`,
+          );
+        },
+        { readOnly: true },
+      ),
+      /read-only/,
+    );
+
+    await store.appendUserMessage({ content: "snapshot consistency" });
+    const claim = await store.claimNextTurn({ owner: "owner-a", leaseSeconds: 60 });
+    assert.equal(claim.kind, "claimed");
+    const turnId = claim.work.turn.id;
+    const chatOutcome = await store.recordChatOutcome({
+      turnId,
+      leaseOwner: "owner-a",
+      payload: {
+        request: buildChatRequest({
+          model: "chat-model",
+          history: [],
+          turnMessages: claim.work.messages,
+          guidance: null,
+        }),
+        messageSources: claim.work.messages.map((message) => message.id),
+        outcome: {
+          kind: "responded",
+          response: {
+            id: "chat-snap",
+            model: "chat-model-build",
+            choices: [
+              { message: { role: "assistant", content: "snapshot reply" }, finish_reason: "stop" },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          },
+          replyContent: "snapshot reply",
+          applicationRejection: null,
+        },
+      },
+    });
+    assert.equal(chatOutcome, true);
+    const published = await store.publishReply({
+      turnId,
+      leaseOwner: "owner-a",
+      content: "snapshot reply",
+    });
+    assert.equal(published, "published");
+
+    // A concurrent, still-uncommitted mutation of both the turn and the
+    // attempt is invisible to the report: the read is one consistent
+    // snapshot, so the turn and its attempt never disagree.
+    const writer = await pool.connect();
+    try {
+      await writer.query("BEGIN");
+      await writer.query(
+        "UPDATE conversation_turn SET status = 'failed', error = 'interleaved' WHERE id = $1",
+        [turnId],
+      );
+      await writer.query(
+        "UPDATE trace_attempt SET outcome = 'failed' WHERE turn_id = $1 AND attempt = 1",
+        [turnId],
+      );
+      const before = await store.getTurnTraceReport({ turnId });
+      assert.equal(before.turn.status, "completed");
+      assert.equal(before.attempts[0].outcome, "published");
+      await writer.query("COMMIT");
+    } finally {
+      await writer.query("ROLLBACK").catch(() => {});
+      writer.release();
+    }
+    const after = await store.getTurnTraceReport({ turnId });
+    assert.equal(after.turn.status, "failed");
+    assert.equal(after.attempts[0].outcome, "failed");
+    assert.equal(after.turn.error, "interleaved");
   });
 });
