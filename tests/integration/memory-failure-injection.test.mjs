@@ -1796,7 +1796,13 @@ describe("memory durability under failure injection (PostgreSQL)", { skip: !hasD
       /injected crash before any apply/,
     );
 
-    // Every extraction attempt fails for this runtime's lifetime.
+    // Every extraction attempt fails for this runtime's lifetime. A new
+    // un-ingested turn gives the next ingest pass real work, so its
+    // extraction genuinely calls the failing LLM and records a failed
+    // fact_extraction — without pending work, ingest succeeds trivially and
+    // this test would prove nothing.
+    const failingStore = createConversationStore(pool);
+    await seedTurn(failingStore, "A fresh turn so the next extraction pass has work to fail on");
     const failingLlm = async () => {
       throw new Error("extraction is down");
     };
