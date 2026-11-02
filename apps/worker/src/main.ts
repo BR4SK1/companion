@@ -31,7 +31,32 @@ import { postJson } from "@companion/openrouter/transport";
 import { loadWorkerConfig } from "./config.ts";
 import { createApiServer } from "./api/server.ts";
 import { conversationMigrations } from "./conversation/migrations.ts";
-import { createConversationStore } from "./conversation/store.ts";
+import {
+  createConversationStore,
+  TraceWriteFencedError,
+} from "./conversation/store.ts";
+
+/**
+ * Runs one fenced trace write and refuses to continue on a lost lease. The
+ * store reports fencing by returning `false`; a stale attempt must stop
+ * processing — no further provider calls, and no selection or publication
+ * decision based on an unrecorded boundary — so the wiring edge turns that
+ * result into `TraceWriteFencedError`, which the engine handles through its
+ * existing fenced failure path (`failTurn` is itself fenced, and a fenced
+ * failure marks the attempt).
+ */
+async function recordTraced(
+  boundary: string,
+  turnId: string,
+  write: () => Promise<boolean>,
+): Promise<void> {
+  const recorded = await write();
+  if (!recorded) {
+    throw new TraceWriteFencedError(
+      `${boundary} trace write fenced: lease for turn ${turnId} no longer held`,
+    );
+  }
+}
 import { processTurnWork } from "./work/processor.ts";
 import { runEngineLoop } from "./work/engine.ts";
 
@@ -80,7 +105,7 @@ async function main(): Promise<void> {
     await runEngineLoop(
       {
         store,
-        processTurn: (work) =>
+        processTurn: (work, { leaseOwner }) =>
           processTurnWork(work, {
             decisionModel: config.openrouter.decisionModel,
             chatModel: config.openrouter.chatModel,
@@ -100,6 +125,54 @@ async function main(): Promise<void> {
                 turnId,
                 limit: config.contextMessageLimit,
               }),
+            recordSnapshot: (snapshot) =>
+              recordTraced("snapshot", work.turn.id, () =>
+                store.recordAttemptSnapshot({
+                  turnId: work.turn.id,
+                  leaseOwner,
+                  snapshot,
+                }),
+              ),
+            recordDecisionRequest: (payload) =>
+              recordTraced("decision request", work.turn.id, () =>
+                store.recordDecisionRequest({
+                  turnId: work.turn.id,
+                  leaseOwner,
+                  trace: payload.trace,
+                }),
+              ),
+            recordDecisionOutcome: (payload) =>
+              recordTraced("decision outcome", work.turn.id, () =>
+                store.recordDecisionOutcome({
+                  turnId: work.turn.id,
+                  leaseOwner,
+                  payload,
+                }),
+              ),
+            recordDecisionSelection: (payload) =>
+              recordTraced("decision selection", work.turn.id, () =>
+                store.recordDecisionSelection({
+                  turnId: work.turn.id,
+                  leaseOwner,
+                  selection: payload.selection,
+                }),
+              ),
+            recordChatRequest: (payload) =>
+              recordTraced("chat request", work.turn.id, () =>
+                store.recordChatRequest({
+                  turnId: work.turn.id,
+                  leaseOwner,
+                  payload,
+                }),
+              ),
+            recordChatOutcome: (payload) =>
+              recordTraced("chat outcome", work.turn.id, () =>
+                store.recordChatOutcome({
+                  turnId: work.turn.id,
+                  leaseOwner,
+                  payload,
+                }),
+              ),
           }),
         leaseSeconds: config.leaseSeconds,
         pollSeconds: config.pollSeconds,

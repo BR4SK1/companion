@@ -1,51 +1,68 @@
 /**
- * Per-turn processing: response-pattern decision first, then chat.
+ * Per-turn processing: response-pattern decision first, chat second.
  *
  * The processor is transport-agnostic: the caller injects the two capability
  * calls (decision and chat) and the two context loaders. This keeps the
  * orchestration testable without network or database and keeps application
  * policy (which models, which endpoints) at the composition edge.
  *
- * Context semantics: both the decision state and the chat request are built
- * from one coherent snapshot of prior work — the messages of every turn
- * claimed before this one, in conversation order (per turn: its user
- * messages, then its reply; see `getThreadContext`) — followed by this
- * turn's own grouped messages. A reply published while a later user
- * message was already waiting (that message joins the next turn under
- * finish-then-group, so its `seq` is lower than the reply's) still
- * precedes that message in the snapshot. Messages that are still
- * unassigned belong to future turns and never appear. The snapshot is
- * keyed by turn association, so it is identical across lease reclaims of
- * the same turn.
+ * Tracing boundaries (all injected, all fenced at the store):
+ * - `recordSnapshot` — the attempt's input snapshot, before the decision step.
+ * - `recordDecisionRequest` — the validated decision request (as sent),
+ *   persisted BEFORE the provider call so the exact request exists even when
+ *   the provider gives no usable response.
+ * - `recordDecisionOutcome` — the available decision outcome after the call
+ *   (the native response, or the actual transport/contract error), persisted
+ *   BEFORE the selection step so a rejected or failed selection still leaves
+ *   every response detail behind.
+ * - `recordDecisionSelection` — the selection outcome (`selected` or
+ *   `rejected`), recorded separately from the boundary.
+ * - `recordChatRequest` — the exact chat request as sent, before the provider
+ *   call.
+ * - `recordChatOutcome` — the available outcome after the call: the native
+ *   response and reply content, or the actual transport/contract error when
+ *   no usable response arrived. Never invented; absent raw data stays absent.
  *
  * Behavior on unusable results is deliberately strict for this slice: a
- * decision that does not name an offered pattern, a chat response with no
- * usable choice, or any transport/contract error propagates as a thrown
- * error so the engine records a failed turn. No silent fallback, retry, or
- * normalization is applied; retry policy remains an open decision.
+ * decision that does not name an offered pattern, or a chat response that
+ * fails the contract, propagates as a thrown error so the engine records a
+ * failed turn. No silent fallback, retry, or normalization is applied; retry
+ * policy remains an open decision.
  */
 
 import type {
+  AttemptSnapshotPayload,
+  ChatOutcomeTrace,
+  ChatOutcomeTracePayload,
+  ChatRequestTracePayload,
+  ConversationMessage,
+  DecisionOutcomeTrace,
+  DecisionOutcomeTracePayload,
+  DecisionRequestTracePayload,
+  DecisionSelectionTrace,
+  ResponsePattern,
+  TurnWork,
+} from "../conversation/types.ts";
+import {
+  buildPatternChoiceRequest,
+  DECISION_QUESTION_ID,
+  selectResponsePattern,
+} from "./decision.ts";
+import { buildChatRequest } from "./chat.ts";
+import { OpenRouterTransportError } from "@companion/openrouter/transport";
+import type {
+  ChatRequest,
+  ChatResponse,
+} from "@companion/openrouter/chat";
+import type {
   DecisionsRequest,
-  DecisionsState,
+  DecisionsResponse,
 } from "@companion/openrouter";
+import { parseChatResponse } from "@companion/openrouter/chat";
 import {
   parseDecisionsExchange,
   parseDecisionsRequest,
 } from "@companion/openrouter";
-import {
-  parseChatResponse,
-  type ChatRequest,
-} from "@companion/openrouter/chat";
-
-import type { ConversationMessage, ResponsePattern, TurnWork } from "../conversation/types.ts";
-import {
-  buildPatternChoiceRequest,
-  recordFromSelection,
-  selectResponsePattern,
-  type RecordedDecision,
-} from "./decision.ts";
-import { buildChatRequest } from "./chat.ts";
 
 export interface TurnProcessorDeps {
   readonly decisionModel: string;
@@ -54,33 +71,61 @@ export interface TurnProcessorDeps {
   readonly callDecisions: (request: DecisionsRequest) => Promise<unknown>;
   /** Perform the chat call; resolves with the raw response body. */
   readonly callChat: (request: ChatRequest) => Promise<unknown>;
-  /** Enabled response patterns at turn start (the turn's pattern snapshot). */
+  /** Enabled response patterns, in their stable presentation order. */
   readonly loadPatterns: () => Promise<readonly ResponsePattern[]>;
-  /**
-   * Prior-turn thread context for this turn, oldest first, in conversation
-   * order: the messages of the turns claimed before this one (including
-   * failed turns' user messages), excluding unassigned messages, this
-   * turn's own grouped messages, and any later turns' messages. See
-   * `getThreadContext`.
-   */
-  readonly loadContext: (
-    turnId: string,
-  ) => Promise<readonly ConversationMessage[]>;
+  /** Prior-turn context for this turn, oldest first. */
+  readonly loadContext: (turnId: string) => Promise<readonly ConversationMessage[]>;
   readonly temperature?: number;
   readonly maxTokens?: number;
+  /**
+   * Records the attempt's input snapshot (mutable patterns and the exact
+   * ordered context) before the decision step begins. Fenced and idempotent
+   * at the store.
+   */
+  readonly recordSnapshot?: (payload: AttemptSnapshotPayload) => Promise<void>;
+  /**
+   * Records the validated decision request (native typed request as sent)
+   * BEFORE the provider call, in its own fenced transaction.
+   */
+  readonly recordDecisionRequest?: (payload: {
+    readonly trace: DecisionRequestTracePayload;
+  }) => Promise<void>;
+  /**
+   * Records the available decision outcome after the call (responded with
+   * the native response, failed with the actual transport error, or invalid
+   * with the contract validation error) before the selection step.
+   */
+  readonly recordDecisionOutcome?: (payload: DecisionOutcomeTracePayload) => Promise<void>;
+  /**
+   * Records the selection outcome (`selected` with the chosen pattern, or
+   * `rejected` with the reason) separately from the boundary.
+   */
+  readonly recordDecisionSelection?: (payload: {
+    readonly selection: DecisionSelectionTrace;
+  }) => Promise<void>;
+  /**
+   * Records the exact chat request (with per-message source linkage) before
+   * the provider call.
+   */
+  readonly recordChatRequest?: (payload: ChatRequestTracePayload) => Promise<void>;
+  /**
+   * Records the available chat outcome after the call (responded, failed, or
+   * invalid) before publication.
+   */
+  readonly recordChatOutcome?: (payload: ChatOutcomeTracePayload) => Promise<void>;
 }
 
+/** The terminal result of one attempt, published by the engine. */
 export interface TurnOutcome {
   readonly reply: string;
   readonly selectedPatternId: string | null;
-  readonly decision: RecordedDecision | null;
 }
 
 /** Conversation state presented to the decision model: the visible thread so far. */
 function decisionState(
   history: readonly ConversationMessage[],
   turnMessages: readonly ConversationMessage[],
-): DecisionsState {
+): { conversation: { role: string; content: string }[] } {
   return {
     conversation: [...history, ...turnMessages].map((message) => ({
       role: message.role,
@@ -89,15 +134,76 @@ function decisionState(
   };
 }
 
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Builds the honest failure trace from a chat call error: the actual
+ * transport error kind and message when it is an OpenRouterTransportError,
+ * the truncated response body when the transport retained one, and a plain
+ * error otherwise. Absent body data stays absent — never fabricated.
+ */
+function chatFailureTrace(error: unknown): ChatOutcomeTrace {
+  if (error instanceof OpenRouterTransportError) {
+    return {
+      kind: "failed",
+      errorKind: error.kind,
+      message: error.message,
+      body: error.body ?? null,
+    };
+  }
+  return {
+    kind: "failed",
+    errorKind: "error",
+    message: errorMessage(error),
+    body: null,
+  };
+}
+
+/**
+ * Builds the honest failure trace from a decision call error: the actual
+ * transport error kind and message when it is an OpenRouterTransportError,
+ * the truncated response body when the transport retained one, and a plain
+ * error otherwise. Absent body data stays absent — never fabricated.
+ */
+function decisionFailureTrace(error: unknown): DecisionOutcomeTrace {
+  if (error instanceof OpenRouterTransportError) {
+    return {
+      kind: "failed",
+      errorKind: error.kind,
+      message: error.message,
+      body: error.body ?? null,
+    };
+  }
+  return {
+    kind: "failed",
+    errorKind: "error",
+    message: errorMessage(error),
+    body: null,
+  };
+}
+
+/** Contract-validation failure: the body arrived but did not validate. */
+function chatInvalidTrace(error: unknown): ChatOutcomeTrace {
+  return { kind: "invalid", message: errorMessage(error) };
+}
+
 export async function processTurnWork(
   work: TurnWork,
   deps: TurnProcessorDeps,
 ): Promise<TurnOutcome> {
   const history = await deps.loadContext(work.turn.id);
   const patterns = await deps.loadPatterns();
+  const fullContext = [...history, ...work.messages];
+
+  // Snapshot boundary: the exact mutable patterns and ordered context this
+  // attempt saw, recorded before the decision step begins.
+  if (deps.recordSnapshot !== undefined) {
+    await deps.recordSnapshot({ context: fullContext, patterns });
+  }
 
   let selected: ResponsePattern | undefined;
-  let recorded: RecordedDecision | null = null;
 
   if (patterns.length > 0) {
     const request = buildPatternChoiceRequest({
@@ -108,14 +214,102 @@ export async function processTurnWork(
     // Round-trip the built request through the contract parser so what is
     // sent is exactly what the contract validates.
     const validated = parseDecisionsRequest(request);
-    const rawResponse = await deps.callDecisions(validated);
-    const response = parseDecisionsExchange(validated, rawResponse);
-    const selection = selectResponsePattern(response, patterns);
+    const decisionTrace: DecisionRequestTracePayload = {
+      questionId: DECISION_QUESTION_ID,
+      request: validated,
+    };
+
+    // Decision request boundary: persisted before the provider call. This
+    // write is deliberate, not best-effort: a failure here fails the attempt
+    // rather than calling the provider with an unrecorded request.
+    if (deps.recordDecisionRequest !== undefined) {
+      await deps.recordDecisionRequest({ trace: decisionTrace });
+    }
+
+    let rawResponse: unknown;
+    try {
+      rawResponse = await deps.callDecisions(validated);
+    } catch (error) {
+      // Transport failure: record the actual error (best-effort — a trace
+      // write failure must never mask the original error) and rethrow so the
+      // engine records a failed turn.
+      if (deps.recordDecisionOutcome !== undefined) {
+        try {
+          await deps.recordDecisionOutcome({
+            trace: decisionTrace,
+            outcome: decisionFailureTrace(error),
+          });
+        } catch {
+          // best-effort; the original error propagates
+        }
+      }
+      throw error;
+    }
+
+    let response: DecisionsResponse;
+    try {
+      response = parseDecisionsExchange(validated, rawResponse);
+    } catch (error) {
+      // Contract failure: a body arrived but did not validate.
+      if (deps.recordDecisionOutcome !== undefined) {
+        try {
+          await deps.recordDecisionOutcome({
+            trace: decisionTrace,
+            outcome: { kind: "invalid", message: errorMessage(error) },
+          });
+        } catch {
+          // best-effort; the original error propagates
+        }
+      }
+      throw error;
+    }
+
+    // Decision outcome boundary: the full validated exchange, persisted
+    // BEFORE the selection step — so a rejected selection or a later chat
+    // failure still leaves the complete native response behind. This write
+    // is deliberate, not best-effort: a failure here fails the attempt rather
+    // than selecting from an unrecorded response.
+    if (deps.recordDecisionOutcome !== undefined) {
+      await deps.recordDecisionOutcome({
+        trace: decisionTrace,
+        outcome: {
+          kind: "responded",
+          trace: {
+            questionId: DECISION_QUESTION_ID,
+            request: validated,
+            response,
+          },
+        },
+      });
+    }
+
+    // Selection step, separate from the boundary. A rejection is recorded
+    // (best-effort: never masks the original error) and then rethrown, so
+    // the engine fails the attempt exactly as before.
+    let selection;
+    try {
+      selection = selectResponsePattern(response, patterns);
+    } catch (error) {
+      if (deps.recordDecisionSelection !== undefined) {
+        try {
+          await deps.recordDecisionSelection({
+            selection: { kind: "rejected", reason: errorMessage(error) },
+          });
+        } catch {
+          // best-effort; the original error propagates
+        }
+      }
+      throw error;
+    }
     selected = patterns.find((pattern) => pattern.id === selection.patternId);
     if (selected === undefined) {
       throw new Error("selected pattern disappeared between load and use");
     }
-    recorded = recordFromSelection(response, selection);
+    if (deps.recordDecisionSelection !== undefined) {
+      await deps.recordDecisionSelection({
+        selection: { kind: "selected", patternId: selected.id },
+      });
+    }
   }
 
   const chatRequest = buildChatRequest({
@@ -126,17 +320,98 @@ export async function processTurnWork(
     ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
     ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
   });
-  const rawChatResponse = await deps.callChat(chatRequest);
-  const chatResponse = parseChatResponse(rawChatResponse);
+
+  // Message sources aligned index-by-index with the chat request messages:
+  // null for the synthetic guidance system message, the conversation message
+  // id for every other message. Computed before the call: it is a pure
+  // function of the request, and it is recorded with the request.
+  const messageSources: (string | null)[] = [];
+  if (selected !== undefined) {
+    messageSources.push(null);
+  }
+  for (const message of fullContext) {
+    messageSources.push(message.id);
+  }
+
+  // Chat request boundary: persisted before the provider call.
+  if (deps.recordChatRequest !== undefined) {
+    await deps.recordChatRequest({
+      request: chatRequest,
+      messageSources,
+    });
+  }
+
+  let rawChatResponse: unknown;
+  try {
+    rawChatResponse = await deps.callChat(chatRequest);
+  } catch (error) {
+    // Transport failure: record the actual error (best-effort — a trace
+    // write failure must never mask the original error) and rethrow so the
+    // engine records a failed turn.
+    if (deps.recordChatOutcome !== undefined) {
+      try {
+        await deps.recordChatOutcome({
+          request: chatRequest,
+          messageSources,
+          outcome: chatFailureTrace(error),
+        });
+      } catch {
+        // best-effort; the original error propagates
+      }
+    }
+    throw error;
+  }
+
+  let chatResponse: ChatResponse;
+  try {
+    chatResponse = parseChatResponse(rawChatResponse);
+  } catch (error) {
+    // Contract failure: a body arrived but did not validate.
+    if (deps.recordChatOutcome !== undefined) {
+      try {
+        await deps.recordChatOutcome({
+          request: chatRequest,
+          messageSources,
+          outcome: chatInvalidTrace(error),
+        });
+      } catch {
+        // best-effort; the original error propagates
+      }
+    }
+    throw error;
+  }
   const choice = chatResponse.choices[0];
+  const reply = choice?.message.content ?? null;
+  const applicationRejection =
+    choice === undefined ? "chat response has no choices" : null;
+
+  // Chat outcome boundary: persisted before the application usability check,
+  // in its own fenced transaction. The returned response is recorded as-is
+  // (even when unusable, with the application rejection reason captured
+  // separately), so the trace is unambiguous: the response arrived, and the
+  // application rejected it or not. This write is deliberate, not
+  // best-effort: a failure here fails the attempt rather than publishing an
+  // unrecorded boundary.
+  if (deps.recordChatOutcome !== undefined) {
+    await deps.recordChatOutcome({
+      request: chatRequest,
+      messageSources,
+      outcome: {
+        kind: "responded",
+        response: chatResponse,
+        replyContent: reply,
+        applicationRejection,
+      },
+    });
+  }
+
   if (choice === undefined) {
     throw new Error("chat response has no choices");
   }
-  const reply = choice.message.content;
 
+  // `choice` is narrowed here by the throw above, so the reply is a string.
   return {
-    reply,
+    reply: choice.message.content,
     selectedPatternId: selected !== undefined ? selected.id : null,
-    decision: recorded,
   };
 }

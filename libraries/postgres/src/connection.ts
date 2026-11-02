@@ -52,10 +52,31 @@ export async function closePostgresPool(pool: PostgresPool): Promise<void> {
   await pool.end();
 }
 
+/** Options scoping a `withTransaction` transaction. */
+export interface TransactionOptions {
+  /**
+   * Open the transaction `READ ONLY`: any write inside it fails at the
+   * server. Use for consistent multi-statement reads that must never
+   * mutate — the database enforces the guarantee, not caller discipline.
+   */
+  readonly readOnly?: boolean;
+  /**
+   * Transaction isolation level. When omitted, the server default
+   * (`read committed`) applies. `repeatable read` gives every statement in
+   * the transaction one snapshot taken at first read, so multi-query reads
+   * cannot straddle concurrent commits.
+   */
+  readonly isolationLevel?: "read committed" | "repeatable read" | "serializable";
+}
+
 /**
  * Run `work` inside one transaction on one pooled client. Commits on
  * success; rolls back and rethrows on failure. The client is always
  * returned to the pool.
+ *
+ * `options.readOnly` opens the transaction `READ ONLY` (writes fail at the
+ * server); `options.isolationLevel` sets the isolation level. Both values
+ * come from fixed enumerations, never from caller-supplied text.
  *
  * This guarantees atomicity of the wrapped statements only. It does not make
  * schema migrations or external side effects rollback-safe; see the library
@@ -64,10 +85,18 @@ export async function closePostgresPool(pool: PostgresPool): Promise<void> {
 export async function withTransaction<T>(
   pool: PostgresPool,
   work: (client: pg.PoolClient) => Promise<T>,
+  options: TransactionOptions = {},
 ): Promise<T> {
   const client = await pool.connect();
   try {
-    await client.query("BEGIN");
+    const begin: string[] = ["BEGIN"];
+    if (options.isolationLevel !== undefined) {
+      begin.push(`ISOLATION LEVEL ${options.isolationLevel.toUpperCase()}`);
+    }
+    if (options.readOnly === true) {
+      begin.push("READ ONLY");
+    }
+    await client.query(begin.join(" "));
     try {
       const result = await work(client);
       await client.query("COMMIT");

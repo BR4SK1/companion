@@ -10,7 +10,7 @@ Domain owners own their types, schemas, migrations, constraints, and queries. Sh
 
 - The access runtime chosen for the first slice is `pg` (node-postgres) used directly with SQL strings; no ORM and no query builder. Drizzle with `pg` remains an open proposal for a future decision — this slice did not adopt it.
 - Migrations are supplied by the owning domain as ordered `{ id, sql }` entries and applied idempotently. The runner records applied ids in `companion_schema_migration`, serializes concurrent migrators with a session-level advisory lock, and applies each migration atomically in its own transaction together with its bookkeeping row. A failed migration aborts the run; already-applied migrations stay applied. Ids recorded but absent from the supplied list are left untouched and reported.
-- `withTransaction` guarantees atomicity of the wrapped statements only. It does not make schema migrations or external side effects rollback-safe, and no rollback/down-migration mechanism exists.
+- `withTransaction` guarantees atomicity of the wrapped statements only. It does not make schema migrations or external side effects rollback-safe, and no rollback/down-migration mechanism exists. `withTransaction` accepts optional `TransactionOptions`: `readOnly` opens the transaction `READ ONLY` (writes fail at the server), and `isolationLevel` (`read committed`, `repeatable read`, or `serializable`) sets the isolation level — both values come from fixed enumerations, never caller-supplied text. A read-only repeatable-read transaction gives multi-statement reads one consistent committed snapshot.
 
 ## Boundaries and dependencies
 

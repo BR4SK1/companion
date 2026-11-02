@@ -290,19 +290,83 @@ try {
           out.reason = "composition-not-exclusive";
           out.composition = compRows.map((entry) => ({ role: entry.role, id: entry.id }));
         } else {
-          const d1 = await client.query("DELETE FROM conversation_message WHERE turn_id = $1", [SMOKE_INPUT.turnId]);
-          const d2 = await client.query("DELETE FROM conversation_turn WHERE id = $1 AND status IN ('completed','failed')", [SMOKE_INPUT.turnId]);
-          await client.query("COMMIT");
-          settled = true;
-          out.deleted = d2.rowCount === 1;
-          out.reason = d2.rowCount === 1 ? null : "turn-delete-affected-no-rows";
-          out.deletedMessageIds = compRows.map((entry) => entry.id);
-          out.deletedMessageCount = d1.rowCount;
-          out.turn = turnShape(turnRow);
-          out.turn.latencyMs = turnRow.completed_at === null || turnRow.created_at === null
-            ? null
-            : Number(new Date(turnRow.completed_at) - new Date(turnRow.created_at));
-          out.composition = { messages: compRows.length, userMessages: users.length, exclusiveToThisRun: true };
+          // Trace rows (worker attempt tracing, migration 0002): delete ONLY
+          // this turn's own trace rows, inside this same guarded transaction,
+          // after the ownership/composition checks above. Refuse when an
+          // unrelated turn's trace rows reference this turn's messages (a
+          // later turn's context or chat snapshots legitimately cite prior
+          // history — destroying those references would corrupt the other
+          // turn's trace and is never this cleanup's authority). Legacy
+          // compatibility: a pre-tracing schema has no trace tables, so there
+          // is nothing to guard or delete and the path is skipped entirely.
+          out.trace = { present: false, refused: false, foreignReferences: 0, deletedCounts: {} };
+          let traceRefused = false;
+          const tracePresent = await scalar("(SELECT to_regclass('public.trace_attempt') IS NOT NULL)");
+          if (tracePresent === true) {
+            out.trace.present = true;
+            const messageIds = compRows.map((entry) => entry.id);
+            const foreignContext = await scalar(
+              "(SELECT count(*) FROM trace_attempt_context c JOIN trace_attempt a ON a.id = c.attempt_id"
+              + " WHERE c.message_id = ANY($1::uuid[]) AND a.turn_id <> $2)",
+              [messageIds, SMOKE_INPUT.turnId],
+            );
+            const foreignChat = await scalar(
+              "(SELECT count(*) FROM trace_attempt_chat_message m JOIN trace_attempt_chat ch ON ch.id = m.chat_id"
+              + " JOIN trace_attempt a ON a.id = ch.attempt_id"
+              + " WHERE m.source_message_id = ANY($1::uuid[]) AND a.turn_id <> $2)",
+              [messageIds, SMOKE_INPUT.turnId],
+            );
+            const foreignTotal = Number(foreignContext ?? 0) + Number(foreignChat ?? 0);
+            out.trace.foreignReferences = foreignTotal;
+            if (foreignTotal > 0) {
+              traceRefused = true;
+              out.trace.refused = true;
+              out.reason = "foreign-trace-references";
+            } else {
+              const attemptIds = "(SELECT id FROM trace_attempt WHERE turn_id = $1)";
+              const chatIds = "(SELECT ch.id FROM trace_attempt_chat ch WHERE ch.attempt_id IN " + attemptIds + ")";
+              const decisionIds = "(SELECT d.id FROM trace_attempt_decision d WHERE d.attempt_id IN " + attemptIds + ")";
+              const counts = {};
+              counts.chatChoices = (await client.query(
+                "DELETE FROM trace_attempt_chat_choice WHERE chat_id IN " + chatIds, [SMOKE_INPUT.turnId])).rowCount;
+              counts.chatMessages = (await client.query(
+                "DELETE FROM trace_attempt_chat_message WHERE chat_id IN " + chatIds, [SMOKE_INPUT.turnId])).rowCount;
+              counts.chat = (await client.query(
+                "DELETE FROM trace_attempt_chat WHERE attempt_id IN " + attemptIds, [SMOKE_INPUT.turnId])).rowCount;
+              counts.decisionProbabilities = (await client.query(
+                "DELETE FROM trace_attempt_decision_probability WHERE decision_id IN " + decisionIds, [SMOKE_INPUT.turnId])).rowCount;
+              counts.decisions = (await client.query(
+                "DELETE FROM trace_attempt_decision WHERE attempt_id IN " + attemptIds, [SMOKE_INPUT.turnId])).rowCount;
+              counts.patterns = (await client.query(
+                "DELETE FROM trace_attempt_pattern WHERE attempt_id IN " + attemptIds, [SMOKE_INPUT.turnId])).rowCount;
+              counts.contexts = (await client.query(
+                "DELETE FROM trace_attempt_context WHERE attempt_id IN " + attemptIds, [SMOKE_INPUT.turnId])).rowCount;
+              counts.attempts = (await client.query(
+                "DELETE FROM trace_attempt WHERE turn_id = $1", [SMOKE_INPUT.turnId])).rowCount;
+              out.trace.deletedCounts = counts;
+            }
+          }
+          if (traceRefused) {
+            // Refused mid-transaction: roll back so nothing — not even the
+            // trace phase — is partially deleted.
+            await client.query("ROLLBACK");
+            settled = true;
+            out.deleted = false;
+          } else {
+            const d1 = await client.query("DELETE FROM conversation_message WHERE turn_id = $1", [SMOKE_INPUT.turnId]);
+            const d2 = await client.query("DELETE FROM conversation_turn WHERE id = $1 AND status IN ('completed','failed')", [SMOKE_INPUT.turnId]);
+            await client.query("COMMIT");
+            settled = true;
+            out.deleted = d2.rowCount === 1;
+            out.reason = d2.rowCount === 1 ? null : "turn-delete-affected-no-rows";
+            out.deletedMessageIds = compRows.map((entry) => entry.id);
+            out.deletedMessageCount = d1.rowCount;
+            out.turn = turnShape(turnRow);
+            out.turn.latencyMs = turnRow.completed_at === null || turnRow.created_at === null
+              ? null
+              : Number(new Date(turnRow.completed_at) - new Date(turnRow.created_at));
+            out.composition = { messages: compRows.length, userMessages: users.length, exclusiveToThisRun: true };
+          }
         }
       }
     } finally {
