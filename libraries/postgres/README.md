@@ -14,8 +14,8 @@ Domain owners own their types, schemas, migrations, constraints, and queries. Sh
 
 ## Boundaries and dependencies
 
-No endpoint, hostname, or credential is included; connection configuration is supplied by the caller. The migration runner knows nothing about migration content. Retry, backup/recovery, and safe-rollout policies are not implemented here.
+No endpoint, hostname, or credential is included; connection configuration is supplied by the caller. The migration runner knows nothing about migration content. Retry and safe-rollout policies are not implemented here, and neither is anything that operates the external PostgreSQL service itself — backup, recovery, and hardening are that service's own operating concern, outside this library's scope.
 
 ## Open questions
 
-Backup/recovery and safe rollout policies remain undefined. Whether the migration runner should gain checksum verification, down-migrations, or a CLI remains open. Do not imply database rollback is transactional or guaranteed without a designed mechanism.
+Safe-rollout policies and migration-runner tooling (checksum verification, down-migrations, a CLI) remain open. Backup/recovery and hardening of the external PostgreSQL service belong to that service, not to this project. Do not imply database rollback is transactional or guaranteed without a designed mechanism.
