@@ -27,6 +27,13 @@ export interface WorkerConfig {
   readonly pollSeconds: number;
   readonly contextMessageLimit: number;
   /**
+   * Tolerance for a client clock running ahead of the server clock when
+   * accepting a client-reported send time as the message's effective time,
+   * in milliseconds (see `conversation/timing.ts`). `0` disables the
+   * tolerance entirely.
+   */
+  readonly clientTimeMaxAheadMs: number;
+  /**
    * Private service-to-service API bearer token. Required, never optional:
    * the HTTP API fails closed rather than serving unauthenticated traffic.
    * The web BFF holds the same value (`WEB_WORKER_TOKEN`).
@@ -57,6 +64,7 @@ const DEFAULT_CHAT_TIMEOUT_MS = 120_000;
 const DEFAULT_DECISION_TIMEOUT_MS = 30_000;
 const DEFAULT_HTTP_HOST = "0.0.0.0";
 const DEFAULT_HTTP_PORT = 8080;
+const DEFAULT_CLIENT_TIME_MAX_AHEAD_MS = 10_000;
 
 function requireString(
   env: Record<string, string | undefined>,
@@ -206,6 +214,12 @@ export function loadWorkerConfig(
       "WORKER_CONTEXT_MESSAGE_LIMIT",
       DEFAULT_CONTEXT_MESSAGE_LIMIT,
       { integer: true, positive: true },
+    ),
+    clientTimeMaxAheadMs: optionalNumber(
+      env,
+      "WORKER_CLIENT_TIME_MAX_AHEAD_MS",
+      DEFAULT_CLIENT_TIME_MAX_AHEAD_MS,
+      { integer: true, minimum: 0 },
     ),
     apiToken,
     http: {

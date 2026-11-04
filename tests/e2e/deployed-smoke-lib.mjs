@@ -15,13 +15,16 @@
  *   deletes only what is provably this run's own data and PRESERVES
  *   (retains) whenever the state is uncertain or a turn is still in flight.
  * - `buildQueuedAtomicDelete` / `buildOwnMessageDelete` / `POD_ACTION_SCRIPT_BODY`:
- *   the exact SQL the runner executes pod-side. The queued delete's
- *   `turn_id IS NULL` predicate is evaluated on the locked row, so against
- *   the worker's claim (`pg_advisory_xact_lock` → pending `SELECT … FOR
- *   UPDATE` → `UPDATE … SET turn_id WHERE turn_id IS NULL`) it is correct
- *   in both interleavings: if the claim holds the row lock, this delete
- *   blocks and re-checks after the claim commits and deletes nothing; if
- *   this delete wins, the claim never sees the row.
+ *   the exact SQL the runner executes pod-side. The queued cleanup runs in
+ *   one transaction that takes the SAME advisory lock the worker's claim
+ *   path takes (before any row lock, the same order the worker uses), so
+ *   the `turn_id IS NULL` predicate is evaluated atomically for the
+ *   engagement-assessment delete and the parent delete: against the
+ *   worker's claim (`pg_advisory_xact_lock` → pending `SELECT … FOR
+ *   UPDATE` → `UPDATE … SET turn_id WHERE turn_id IS NULL`) either the
+ *   message is still unassigned (satellite and parent deleted together) or
+ *   it was already claimed (both delete nothing) — an assessment is never
+ *   removed from a retained message.
  * - `createShutdownController`: SIGINT/SIGTERM become graceful stops — the
  *   journey aborts, the awaited cleanup still runs, and only then does the
  *   process exit (SIGKILL has no handler; the persisted ownership marker is
@@ -29,6 +32,16 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
+
+/**
+ * The worker claim path's advisory lock key, mirrored here for the
+ * pod-side cleanup: the queued-message cleanup takes the same
+ * `pg_advisory_xact_lock` the claim takes, serializing the assessment +
+ * parent delete against claims (see the delete-queued action). Drift is
+ * guarded by a regression test that compares this value against the
+ * worker store's exported `CLAIM_ADVISORY_LOCK_KEY`.
+ */
+export const SMOKE_CLAIM_ADVISORY_LOCK_KEY = 918273645511;
 
 // ---------------------------------------------------------------------------
 // Output hygiene
@@ -190,6 +203,11 @@ export function buildOwnMessageDelete(messageId, marker, turnId) {
 export const POD_ACTION_SCRIPT_BODY = `
 const client = new pg.Client({ connectionString: process.env.WORKER_DATABASE_URL });
 await client.connect();
+// The worker claim path's advisory lock key (mirrored from the worker
+// store; drift-guarded by regression tests). The queued-message cleanup
+// takes this lock before any row lock, serializing against claims exactly
+// as the worker's own transactions do.
+const CLAIM_ADVISORY_LOCK_KEY = ${JSON.stringify(SMOKE_CLAIM_ADVISORY_LOCK_KEY)};
 const out = { ok: true, action: SMOKE_INPUT.action };
 try {
   const scalar = async (sql, params = []) => {
@@ -248,19 +266,73 @@ try {
       }
     }
   } else if (SMOKE_INPUT.action === "delete-queued") {
-    // Atomic guarded delete: the turn_id IS NULL predicate is re-evaluated
-    // on the locked row, so this can never remove a claimed/claiming row.
-    const result = await client.query(
-      "DELETE FROM conversation_message WHERE id = $1 AND content = $2 AND turn_id IS NULL",
-      [SMOKE_INPUT.messageId, SMOKE_INPUT.marker],
-    );
-    out.rowCount = result.rowCount;
+    // Atomic guarded delete of this run's own still-unassigned message —
+    // and, when the engagement schema is present, of that message's own
+    // engagement assessment (a 1:1 satellite written atomically with the
+    // message at ingest; leaving it behind would dangle or block the
+    // parent delete on its foreign key).
+    //
+    // Serialized against the worker's claim path: this transaction takes
+    // the SAME advisory lock the claim path takes (before any row lock, the
+    // same order the worker uses), so no claim can interleave between the
+    // assessment delete and the parent delete. The turn_id IS NULL
+    // predicate is therefore evaluated atomically for both statements:
+    // either the message is still unassigned (assessment and parent are
+    // deleted together) or it was already claimed (both delete nothing) —
+    // an assessment is never removed from a retained message.
+    await client.query("BEGIN");
+    let settled = false;
+    try {
+      await client.query("SELECT pg_advisory_xact_lock($1)", [
+        CLAIM_ADVISORY_LOCK_KEY,
+      ]);
+      const engagementPresent = await scalar("(SELECT to_regclass('public.engagement_message_assessment') IS NOT NULL)");
+      if (engagementPresent === true) {
+        await client.query(
+          "DELETE FROM engagement_message_assessment a USING conversation_message m WHERE a.message_id = m.id AND m.id = $1 AND m.content = $2 AND m.turn_id IS NULL",
+          [SMOKE_INPUT.messageId, SMOKE_INPUT.marker],
+        );
+      }
+      const result = await client.query(
+        "DELETE FROM conversation_message WHERE id = $1 AND content = $2 AND turn_id IS NULL",
+        [SMOKE_INPUT.messageId, SMOKE_INPUT.marker],
+      );
+      await client.query("COMMIT");
+      settled = true;
+      out.rowCount = result.rowCount;
+      out.engagementDeleted = engagementPresent === true;
+    } finally {
+      if (!settled) {
+        try { await client.query("ROLLBACK"); } catch { /* connection-level failure */ }
+      }
+    }
   } else if (SMOKE_INPUT.action === "delete-own-message") {
-    const result = await client.query(
-      "DELETE FROM conversation_message WHERE id = $1 AND content = $2 AND turn_id = $3",
-      [SMOKE_INPUT.messageId, SMOKE_INPUT.marker, SMOKE_INPUT.turnId],
-    );
-    out.rowCount = result.rowCount;
+    // Same shape as delete-queued, turn-scoped: the message's own
+    // engagement assessment goes with it, under the identical guarded
+    // predicates, in one transaction.
+    await client.query("BEGIN");
+    let settled = false;
+    try {
+      const engagementPresent = await scalar("(SELECT to_regclass('public.engagement_message_assessment') IS NOT NULL)");
+      if (engagementPresent === true) {
+        await client.query(
+          "DELETE FROM engagement_message_assessment a USING conversation_message m WHERE a.message_id = m.id AND m.id = $1 AND m.content = $2 AND m.turn_id = $3",
+          [SMOKE_INPUT.messageId, SMOKE_INPUT.marker, SMOKE_INPUT.turnId],
+        );
+      }
+      const result = await client.query(
+        "DELETE FROM conversation_message WHERE id = $1 AND content = $2 AND turn_id = $3",
+        [SMOKE_INPUT.messageId, SMOKE_INPUT.marker, SMOKE_INPUT.turnId],
+      );
+      await client.query("COMMIT");
+      settled = true;
+      out.rowCount = result.rowCount;
+      out.engagementDeleted = engagementPresent === true;
+    } finally {
+      if (!settled) {
+        try { await client.query("ROLLBACK"); } catch { /* connection-level failure */ }
+      }
+    }
   } else if (SMOKE_INPUT.action === "delete-full-turn") {
     await client.query("BEGIN");
     let settled = false;
@@ -385,6 +457,24 @@ try {
               out.memory.refused = true;
               out.reason = "memory-rows-reference-turn";
             }
+          }
+          // Engagement-domain rows (migration 0006): each user message's
+          // engagement assessment is that message's own 1:1 ingest-time
+          // satellite (written atomically with it), so it is deleted with
+          // the turn's messages inside this same guarded transaction. No
+          // foreign-reference refusal is needed: an assessment references
+          // exactly its own message and never another turn's data. Legacy
+          // compatibility: a pre-engagement schema has no assessment table,
+          // so the path is skipped entirely, like the trace guard above.
+          out.engagement = { present: false, deletedCount: 0 };
+          const engagementPresent = await scalar("(SELECT to_regclass('public.engagement_message_assessment') IS NOT NULL)");
+          if (engagementPresent === true) {
+            out.engagement.present = true;
+            const d0 = await client.query(
+              "DELETE FROM engagement_message_assessment a USING conversation_message m WHERE a.message_id = m.id AND m.turn_id = $1",
+              [SMOKE_INPUT.turnId],
+            );
+            out.engagement.deletedCount = d0.rowCount;
           }
           if (traceRefused || memoryRefused) {
             // Refused mid-transaction: roll back so nothing — not even the

@@ -205,13 +205,17 @@ export async function seedHistory(turnCount) {
         row_number() OVER (ORDER BY t.created_at) AS seq_slot
       FROM turns t JOIN seed s ON s.id = t.id
     )
-    INSERT INTO conversation_message (seq, role, content, turn_id, created_at)
+    INSERT INTO conversation_message (seq, role, content, turn_id, created_at, effective_at, time_source, client_time_status, server_received_at)
     OVERRIDING SYSTEM VALUE
     SELECT
       n.seq_slot * 2 - 1,
       'user',
       'e2e-history-user-' || n.n,
       n.turn_id,
+      n.created_at,
+      n.created_at,
+      'server',
+      'absent',
       n.created_at
     FROM numbered n
     UNION ALL
@@ -220,6 +224,10 @@ export async function seedHistory(turnCount) {
       'assistant',
       'e2e-history-reply-' || n.n,
       n.turn_id,
+      n.created_at + interval '1 minute',
+      n.created_at + interval '1 minute',
+      'server',
+      'absent',
       n.created_at + interval '1 minute'
     FROM numbered n;
 

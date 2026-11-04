@@ -53,10 +53,22 @@ export type GetThreadResult =
   | { readonly ok: true; readonly snapshot: ThreadSnapshot }
   | { readonly ok: false; readonly kind: "unavailable" | "bad_request" };
 
+export interface WorkerEngagement {
+  readonly state: "engaged" | "lull" | "idle" | "gone" | null;
+  readonly lastUserMessageId: string | null;
+  readonly lastUserEffectiveAt: string | null;
+  readonly silenceMs: number | null;
+}
+
+export type GetEngagementResult =
+  | { readonly ok: true; readonly engagement: WorkerEngagement }
+  | { readonly ok: false; readonly kind: "unavailable" };
+
 export interface WorkerClient {
   readonly sendMessage: (
     text: string,
     clientKey: string,
+    clientSentAt?: number | string,
   ) => Promise<SendMessageResult>;
   /**
    * One bounded page of the thread. `before` is the exclusive seq upper
@@ -66,6 +78,12 @@ export interface WorkerClient {
     limit: number,
     before?: number,
   ) => Promise<GetThreadResult>;
+  /**
+   * Engagement-domain summary: the current band recomputed from the last
+   * user message (the last-activity anchor) and the deployment's configured
+   * cutoffs, floored by that message's own recorded assessment.
+   */
+  readonly getEngagement: () => Promise<GetEngagementResult>;
 }
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -182,11 +200,19 @@ export function createWorkerClient(deps: WorkerClientDeps): WorkerClient {
   }
 
   return {
-    sendMessage: async (text, clientKey): Promise<SendMessageResult> => {
+    sendMessage: async (
+      text,
+      clientKey,
+      clientSentAt,
+    ): Promise<SendMessageResult> => {
       const response = await request("/v1/messages", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ text, clientKey }),
+        body: JSON.stringify({
+          text,
+          clientKey,
+          ...(clientSentAt !== undefined ? { clientSentAt } : {}),
+        }),
       });
       if (response === null) {
         return { ok: false, kind: "unavailable" };
@@ -244,6 +270,61 @@ export function createWorkerClient(deps: WorkerClientDeps): WorkerClient {
         return { ok: false, kind: "unavailable" };
       }
       return { ok: true, snapshot };
+    },
+
+    getEngagement: async (): Promise<GetEngagementResult> => {
+      const response = await request("/v1/engagement", { method: "GET" });
+      if (response === null) {
+        return { ok: false, kind: "unavailable" };
+      }
+      if (response.status === 503) {
+        return { ok: false, kind: "unavailable" };
+      }
+      if (!response.ok) {
+        return { ok: false, kind: "unavailable" };
+      }
+      let parsed: unknown;
+      try {
+        parsed = await response.json();
+      } catch {
+        return { ok: false, kind: "unavailable" };
+      }
+      if (!isRecord(parsed)) {
+        return { ok: false, kind: "unavailable" };
+      }
+      const state = parsed.state;
+      const lastUserMessageId = parsed.lastUserMessageId;
+      const lastUserEffectiveAt = parsed.lastUserEffectiveAt;
+      const silenceMs = parsed.silenceMs;
+      if (
+        !(
+          (state === null ||
+            state === "engaged" ||
+            state === "lull" ||
+            state === "idle" ||
+            state === "gone") &&
+          (lastUserMessageId === null ||
+            typeof lastUserMessageId === "string") &&
+          (lastUserEffectiveAt === null ||
+            (typeof lastUserEffectiveAt === "string" &&
+              !Number.isNaN(Date.parse(lastUserEffectiveAt)))) &&
+          (silenceMs === null ||
+            (typeof silenceMs === "number" &&
+              Number.isInteger(silenceMs) &&
+              silenceMs >= 0))
+        )
+      ) {
+        return { ok: false, kind: "unavailable" };
+      }
+      return {
+        ok: true,
+        engagement: {
+          state,
+          lastUserMessageId,
+          lastUserEffectiveAt,
+          silenceMs,
+        },
+      };
     },
   };
 }

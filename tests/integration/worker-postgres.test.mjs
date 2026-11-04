@@ -24,6 +24,7 @@ import {
 } from "../../libraries/postgres/src/index.ts";
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
+import { engagementMigrations } from "../../apps/worker/src/engagement/migrations.ts";
 import {
   CLAIM_ADVISORY_LOCK_KEY,
   createConversationStore,
@@ -102,6 +103,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       "0001_conversation_work",
       "0002_conversation_tracing",
       "0004_chat_identity",
+      "0005_message_timing",
       "0003_memory_work",
     ]);
     const tables = await pool.query(
@@ -119,6 +121,89 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         "response_pattern",
       ],
     );  });
+
+  it("upgrades a populated pre-timing schema with honest provenance and no invented client time", async () => {
+    // The upgrade path a deployment that predates the timing columns takes:
+    // rebuild the exact 0001-only schema, populate legacy rows, then apply
+    // the real 0005 migration over the populated table. The full schema is
+    // restored afterwards for the remaining tests.
+    await pool.query("DROP SCHEMA public CASCADE");
+    await pool.query("CREATE SCHEMA public");
+    try {
+      const legacy = conversationMigrations.find((m) => m.id === "0001_conversation_work");
+      const timing = conversationMigrations.find((m) => m.id === "0005_message_timing");
+      assert.ok(legacy && timing);
+      await pool.query(legacy.sql);
+      const legacyCreated = new Date("2026-01-01T10:00:00.000Z");
+      await pool.query(
+        `INSERT INTO conversation_message (role, content, client_key, created_at)
+         VALUES ('user', 'legacy message', 'legacy-1', $1),
+                ('assistant', 'legacy reply', NULL, $1)`,
+        [legacyCreated],
+      );
+      await pool.query(timing.sql);
+
+      // Honest backfill from each row's own recorded history: the server
+      // receive time and effective time are the row's server insert instant
+      // (`created_at` — same clock, same statement), the status is `absent`,
+      // and NO original client time is invented.
+      const rows = await pool.query(
+        `SELECT client_sent_at, effective_at, time_source, client_time_status,
+                server_received_at, created_at
+         FROM conversation_message ORDER BY seq`,
+      );
+      assert.equal(rows.rows.length, 2);
+      for (const row of rows.rows) {
+        assert.equal(row.client_sent_at, null, "no client time may be invented");
+        assert.equal(row.time_source, "server");
+        assert.equal(row.client_time_status, "absent");
+        assert.equal(row.server_received_at.getTime(), row.created_at.getTime());
+        assert.equal(row.effective_at.getTime(), row.created_at.getTime());
+      }
+      const nulls = await pool.query(
+        `SELECT count(*)::int AS n FROM conversation_message
+         WHERE server_received_at IS NULL OR effective_at IS NULL
+            OR time_source IS NULL OR client_time_status IS NULL`,
+      );
+      assert.equal(nulls.rows[0].n, 0);
+      const nullability = await pool.query(
+        `SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'conversation_message'
+           AND column_name = 'server_received_at'`,
+      );
+      assert.equal(nullability.rows[0].is_nullable, "NO",
+        "server_received_at must be NOT NULL after the backfill");
+
+      // The store's message mapping reads upgraded history without failing
+      // (the regression this test pins: mapMessage renders the provenance
+      // fields of every row, including legacy ones).
+      const upgradedStore = createConversationStore(pool);
+      const page = await upgradedStore.getThreadPage({ limit: 10 });
+      assert.equal(page.messages.length, 2);
+      for (const message of page.messages) {
+        assert.equal(message.clientSentAt, null);
+        assert.equal(message.timeSource, "server");
+        assert.equal(message.clientTimeStatus, "absent");
+        assert.equal(message.serverReceivedAt, message.createdAt);
+        assert.equal(message.effectiveAt, message.createdAt);
+      }
+    } finally {
+      // Restore the full schema (all domains) for the remaining tests.
+      await pool.query("DROP SCHEMA public CASCADE");
+      await pool.query("CREATE SCHEMA public");
+      await runMigrations(pool, [
+        ...conversationMigrations,
+        ...memoryMigrations,
+        ...engagementMigrations,
+      ]);
+      await pool.query(
+        `INSERT INTO chat_identity (id, content, revision)
+         VALUES ('identity', 'Integration fixture identity: generic test text.', 1)
+         ON CONFLICT (id) DO UPDATE SET
+           content = EXCLUDED.content, revision = EXCLUDED.revision`,
+      );
+    }
+  });
 
   it("reads the provisioned chat identity and fails closed without one", async () => {
     const identity = await store.getChatIdentity();
@@ -426,11 +511,11 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       );
       const turnId = turn.rows[0].id;
       await pool.query(
-        `INSERT INTO conversation_message (role, content, turn_id) VALUES ('user', $1, $2)`,
+        `INSERT INTO conversation_message (role, content, turn_id, effective_at, time_source, client_time_status, server_received_at) VALUES ('user', $1, $2, now(), 'server', 'absent', now())`,
         [`u${String(index)}`, turnId],
       );
       await pool.query(
-        `INSERT INTO conversation_message (role, content, turn_id) VALUES ('assistant', $1, $2)`,
+        `INSERT INTO conversation_message (role, content, turn_id, effective_at, time_source, client_time_status, server_received_at) VALUES ('assistant', $1, $2, now(), 'server', 'absent', now())`,
         [`r${String(index)}`, turnId],
       );
     }
@@ -555,7 +640,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         CLAIM_ADVISORY_LOCK_KEY,
       ]);
       await holder.query(
-        "INSERT INTO conversation_message (role, content, client_key) VALUES ('user', 'slow', 'key-slow')",
+        "INSERT INTO conversation_message (role, content, client_key, effective_at, time_source, client_time_status, server_received_at) VALUES ('user', 'slow', 'key-slow', now(), 'server', 'absent', now())",
       );
 
       const ingestPromise = store
@@ -2218,8 +2303,10 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     );
     const legacyTurnId = legacy.rows[0].id;
     await pool.query(
-      `INSERT INTO conversation_message (role, content, turn_id)
-       VALUES ('assistant', 'legacy reply', $1)`,
+      `INSERT INTO conversation_message
+         (role, content, turn_id, effective_at, time_source,
+          client_time_status, server_received_at)
+       VALUES ('assistant', 'legacy reply', $1, now(), 'server', 'absent', now())`,
       [legacyTurnId],
     );
 

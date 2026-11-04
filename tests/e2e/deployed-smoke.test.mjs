@@ -42,8 +42,11 @@ import assert from "node:assert/strict";
 
 import { config } from "./helpers/config.mjs";
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
+import { engagementMigrations } from "../../apps/worker/src/engagement/migrations.ts";
+import { CLAIM_ADVISORY_LOCK_KEY } from "../../apps/worker/src/conversation/store.ts";
 import {
   POD_ACTION_SCRIPT_BODY,
+  SMOKE_CLAIM_ADVISORY_LOCK_KEY,
   buildMarker,
   buildOwnMessageDelete,
   buildPodActionScript,
@@ -74,7 +77,8 @@ function sleep(ms) {
 
 /** The deployed schema, applied from the real migration set (no drift). */
 async function applyMigrations(client, migrationIds = conversationMigrations.map((migration) => migration.id)) {
-  const selected = conversationMigrations.filter((migration) => migrationIds.includes(migration.id));
+  const all = [...conversationMigrations, ...engagementMigrations];
+  const selected = all.filter((migration) => migrationIds.includes(migration.id));
   for (const migration of selected) {
     await client.query(migration.sql);
   }
@@ -228,12 +232,57 @@ async function withDisposablePostgres(t, use, { migrationIds } = {}) {
   }
 }
 
-async function seedQueuedMessage(client, marker) {
+/**
+ * Whether `conversation_message` carries the 0005_message_timing columns.
+ * The seed helpers target both the full deployed schema and the legacy
+ * (pre-timing) schema used by the legacy-compatibility tests, so they
+ * detect the shape instead of assuming it.
+ */
+async function hasMessageTimingColumns(client) {
+  const present = await client.query(
+    "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='conversation_message' AND column_name='server_received_at') AS ok",
+  );
+  return present.rows[0].ok === true;
+}
+
+/** Insert one conversation message in whatever schema shape is present. */
+async function insertConversationMessage(client, { role, content, clientKey = null, turnId = null }) {
+  if (await hasMessageTimingColumns(client)) {
+    const result = await client.query(
+      "INSERT INTO conversation_message (role, content, client_key, turn_id, effective_at, time_source, client_time_status, server_received_at) VALUES ($1, $2, $3, $4, now(), 'server', 'absent', now()) RETURNING id",
+      [role, content, clientKey, turnId],
+    );
+    return result.rows[0].id;
+  }
   const result = await client.query(
-    "INSERT INTO conversation_message (role, content, client_key) VALUES ('user', $1, $2) RETURNING id",
-    [marker, randomUUID()],
+    "INSERT INTO conversation_message (role, content, client_key, turn_id) VALUES ($1, $2, $3, $4) RETURNING id",
+    [role, content, clientKey, turnId],
   );
   return result.rows[0].id;
+}
+
+async function seedQueuedMessage(client, marker) {
+  return insertConversationMessage(client, { role: "user", content: marker, clientKey: randomUUID() });
+}
+
+/** Band cutoffs used only as local test fixtures (never deployment policy). */
+const TEST_LULL_MS = 180_000;
+const TEST_IDLE_MS = 420_000;
+const TEST_GONE_MS = 1_800_000;
+
+/**
+ * Seed one engagement assessment row for a message, the way the worker's
+ * ingest hook writes it on an engagement-enabled installation (migration
+ * 0006): the message's own 1:1 satellite row.
+ */
+async function seedAssessment(client, messageId, state = "engaged") {
+  await client.query(
+    `INSERT INTO engagement_message_assessment
+       (message_id, state, previous_state, silence_ms, retained_lull,
+        message_effective_at, lull_ms, idle_ms, gone_ms)
+     VALUES ($1, $2, $3, $4, $5, now(), $6, $7, $8)`,
+    [messageId, state, state === "engaged" ? null : "engaged", 0, state === "lull", TEST_LULL_MS, TEST_IDLE_MS, TEST_GONE_MS],
+  );
 }
 
 async function seedCompletedTurn(client, marker, replyNote = "synthetic") {
@@ -242,15 +291,18 @@ async function seedCompletedTurn(client, marker, replyNote = "synthetic") {
     "INSERT INTO conversation_turn (id, status, lease_owner, lease_expires_at, completed_at) VALUES ($1, 'completed', 'test-worker', now() + interval '30 seconds', now())",
     [turnId],
   );
-  const user = await client.query(
-    "INSERT INTO conversation_message (role, content, client_key, turn_id) VALUES ('user', $1, $2, $3) RETURNING id",
-    [marker, randomUUID(), turnId],
-  );
-  const reply = await client.query(
-    "INSERT INTO conversation_message (role, content, turn_id) VALUES ('assistant', $1, $2) RETURNING id",
-    [`fake reply for ${marker.slice(-6)} (${replyNote})`, turnId],
-  );
-  return { turnId, userId: user.rows[0].id, replyId: reply.rows[0].id };
+  const userId = await insertConversationMessage(client, {
+    role: "user",
+    content: marker,
+    clientKey: randomUUID(),
+    turnId,
+  });
+  const replyId = await insertConversationMessage(client, {
+    role: "assistant",
+    content: `fake reply for ${marker.slice(-6)} (${replyNote})`,
+    turnId,
+  });
+  return { turnId, userId, replyId };
 }
 
 /**
@@ -702,7 +754,9 @@ test("buildMarker is unique, prefixed, and never contains characters needing SQL
 // 5. The delete-vs-claim race (disposable PostgreSQL, real claim semantics)
 // ---------------------------------------------------------------------------
 
-const CLAIM_ADVISORY_LOCK_KEY = 918273645511;
+// The claim path's advisory lock key is imported from the worker store
+// itself (no duplicated literal here); the smoke lib mirrors it for the
+// pod-side cleanup, and the drift is guarded by an explicit assertion.
 
 /**
  * The worker's claim, faithfully modeled from
@@ -743,6 +797,29 @@ async function claimOnce(client, { holdLockMs = 0, onLocked = () => {}, rollback
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     throw error;
+  }
+}
+
+/**
+ * Resolve once a not-granted advisory lock is observable in pg_locks —
+ * i.e. some transaction is waiting on the advisory lock another (the
+ * claim) holds. Used to make claim-vs-cleanup interleavings deterministic:
+ * after this resolves, the waiting party is provably queued behind the
+ * holder, so the holder's commit happens before the waiter proceeds.
+ */
+async function waitForBlockedAdvisoryLock(client, { timeoutMs = 15_000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const waiting = await client.query(
+      "SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted",
+    );
+    if (waiting.rows[0].n > 0) {
+      return;
+    }
+    if (Date.now() > deadline) {
+      throw new Error("no blocked advisory lock appeared before the timeout");
+    }
+    await sleep(50);
   }
 }
 
@@ -862,7 +939,7 @@ test("full-turn deletion transaction: re-verification rolls back on a compositio
     const seeded = await seedCompletedTurn(db, marker);
     // Simulate a shared turn: another user's message joined before deletion.
     await db.query(
-      "INSERT INTO conversation_message (role, content, client_key, turn_id) VALUES ('user', 'another user message (synthetic)', $1, $2)",
+      "INSERT INTO conversation_message (role, content, client_key, turn_id, effective_at, time_source, client_time_status, server_received_at) VALUES ('user', 'another user message (synthetic)', $1, $2, now(), 'server', 'absent', now())",
       [randomUUID(), seeded.turnId],
     );
     // The pod-side full-turn action, extracted from the generated script.
@@ -972,6 +1049,238 @@ test("full-turn deletion transaction: unrelated turns' messages and trace rows a
     const otherTurn = await db.query("SELECT count(*)::int AS n FROM conversation_turn WHERE id = $1", [other.turnId]);
     assert.equal(otherTurn.rows[0].n, 1);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Engagement-enabled installations (migration 0006): every guarded cleanup
+// path must remove the smoke's own engagement assessment rows — the 1:1
+// satellites its messages carry at ingest — without refusing or failing on
+// their foreign keys, and without ever touching another row's assessment.
+// ---------------------------------------------------------------------------
+
+const FULL_ENGAGEMENT_SCHEMA_IDS = [
+  ...conversationMigrations.map((migration) => migration.id),
+  ...engagementMigrations.map((migration) => migration.id),
+];
+
+test("queued-message cleanup removes the message's own engagement assessment", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const messageId = await seedQueuedMessage(db, marker);
+    await seedAssessment(db, messageId, "lull");
+
+    const payload = { action: "delete-queued", messageId, marker };
+    const result = await runPodScript(databaseUrl, buildPodActionScript(payload));
+    assert.equal(result.ok, true, `the pod action must succeed: ${result.error ?? ""}`);
+    assert.equal(result.rowCount, 1);
+    assert.equal(result.engagementDeleted, true, "the engagement satellite delete must run on the enabled schema");
+    const assessments = await db.query(
+      "SELECT count(*)::int AS n FROM engagement_message_assessment WHERE message_id = $1",
+      [messageId],
+    );
+    assert.equal(assessments.rows[0].n, 0, "the message's own assessment must be deleted with it");
+    const messages = await db.query(
+      "SELECT count(*)::int AS n FROM conversation_message WHERE id = $1",
+      [messageId],
+    );
+    assert.equal(messages.rows[0].n, 0);
+  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+});
+
+test("queued-message cleanup never touches a claimed message or its assessment", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const messageId = await seedQueuedMessage(db, marker);
+    await seedAssessment(db, messageId);
+    const turnId = randomUUID();
+    await db.query(
+      "INSERT INTO conversation_turn (id, status, lease_owner, lease_expires_at) VALUES ($1, 'in_flight', 'test-worker', now() + interval '30 seconds')",
+      [turnId],
+    );
+    await db.query("UPDATE conversation_message SET turn_id = $2 WHERE id = $1", [messageId, turnId]);
+
+    const payload = { action: "delete-queued", messageId, marker };
+    const result = await runPodScript(databaseUrl, buildPodActionScript(payload));
+    assert.equal(result.ok, true);
+    assert.equal(result.rowCount, 0, "a claimed row must be preserved");
+    const assessments = await db.query(
+      "SELECT count(*)::int AS n FROM engagement_message_assessment WHERE message_id = $1",
+      [messageId],
+    );
+    assert.equal(assessments.rows[0].n, 1, "a claimed message's assessment must be preserved with it");
+  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+});
+
+test("own-message cleanup removes that message's own engagement assessment", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    await seedAssessment(db, seeded.userId);
+
+    const payload = {
+      action: "delete-own-message",
+      messageId: seeded.userId,
+      marker,
+      turnId: seeded.turnId,
+    };
+    const result = await runPodScript(databaseUrl, buildPodActionScript(payload));
+    assert.equal(result.ok, true, `the pod action must succeed: ${result.error ?? ""}`);
+    assert.equal(result.rowCount, 1);
+    assert.equal(result.engagementDeleted, true);
+    const assessments = await db.query(
+      "SELECT count(*)::int AS n FROM engagement_message_assessment WHERE message_id = $1",
+      [seeded.userId],
+    );
+    assert.equal(assessments.rows[0].n, 0);
+    // The turn and its assistant reply (which carries no assessment) remain.
+    const reply = await db.query(
+      "SELECT count(*)::int AS n FROM conversation_message WHERE id = $1",
+      [seeded.replyId],
+    );
+    assert.equal(reply.rows[0].n, 1);
+  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+});
+
+test("full-turn cleanup removes the turn's engagement assessments exactly", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    await seedAssessment(db, seeded.userId);
+    const other = await seedCompletedTurn(db, buildMarker());
+    await seedAssessment(db, other.userId);
+
+    const payload = { action: "delete-full-turn", turnId: seeded.turnId, messageId: seeded.userId, marker };
+    const result = await runPodScript(databaseUrl, buildPodActionScript(payload));
+    assert.equal(result.deleted, true);
+    assert.equal(result.engagement.present, true, "the engagement phase must run on the enabled schema");
+    assert.equal(result.engagement.deletedCount, 1, "exactly the turn's own user-message assessment is deleted");
+    const ownRemaining = await db.query(
+      "SELECT count(*)::int AS n FROM engagement_message_assessment WHERE message_id = $1",
+      [seeded.userId],
+    );
+    assert.equal(ownRemaining.rows[0].n, 0);
+    // The unrelated turn's assessment is untouched.
+    const otherRemaining = await db.query(
+      "SELECT count(*)::int AS n FROM engagement_message_assessment WHERE message_id = $1",
+      [other.userId],
+    );
+    assert.equal(otherRemaining.rows[0].n, 1, "another turn's assessment must be preserved");
+  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+});
+
+test("cleanup paths skip the engagement phase entirely on a pre-engagement schema", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const messageId = await seedQueuedMessage(db, marker);
+    const payload = { action: "delete-queued", messageId, marker };
+    const result = await runPodScript(databaseUrl, buildPodActionScript(payload));
+    assert.equal(result.ok, true);
+    assert.equal(result.rowCount, 1);
+    assert.equal(result.engagementDeleted, false, "no engagement tables: the phase must be skipped, not fail");
+  }, { migrationIds: ["0001_conversation_work"] });
+});
+
+test("the smoke lib's claim lock key matches the worker's claim advisory lock", () => {
+  // The pod-side cleanup serializes against the worker's claim path by
+  // taking the same advisory lock; a drifted key would silently remove
+  // that serialization.
+  assert.equal(SMOKE_CLAIM_ADVISORY_LOCK_KEY, CLAIM_ADVISORY_LOCK_KEY);
+  assert.ok(POD_ACTION_SCRIPT_BODY.includes(String(SMOKE_CLAIM_ADVISORY_LOCK_KEY)));
+});
+
+test("interleaving: a claim holding the lock first preserves the message AND its assessment", async (t) => {
+  // Deterministic interleaving — claim first. The claim transaction holds
+  // the shared advisory lock; the cleanup's transaction blocks on that
+  // lock, so the claim commits fully before the cleanup's guarded
+  // predicates are evaluated. Both must then delete nothing.
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const messageId = await seedQueuedMessage(db, marker);
+    await seedAssessment(db, messageId);
+
+    const claimer = new pg.Client({ connectionString: databaseUrl });
+    await claimer.connect();
+    try {
+      let locked;
+      const lockedPromise = new Promise((resolve) => { locked = resolve; });
+      const claimPromise = claimOnce(claimer, {
+        holdLockMs: 2_000,
+        onLocked: (rows) => {
+          assert.equal(rows.length, 1, "the claim must see the queued message");
+          locked();
+        },
+      });
+      await lockedPromise;
+
+      // The cleanup runs while the claim transaction holds the advisory
+      // lock: the pod script blocks, then re-evaluates its guarded
+      // predicates after the claim commits. Wait until the script's
+      // waiting advisory-lock request is OBSERVED in pg_locks, so the
+      // interleaving is deterministic rather than timing-dependent (the
+      // claim holds the only granted advisory lock, so any not-granted
+      // advisory lock is the script's). If the claim commits before the
+      // script's lock request arrives (a very slow subprocess spawn), the
+      // race below falls through to the claim and the invariant assertions
+      // below still hold — the interleaving then degenerates to sequential.
+      const payload = { action: "delete-queued", messageId, marker };
+      const scriptPromise = runPodScript(databaseUrl, buildPodActionScript(payload));
+      await Promise.race([waitForBlockedAdvisoryLock(db, { timeoutMs: 15_000 }), claimPromise]);
+      const claim = await claimPromise;
+      assert.equal(claim.claimed.length, 1, "the claim must commit intact");
+      const result = await scriptPromise;
+      assert.equal(result.ok, true);
+      assert.equal(result.rowCount, 0, "the locked cleanup must not remove a claimed row");
+      const row = (await db.query(
+        "SELECT turn_id FROM conversation_message WHERE id = $1",
+        [messageId],
+      )).rows[0];
+      assert.ok(row, "the message must survive");
+      assert.equal(row.turn_id, claim.turnId, "the claim must be intact");
+      const assessments = await db.query(
+        "SELECT count(*)::int AS n FROM engagement_message_assessment WHERE message_id = $1",
+        [messageId],
+      );
+      assert.equal(
+        assessments.rows[0].n,
+        1,
+        "an assessment must never be removed from a retained message",
+      );
+    } finally {
+      await claimer.end().catch(() => {});
+    }
+  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+});
+
+test("interleaving: the locked cleanup wins and the claim never sees the row", async (t) => {
+  // Deterministic interleaving — cleanup first. The cleanup's transaction
+  // takes the advisory lock, deletes the satellite and the parent
+  // together, and commits; a claim that starts afterwards finds nothing.
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const messageId = await seedQueuedMessage(db, marker);
+    await seedAssessment(db, messageId);
+
+    const payload = { action: "delete-queued", messageId, marker };
+    const result = await runPodScript(databaseUrl, buildPodActionScript(payload));
+    assert.equal(result.ok, true);
+    assert.equal(result.rowCount, 1);
+    assert.equal(result.engagementDeleted, true);
+    const assessments = await db.query(
+      "SELECT count(*)::int AS n FROM engagement_message_assessment",
+    );
+    assert.equal(assessments.rows[0].n, 0, "the satellite must go with its message");
+
+    const claimer = new pg.Client({ connectionString: databaseUrl });
+    await claimer.connect();
+    try {
+      const claim = await claimOnce(claimer);
+      assert.equal(claim.claimed.length, 0, "the claim must not see the deleted row");
+      const turns = await db.query("SELECT count(*)::int AS n FROM conversation_turn");
+      assert.equal(turns.rows[0].n, 0, "no turn may be created for a deleted message");
+    } finally {
+      await claimer.end().catch(() => {});
+    }
+  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
 });
 
 test("full-turn deletion transaction: a foreign trace reference refuses and rolls back everything", async (t) => {
@@ -1254,7 +1563,7 @@ test("runner --recover: a shared turn retains the shared data and reports the re
     const marker = buildMarker();
     const seeded = await seedCompletedTurn(db, marker);
     await db.query(
-      "INSERT INTO conversation_message (role, content, client_key, turn_id) VALUES ('user', 'another user message (synthetic)', $1, $2)",
+      "INSERT INTO conversation_message (role, content, client_key, turn_id, effective_at, time_source, client_time_status, server_received_at) VALUES ('user', 'another user message (synthetic)', $1, $2, now(), 'server', 'absent', now())",
       [randomUUID(), seeded.turnId],
     );
     const gatePort = await freeTcpPort();

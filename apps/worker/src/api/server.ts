@@ -50,6 +50,7 @@ import {
   type ConversationStore,
 } from "../conversation/store.ts";
 import type { CanonicalRecallResponse } from "../memory/types.ts";
+import type { EngagementSummary } from "../engagement/types.ts";
 import { CanonicalRecallValidationError } from "../memory/recall.ts";
 
 /** Maximum accepted JSON request body size, in bytes. */
@@ -94,6 +95,14 @@ export interface ApiServerDeps {
     readonly query: string;
     readonly limit?: number;
   }) => Promise<CanonicalRecallResponse>;
+  /**
+   * Engagement-domain summary read (the domain's own shared read surface).
+   * Recomputed per call from the last user message's effective time and the
+   * configured bands. The route reports the current band, the anchor
+   * message, and the configured boundaries — configuration content stays
+   * server-side by design; the response carries the values in force.
+   */
+  readonly engagement?: () => Promise<EngagementSummary>;
 }
 
 export interface ApiServer {
@@ -185,6 +194,41 @@ function readBody(
 interface ParsedSendBody {
   readonly text: string;
   readonly clientKey: string;
+  /** Raw client-reported send time; shape-validated only. */
+  readonly clientSentAt?: number | string;
+}
+
+/** Sanity bound for an epoch-ms client send time (year 2100). */
+const MAX_CLIENT_EPOCH_MS = 4_102_444_800_000;
+
+/**
+ * Client send time: an epoch-ms number (safe integer, sane range) or a
+ * non-empty bounded string (typically ISO 8601). Shape validation only —
+ * semantic classification (skew, ordering, provenance) belongs to the
+ * conversation domain's ingest timing and is recorded on the message.
+ */
+function parseClientSentAt(value: unknown): number | string | undefined | false {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value === "number") {
+    if (
+      !Number.isSafeInteger(value) ||
+      value < 0 ||
+      value > MAX_CLIENT_EPOCH_MS
+    ) {
+      return false;
+    }
+    return value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length === 0 || trimmed.length > 64) {
+      return false;
+    }
+    return trimmed;
+  }
+  return false;
 }
 
 function parseSendBody(raw: string): ParsedSendBody | undefined {
@@ -209,7 +253,15 @@ function parseSendBody(raw: string): ParsedSendBody | undefined {
   if (!CLIENT_KEY_PATTERN.test(clientKey)) {
     return undefined;
   }
-  return { text, clientKey };
+  const clientSentAt = parseClientSentAt(record.clientSentAt);
+  if (clientSentAt === false) {
+    return undefined;
+  }
+  return {
+    text,
+    clientKey,
+    ...(clientSentAt !== undefined ? { clientSentAt } : {}),
+  };
 }
 
 /**
@@ -317,7 +369,8 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
     if (
       url.pathname !== "/v1/messages" &&
       url.pathname !== "/v1/thread" &&
-      url.pathname !== "/v1/memory/recall"
+      url.pathname !== "/v1/memory/recall" &&
+      url.pathname !== "/v1/engagement"
     ) {
       writeGenericError(response, 404, "not_found");
       request.resume();
@@ -340,6 +393,11 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
     }
     if (url.pathname === "/v1/memory/recall" && request.method !== "POST") {
       writeJson(response, 405, { error: "method_not_allowed" }, { allow: "POST" });
+      request.resume();
+      return;
+    }
+    if (url.pathname === "/v1/engagement" && request.method !== "GET") {
+      writeJson(response, 405, { error: "method_not_allowed" }, { allow: "GET" });
       request.resume();
       return;
     }
@@ -374,6 +432,9 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
         const message = await deps.store.appendUserMessage({
           content: parsed.text,
           clientKey: parsed.clientKey,
+          ...(parsed.clientSentAt !== undefined
+            ? { clientSentAt: parsed.clientSentAt }
+            : {}),
         });
         writeJson(response, 200, { message });
       } catch (error) {
@@ -410,6 +471,21 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
           hasMore: page.hasMore,
         },
       });
+      return;
+    }
+
+    if (route === "GET /v1/engagement") {
+      if (deps.engagement === undefined) {
+        writeGenericError(response, 503, "unavailable");
+        return;
+      }
+      try {
+        const summary = await deps.engagement();
+        writeJson(response, 200, { ...summary });
+      } catch (error) {
+        log(`engagement read failed: ${error instanceof Error ? error.message : String(error)}`);
+        writeGenericError(response, 500, "internal_error");
+      }
       return;
     }
 

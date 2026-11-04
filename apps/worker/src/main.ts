@@ -35,6 +35,9 @@ import {
   createConversationStore,
   TraceWriteFencedError,
 } from "./conversation/store.ts";
+import { engagementMigrations } from "./engagement/migrations.ts";
+import { loadEngagementBands } from "./engagement/bands.ts";
+import { createEngagementStore } from "./engagement/store.ts";
 import { memoryMigrations } from "./memory/migrations.ts";
 import { loadMemoryConfig } from "./memory/config.ts";
 import { createMemoryLlmCaller } from "./memory/llm.ts";
@@ -99,6 +102,7 @@ async function main(): Promise<void> {
     const migrations = await runMigrations(pool, [
       ...conversationMigrations,
       ...memoryMigrations,
+      ...engagementMigrations,
     ]);
     if (migrations.applied.length > 0) {
       console.log(`applied migrations: ${migrations.applied.join(", ")}`);
@@ -111,7 +115,33 @@ async function main(): Promise<void> {
 
     const memoryConfig = loadMemoryConfig(process.env);
 
-    const store = createConversationStore(pool);
+    // Engagement domain. A worker-owned peer to memory: per-message
+    // assessments written inside the ingest transaction, and an effective
+    // state recomputed on read from the engagement anchor. The band
+    // boundaries are locally provisioned runtime configuration
+    // (`engagement_bands`), never code or repository content. An
+    // unprovisioned deployment runs engagement as a safe no-op (provision
+    // the row and restart to enable); no timers and no proactive behavior
+    // exist anywhere in the domain.
+    const engagementBands = await loadEngagementBands(pool);
+    const engagementStore = engagementBands === null
+      ? undefined
+      : createEngagementStore({ pool, bands: engagementBands });
+    if (engagementStore === undefined) {
+      console.warn(
+        "[ENGAGEMENT] band configuration not provisioned (engagement_bands is empty); engagement stays disabled as a no-op until the row is provisioned and the worker restarts",
+      );
+    }
+
+    const store = createConversationStore(pool, {
+      clientTimeMaxAheadMs: config.clientTimeMaxAheadMs,
+      ...(engagementStore !== undefined
+        ? {
+            onUserMessageInserted: (tx, inserted) =>
+              engagementStore.onUserMessageInserted(tx, inserted),
+          }
+        : {}),
+    });
 
     // Memory domain. Disabled memory changes nothing about the chat path:
     // no configuration load (fail-closed tables stay unprovisioned), no
@@ -284,6 +314,12 @@ async function main(): Promise<void> {
       host: config.http.host,
       port: config.http.port,
       log: (message) => console.log(message),
+      // Engagement summary: recomputed on each read from the engagement
+      // anchor's effective time and the provisioned bands. Wired only when
+      // engagement is provisioned; the route reports 503 otherwise.
+      ...(engagementStore !== undefined
+        ? { engagement: () => engagementStore.getSummary(new Date()) }
+        : {}),
       ...(provisionedMemoryConfiguration !== undefined
         ? {
             // General recall surface: canonical recall by arbitrary query,

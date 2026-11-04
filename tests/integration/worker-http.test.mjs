@@ -216,12 +216,26 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
       ["user:first", "user:second", "assistant:a reply"],
       "the page is ordered by persisted seq, so the later-arriving message precedes the reply published after it",
     );
-    // The worker HTTP surface exposes the durable domain shape; the BFF is
-    // the layer that reduces it to the client-facing fields.
+    // The worker HTTP surface exposes the durable domain shape (including
+    // the ingest-timing provenance fields); the BFF is the layer that
+    // reduces it to the client-facing fields.
     for (const message of body.messages) {
       assert.deepEqual(
         Object.keys(message).sort(),
-        ["clientKey", "content", "createdAt", "id", "role", "seq", "turnId"],
+        [
+          "clientKey",
+          "clientSentAt",
+          "clientTimeStatus",
+          "content",
+          "createdAt",
+          "effectiveAt",
+          "id",
+          "role",
+          "seq",
+          "serverReceivedAt",
+          "timeSource",
+          "turnId",
+        ],
       );
     }
     assert.deepEqual(body.page, { oldestSeq: 1, hasMore: false });
@@ -274,7 +288,7 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
     try {
       await client.query("BEGIN");
       await client.query(
-        "INSERT INTO conversation_message (role, content) VALUES ('assistant', 'slow reply')",
+        "INSERT INTO conversation_message (role, content, effective_at, time_source, client_time_status, server_received_at) VALUES ('assistant', 'slow reply', now(), 'server', 'absent', now())",
       );
 
       const inFlight = await getThread();
@@ -310,7 +324,7 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
     try {
       await client.query("BEGIN");
       await client.query(
-        "INSERT INTO conversation_message (role, content) VALUES ('assistant', 'doomed reply')",
+        "INSERT INTO conversation_message (role, content, effective_at, time_source, client_time_status, server_received_at) VALUES ('assistant', 'doomed reply', now(), 'server', 'absent', now())",
       );
       await client.query("ROLLBACK");
     } finally {
