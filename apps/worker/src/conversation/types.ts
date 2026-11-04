@@ -69,6 +69,38 @@ export interface ConversationMessage {
   /** Caller-supplied idempotency key; null for messages ingested without one. */
   readonly clientKey: string | null;
   readonly createdAt: string;
+  /**
+   * The client-reported send time as received, when the caller supplied one
+   * and it was representable as a timestamp; null when absent or unparseable.
+   * Preserved raw for provenance regardless of whether it was trusted.
+   */
+  readonly clientSentAt: string | null;
+  /**
+   * The trusted working time chosen at ingest: the original client time when
+   * it was valid and consistent with the thread's user-message order, the
+   * server receive time otherwise. Best effort — see `timeSource` for which
+   * clock it came from; this is not a claim of the perfect original send
+   * time.
+   */
+  readonly effectiveAt: string;
+  /** Which clock the effective time came from: `client` or `server`. */
+  readonly timeSource: "client" | "server";
+  /**
+   * Why the effective time was chosen: `absent` (no client time supplied),
+   * `valid` (client time used), `future_skew` (client time too far ahead of
+   * the server clock), `out_of_order` (client time below the monotonically
+   * tracked acceptance/order bound), or `invalid` (unparseable client
+   * value). Every non-valid status falls back to the actual recorded server
+   * receive time, identical to `serverReceivedAt`.
+   */
+  readonly clientTimeStatus:
+    | "absent"
+    | "valid"
+    | "future_skew"
+    | "out_of_order"
+    | "invalid";
+  /** The server receive time recorded at ingest (the fallback clock). */
+  readonly serverReceivedAt: string;
 }
 
 export type TurnStatus = "in_flight" | "completed" | "failed";

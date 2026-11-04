@@ -54,6 +54,41 @@ const CLIENT_KEY_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 interface ParsedBody {
   readonly text: string;
   readonly clientKey: string;
+  /** Optional raw client send time (epoch-ms number or ISO string). */
+  readonly clientSentAt?: number | string;
+}
+
+/**
+ * Client send time shape validation only (epoch-ms number in a sane range,
+ * or a bounded non-empty string): semantic classification (skew, ordering,
+ * provenance) belongs to the worker's ingest timing.
+ */
+const MAX_CLIENT_EPOCH_MS = 4_102_444_800_000;
+
+function parseClientSentAt(
+  value: unknown,
+): number | string | undefined | false {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value === "number") {
+    if (
+      !Number.isSafeInteger(value) ||
+      value < 0 ||
+      value > MAX_CLIENT_EPOCH_MS
+    ) {
+      return false;
+    }
+    return value;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed.length === 0 || trimmed.length > 64) {
+      return false;
+    }
+    return trimmed;
+  }
+  return false;
 }
 
 function parseBody(raw: string): ParsedBody | undefined {
@@ -78,7 +113,15 @@ function parseBody(raw: string): ParsedBody | undefined {
   if (!CLIENT_KEY_PATTERN.test(clientKey)) {
     return undefined;
   }
-  return { text, clientKey };
+  const clientSentAt = parseClientSentAt(record.clientSentAt);
+  if (clientSentAt === false) {
+    return undefined;
+  }
+  return {
+    text,
+    clientKey,
+    ...(clientSentAt !== undefined ? { clientSentAt } : {}),
+  };
 }
 
 export async function POST(request: NextRequest) {
@@ -123,7 +166,11 @@ export async function POST(request: NextRequest) {
     token: config.workerToken,
     timeoutMs: config.workerTimeoutMs,
   });
-  const result = await client.sendMessage(parsed.text, parsed.clientKey);
+  const result = await client.sendMessage(
+    parsed.text,
+    parsed.clientKey,
+    parsed.clientSentAt,
+  );
   if (result.ok) {
     return jsonOk({ message: toClientMessage(result.message) });
   }

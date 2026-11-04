@@ -397,7 +397,14 @@ export function LiveThread() {
         const response = await fetch("/api/messages", {
           method: "POST",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify({ text: entry.text, clientKey: entry.clientKey }),
+          body: JSON.stringify({
+            text: entry.text,
+            clientKey: entry.clientKey,
+            // The original compose/send time, captured once per composed
+            // message and reused across retries so the worker records the
+            // original send time, never the retry time.
+            clientSentAt: entry.sentAt,
+          }),
         });
         if (response.ok) {
           failed = false;

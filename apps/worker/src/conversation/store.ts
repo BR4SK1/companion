@@ -52,6 +52,12 @@ import type {
 } from "@companion/postgres";
 import { withTransaction } from "@companion/postgres";
 
+import {
+  DEFAULT_CLIENT_MAX_AHEAD_MS,
+  classifyClientSentAt,
+  resolveEffectiveAt,
+} from "./timing.ts";
+
 import type {
   AttemptSnapshotPayload,
   ChatOutcomeTrace,
@@ -109,6 +115,11 @@ interface MessageRow {
   turn_id: string | null;
   client_key: string | null;
   created_at: Date;
+  client_sent_at: Date | null;
+  effective_at: Date;
+  time_source: string;
+  client_time_status: string;
+  server_received_at: Date;
 }
 
 interface TurnRow {
@@ -140,6 +151,12 @@ function mapMessage(row: MessageRow): ConversationMessage {
     turnId: row.turn_id,
     clientKey: row.client_key,
     createdAt: row.created_at.toISOString(),
+    clientSentAt: row.client_sent_at?.toISOString() ?? null,
+    effectiveAt: row.effective_at.toISOString(),
+    timeSource: row.time_source as ConversationMessage["timeSource"],
+    clientTimeStatus:
+      row.client_time_status as ConversationMessage["clientTimeStatus"],
+    serverReceivedAt: row.server_received_at.toISOString(),
   };
 }
 
@@ -168,7 +185,9 @@ function mapPattern(row: PatternRow): ResponsePattern {
 }
 
 const MESSAGE_COLUMNS =
-  "id, seq, role, content, turn_id, client_key, created_at";
+  "id, seq, role, content, turn_id, client_key, created_at, " +
+  "client_sent_at, effective_at, time_source, client_time_status, " +
+  "server_received_at";
 const TURN_COLUMNS =
   "id, status, attempt, lease_owner, lease_expires_at, selected_pattern_id, decision, error, created_at, completed_at";
 
@@ -180,6 +199,60 @@ export interface AppendUserMessageParams {
    * `ClientKeyConflictError`.
    */
   readonly clientKey?: string;
+  /**
+   * The raw client-reported send time as received on the wire (epoch
+   * milliseconds or an ISO-8601 instant), preserved alongside the server
+   * receive time. The effective message time prefers this value when it is
+   * valid and consistent with the thread's user-message order, and falls
+   * back to the recorded server receive time otherwise; the selection is
+   * made once at ingest and persisted with its provenance, and an
+   * idempotent replay returns the originally recorded values untouched.
+   */
+  readonly clientSentAt?: number | string | null;
+}
+
+/**
+ * In-transaction hook fired after a NEW user message row is inserted (never
+ * on an idempotent replay), inside the same transaction — so anything the
+ * hook writes (for example the engagement domain's per-message assessment)
+ * commits atomically with the message, and a later replay observes exactly
+ * the recorded values. The conversation store stays agnostic about what the
+ * hook does: the composition edge injects it.
+ */
+export interface UserMessageInsertion {
+  readonly messageId: string;
+  readonly effectiveAt: Date;
+  readonly serverReceivedAt: Date;
+}
+
+export type UserMessageInsertedHook = (
+  tx: PostgresPoolClient,
+  inserted: UserMessageInsertion,
+) => Promise<unknown>;
+
+/**
+ * Post-commit notification for a NEW user message (never on replay). Fire
+ * and forget from the caller's perspective: the store invokes it after the
+ * ingest transaction has committed, with whatever summary the in-transaction
+ * hook returned, so interested runtimes can react (for example re-arming an
+ * engagement timer) without participating in the transaction.
+ */
+export type UserMessageCommittedHook = (result: unknown) => void;
+
+export interface ConversationStoreOptions {
+  /**
+   * Tolerance for a client clock running ahead of the server clock when
+   * accepting a client-reported send time, in milliseconds (see
+   * `conversation/timing.ts`). Zero disables the tolerance entirely.
+   */
+  readonly clientTimeMaxAheadMs?: number;
+  /**
+   * In-transaction hook for new user messages (see `UserMessageInsertion`);
+   * a thrown error fails the ingest transaction atomically.
+   */
+  readonly onUserMessageInserted?: UserMessageInsertedHook;
+  /** Post-commit notification for new user messages; errors are swallowed. */
+  readonly onUserMessageCommitted?: UserMessageCommittedHook;
 }
 
 /**
@@ -387,11 +460,19 @@ export interface ConversationStore {
   getTurnTraceReport(params: TurnTraceParams): Promise<TurnTraceReport>;
 }
 
-export function createConversationStore(pool: PostgresPool): ConversationStore {
+export function createConversationStore(
+  pool: PostgresPool,
+  options?: ConversationStoreOptions,
+): ConversationStore {
   async function appendUserMessage(
     params: AppendUserMessageParams,
   ): Promise<ConversationMessage> {
-    return withTransaction(pool, async (client) => {
+    // Set when a NEW message row was inserted, with whatever the
+    // in-transaction insertion hook returned; released by the post-commit
+    // handler below (never on an idempotent replay).
+    let committedHookResult: unknown | undefined;
+    let hasCommittedHookResult = false;
+    const message = await withTransaction(pool, async (client) => {
       // Serialize with `claimNextTurn` (same advisory lock, always taken
       // before any row lock, so the two cannot deadlock). PostgreSQL
       // sequences are not transactional: an ingest that has drawn `seq` but
@@ -407,15 +488,73 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
         CLAIM_ADVISORY_LOCK_KEY,
       ]);
 
+      // One clock reading per ingest, taken from the database's own
+      // transaction clock: the server receive time recorded on the message
+      // and `created_at` are the same instant by construction, and the
+      // client-time classification is decided against exactly that clock.
+      const serverNow = await client.query<{ now: Date }>(
+        "SELECT now() AS now",
+      );
+      const serverNowRow = serverNow.rows[0];
+      if (serverNowRow === undefined) {
+        throw new Error("server clock read returned no row");
+      }
+      const serverReceivedAt = serverNowRow.now;
+      // The acceptance/order bound: the maximum effective time recorded so far
+      // on user messages (fallbacks included) — a monotonically tracked
+      // validation bound for client-time candidates. Read before the
+      // insert, inside the serialized ingest transaction, so the max covers
+      // every user row that exists at this moment. It gates candidate
+      // validation only; the chosen fallback value is never modified by it.
+      const boundResult = await client.query<{ order_bound: Date | null }>(
+        `SELECT max(effective_at) AS order_bound FROM conversation_message
+         WHERE role = 'user'`,
+      );
+      const orderBound = boundResult.rows[0]?.order_bound ?? null;
+      const classification = classifyClientSentAt({
+        clientSentAt: params.clientSentAt ?? null,
+        serverReceivedAt,
+        maxAheadMs:
+          options?.clientTimeMaxAheadMs ?? DEFAULT_CLIENT_MAX_AHEAD_MS,
+        ...(orderBound !== null ? { orderBoundAt: orderBound } : {}),
+      });
+      // The honest contract: a valid client time is the effective time;
+      // every other status falls back to the actual recorded server receive
+      // time, identical to `server_received_at`, with the classification's
+      // own status preserved.
+      const resolved = resolveEffectiveAt(classification, serverReceivedAt);
+
       const inserted = await client.query<MessageRow>(
-        `INSERT INTO conversation_message (role, content, client_key)
-         VALUES ('user', $1, $2)
+        `INSERT INTO conversation_message
+           (role, content, client_key, client_sent_at, effective_at,
+            time_source, client_time_status, server_received_at)
+         VALUES ('user', $1, $2, $3, $4, $5, $6, $7)
          ON CONFLICT (client_key) DO NOTHING
          RETURNING ${MESSAGE_COLUMNS}`,
-        [params.content, params.clientKey ?? null],
+        [
+          params.content,
+          params.clientKey ?? null,
+          classification.clientSentAt,
+          resolved.effectiveAt,
+          resolved.timeSource,
+          classification.status,
+          serverReceivedAt,
+        ],
       );
       const row = inserted.rows[0];
       if (row !== undefined) {
+        // New message. The domain-owned insertion hook runs inside this
+        // same transaction — whatever it writes (the engagement domain's
+        // per-message assessment) commits atomically with the message, so
+        // an idempotent replay later observes exactly the recorded values.
+        if (options?.onUserMessageInserted !== undefined) {
+          committedHookResult = await options.onUserMessageInserted(client, {
+            messageId: row.id,
+            effectiveAt: row.effective_at,
+            serverReceivedAt: row.server_received_at,
+          });
+          hasCommittedHookResult = true;
+        }
         return mapMessage(row);
       }
       // Unique-violation path: the same client key was already ingested. The
@@ -441,8 +580,29 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
       if (found.content !== params.content) {
         throw new ClientKeyConflictError(params.clientKey);
       }
+      // Idempotent replay: the originally recorded client time, effective
+      // time, provenance, and (via the committed hook's durable rows) the
+      // originally recorded engagement assessment are returned untouched —
+      // a replay never re-classifies time and never re-fires the hook, so
+      // it cannot reset user activity or engagement state.
       return mapMessage(found);
     });
+    if (hasCommittedHookResult && options?.onUserMessageCommitted) {
+      const result = committedHookResult;
+      // Fire and forget, after the ingest transaction has committed: a
+      // failed notification is logged and swallowed — it never fails the
+      // already-durable message.
+      try {
+        options.onUserMessageCommitted(result);
+      } catch (error: unknown) {
+        console.warn(
+          `[conversation] post-ingest notification handler failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    return message;
   }
 
   async function claimNextTurn(
@@ -1292,9 +1452,15 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
         [params.turnId, params.leaseOwner],
       );
       if (guard.rows.length === 1) {
+        // Assistant replies carry no client time: the server receive time is
+        // their effective time (absent client time, recorded provenance).
+        // Assistant messages are not user activity and never touch the
+        // engagement domain.
         await client.query(
-          `INSERT INTO conversation_message (role, content, turn_id)
-           VALUES ('assistant', $1, $2)`,
+          `INSERT INTO conversation_message
+             (role, content, turn_id, effective_at, time_source,
+              client_time_status, server_received_at)
+           VALUES ('assistant', $1, $2, now(), 'server', 'absent', now())`,
           [params.content, params.turnId],
         );
         const attemptId = await findOpenAttemptAfterTransition(
@@ -1743,7 +1909,9 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
     readonly ConversationMessage[]
   > {
     const result = await pool.query<MessageRow>(
-      `SELECT id, seq, role, content, turn_id, client_key, created_at
+      `SELECT id, seq, role, content, turn_id, client_key, created_at,
+              client_sent_at, effective_at, time_source, client_time_status,
+              server_received_at
        FROM (
          SELECT ${MESSAGE_COLUMNS},
                 min(seq) OVER (PARTITION BY turn_id) AS turn_first_seq
@@ -1802,7 +1970,9 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
       MessageRow & { page_oldest_seq: string | null; has_more: boolean }
     >(
       `WITH page AS (
-         SELECT id, seq, role, content, turn_id, client_key, created_at
+         SELECT id, seq, role, content, turn_id, client_key, created_at,
+                client_sent_at, effective_at, time_source, client_time_status,
+                server_received_at
          FROM conversation_message
          WHERE ($2::bigint IS NULL OR seq < $2::bigint)
          ORDER BY seq DESC
@@ -1818,7 +1988,9 @@ export function createConversationStore(pool: PostgresPool): ConversationStore {
            ) AS has_more
        )
        SELECT p.id, p.seq, p.role, p.content, p.turn_id, p.client_key,
-              p.created_at, b.page_oldest_seq, b.has_more
+              p.created_at, p.client_sent_at, p.effective_at, p.time_source,
+              p.client_time_status, p.server_received_at,
+              b.page_oldest_seq, b.has_more
        FROM page p CROSS JOIN bounds b
        ORDER BY p.seq ASC`,
       [params.limit, params.before ?? null],

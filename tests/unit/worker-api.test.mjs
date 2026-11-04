@@ -375,6 +375,126 @@ describe("worker private HTTP API", () => {
     // hanging; treat that as acceptable close semantics.
     await assert.rejects(server.close());
   });
+
+  it("forwards an optional client send time to the store on ingest", async () => {
+    const { baseUrl, store } = await startServer();
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        text: "hello",
+        clientKey: "k-with-time",
+        clientSentAt: 1_700_000_000_000,
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(store.calls.append.at(-1), {
+      content: "hello",
+      clientKey: "k-with-time",
+      clientSentAt: 1_700_000_000_000,
+    });
+  });
+
+  it("forwards an ISO-string client send time unchanged", async () => {
+    const { baseUrl, store } = await startServer();
+    const response = await fetch(`${baseUrl}/v1/messages`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${TOKEN}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        text: "hello",
+        clientKey: "k-iso",
+        clientSentAt: "2026-11-04T12:00:00.000Z",
+      }),
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(store.calls.append.at(-1), {
+      content: "hello",
+      clientKey: "k-iso",
+      clientSentAt: "2026-11-04T12:00:00.000Z",
+    });
+  });
+
+  it("rejects malformed client send times as bad_request", async () => {
+    for (const clientSentAt of [1.5, -1, 99999999999999999, "x".repeat(65), {}, true]) {
+      const { baseUrl, store } = await startServer();
+      const response = await fetch(`${baseUrl}/v1/messages`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${TOKEN}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ text: "hi", clientKey: "k", clientSentAt }),
+      });
+      assert.equal(response.status, 400, `clientSentAt=${String(clientSentAt)}`);
+      assert.equal(store.calls.append.length, 0);
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  });
+
+  it("serves the engagement summary when the domain is wired", async () => {
+    const calls = [];
+    const engagement = async (input) => {
+      calls.push(input);
+      return {
+        state: "lull",
+        lastUserMessageId: "last-1",
+        lastUserEffectiveAt: "2026-11-04T11:57:00.000Z",
+        silenceMs: 4 * 60_000,
+        bands: {
+          lullMs: 180_000,
+          idleMs: 420_000,
+          goneMs: 1_800_000,
+        },
+      };
+    };
+    const { baseUrl } = await startServer({ engagement });
+    const response = await fetch(`${baseUrl}/v1/engagement`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.state, "lull");
+    assert.equal(body.lastUserMessageId, "last-1");
+    assert.equal(body.silenceMs, 240_000);
+    assert.equal(calls.length, 1);
+  });
+
+  it("reports the engagement surface unavailable when not wired", async () => {
+    const { baseUrl } = await startServer({});
+    const response = await fetch(`${baseUrl}/v1/engagement`, {
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    assert.equal(response.status, 503);
+  });
+
+  it("requires the bearer token for the engagement read", async () => {
+    const { baseUrl } = await startServer({
+      engagement: async () => ({
+        state: null,
+        lastUserMessageId: null,
+        lastUserEffectiveAt: null,
+        silenceMs: null,
+        bands: {
+          lullMs: 1,
+          idleMs: 2,
+          goneMs: 3,
+        },
+      }),
+    });
+    const noToken = await fetch(`${baseUrl}/v1/engagement`);
+    assert.equal(noToken.status, 401);
+    const post = await fetch(`${baseUrl}/v1/engagement`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${TOKEN}` },
+    });
+    assert.equal(post.status, 405);
+  });
 });
 
 function replayMessage() {

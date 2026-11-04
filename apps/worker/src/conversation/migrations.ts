@@ -331,6 +331,66 @@ ALTER TABLE trace_attempt_chat_message ADD COLUMN chunk text
   CHECK (chunk IN ('identity', 'profiles', 'temporal', 'recall', 'guidance', 'conversation'));
 `;
 
+/**
+ * Original message timing: dual provenance for user messages. The raw
+ * client-reported send time (nullable — absence is legitimate) is preserved
+ * alongside the server receive time (the existing `created_at`), and one
+ * effective time is derived at ingest and persisted so every later reader
+ * sees the same decision:
+ *
+ * - `client_sent_at` — the client-reported send time as received, kept even
+ *   when it was not trusted (a parseable but rejected value stays visible
+ *   for provenance; only an unparseable value cannot be stored as a
+ *   timestamp and is recorded through `client_time_status` instead).
+ * - `effective_at` — the trusted working time: the client time when it was
+ *   valid and consistent with the acceptance/order bound, otherwise the
+ *   server receive time, always identical to `server_received_at` on
+ *   fallbacks (never clamped or synthesized).
+ * - `time_source` / `client_time_status` — which clock the effective time
+ *   came from and why (`absent`, `valid`, `future_skew`, `out_of_order`,
+ *   `invalid`), preserved independently.
+ * - `server_received_at` — the server clock reading at ingest, recorded
+ *   honestly; on every fallback it is identical to `effective_at`.
+ *
+ * Legacy rows are backfilled from their own recorded history with nothing
+ * invented: `server_received_at` = `created_at` (the row's server insert
+ * instant — same clock, same statement), `effective_at` = `created_at`,
+ * `time_source` = 'server', `client_time_status` = 'absent' (no client time
+ * was recorded before this migration, and none is invented);
+ * `client_sent_at` stays nullable because absence is a real state. The
+ * provenance columns become NOT NULL after the backfill.
+ *
+ * The partial index on user rows supports the ingest path's
+ * acceptance/order bound lookup (the maximum effective time over user
+ * rows — the monotonically tracked client-candidate validation bound and
+ * the engagement last-activity clock), which runs inside the serialized
+ * ingest transaction.
+ */
+const ADD_MESSAGE_TIMING = `
+ALTER TABLE conversation_message ADD COLUMN client_sent_at timestamptz;
+ALTER TABLE conversation_message ADD COLUMN effective_at timestamptz;
+ALTER TABLE conversation_message ADD COLUMN server_received_at timestamptz;
+ALTER TABLE conversation_message ADD COLUMN time_source text
+  CHECK (time_source IN ('client', 'server'));
+ALTER TABLE conversation_message ADD COLUMN client_time_status text
+  CHECK (client_time_status IN ('absent', 'valid', 'future_skew', 'out_of_order', 'invalid'));
+
+UPDATE conversation_message
+SET server_received_at = created_at,
+    effective_at = created_at,
+    time_source = 'server',
+    client_time_status = 'absent'
+WHERE effective_at IS NULL OR server_received_at IS NULL;
+
+ALTER TABLE conversation_message ALTER COLUMN effective_at SET NOT NULL;
+ALTER TABLE conversation_message ALTER COLUMN server_received_at SET NOT NULL;
+ALTER TABLE conversation_message ALTER COLUMN time_source SET NOT NULL;
+ALTER TABLE conversation_message ALTER COLUMN client_time_status SET NOT NULL;
+
+CREATE INDEX conversation_message_user_seq_idx
+  ON conversation_message (seq) WHERE role = 'user';
+`;
+
 export const conversationMigrations: readonly Migration[] = [
   {
     id: "0001_conversation_work",
@@ -343,5 +403,9 @@ export const conversationMigrations: readonly Migration[] = [
   {
     id: "0004_chat_identity",
     sql: CREATE_CHAT_IDENTITY,
+  },
+  {
+    id: "0005_message_timing",
+    sql: ADD_MESSAGE_TIMING,
   },
 ];
