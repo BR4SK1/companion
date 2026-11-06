@@ -24,6 +24,7 @@ import {
 } from "../../libraries/postgres/src/index.ts";
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
+import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { engagementMigrations } from "../../apps/worker/src/engagement/migrations.ts";
 import {
   CLAIM_ADVISORY_LOCK_KEY,
@@ -55,7 +56,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     // Fresh application against the provided non-production database; the
     // worker applies the conversation and memory domain migrations together
     // (see main.ts), so every test below assumes both domain schemas exist.
-    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations]);
+    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations, ...articleMigrations]);
     // The chat identity is required runtime configuration (like
     // response_pattern): provision a generic fixture row so engine cycles
     // can run. It is configuration, not per-test data, so the beforeEach
@@ -93,6 +94,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     const second = await runMigrations(pool, [
       ...conversationMigrations,
       ...memoryMigrations,
+      ...articleMigrations,
     ]);
     assert.deepEqual(second.applied, []);
     // Ids are feature-owned labels, not a global sequence: the composition
@@ -105,6 +107,9 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       "0004_chat_identity",
       "0005_message_timing",
       "0003_memory_work",
+      "0007_article_work",
+      "0008_article_share_and_evidence",
+      "0009_article_observation_claim",
     ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
@@ -194,6 +199,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       await runMigrations(pool, [
         ...conversationMigrations,
         ...memoryMigrations,
+        ...articleMigrations,
         ...engagementMigrations,
       ]);
       await pool.query(
@@ -855,6 +861,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     const staleSelection = await store.recordDecisionSelection({
       turnId: first.work.turn.id,
       leaseOwner: "stale-owner",
+      questionId: "response_pattern",
       selection: { kind: "rejected", reason: "stale owner" },
     });
     assert.equal(staleSelection, false);
@@ -1051,6 +1058,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
             store.recordDecisionSelection({
               turnId: work.turn.id,
               leaseOwner,
+              questionId: payload.questionId,
               selection: payload.selection,
             }),
           recordChatRequest: (payload) =>
@@ -1488,6 +1496,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
             store.recordDecisionSelection({
               turnId: work.turn.id,
               leaseOwner,
+              questionId: payload.questionId,
               selection: payload.selection,
             }),
           recordChatRequest: (payload) =>
@@ -1677,6 +1686,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
             store.recordDecisionSelection({
               turnId: work.turn.id,
               leaseOwner,
+              questionId: payload.questionId,
               selection: payload.selection,
             }),
           recordChatRequest: (payload) =>
@@ -2149,6 +2159,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     await store.recordDecisionSelection({
       turnId,
       leaseOwner: "owner-report",
+      questionId: "response_pattern",
       selection: { kind: "selected", patternId: "concise" },
     });
     const chatRequest = buildChatRequest({
@@ -2288,9 +2299,11 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
          trace_attempt_pattern, trace_attempt_context, trace_attempt,
          chat_identity CASCADE`,
     );
+    await pool.query(`DROP INDEX IF EXISTS article_share_turn_reaction_idx`);
     await pool.query(
       `DELETE FROM companion_schema_migration
-       WHERE id IN ('0002_conversation_tracing', '0004_chat_identity')`,
+       WHERE id IN ('0002_conversation_tracing', '0004_chat_identity',
+                    '0008_article_share_and_evidence')`,
     );
 
     // A legacy turn exactly as pre-tracing code wrote it.
@@ -2310,11 +2323,21 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       [legacyTurnId],
     );
 
-    // The tracing migrations apply cleanly over the legacy data.
-    const applied = await runMigrations(pool, conversationMigrations);
+    // The tracing migrations apply cleanly over the legacy data. The article
+    // migration set is re-applied with them: 0008 owns the trace-decision
+    // uniqueness AND the article trace-kind/chunk constraint widenings this
+    // suite's later engine tests rely on (per-question trace rows; the
+    // article chunk classification), and re-running it over the recreated
+    // tracing tables restores that shape — the article composition belongs to
+    // the same array main.ts applies.
+    const applied = await runMigrations(pool, [
+      ...conversationMigrations,
+      ...articleMigrations,
+    ]);
     assert.deepEqual(applied.applied, [
       "0002_conversation_tracing",
       "0004_chat_identity",
+      "0008_article_share_and_evidence",
     ]);
 
     // The legacy row is untouched: the decision JSONB is exactly as inserted,
@@ -2402,6 +2425,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       const recorded = await store.recordDecisionSelection({
         turnId,
         leaseOwner,
+        questionId: payload.questionId,
         selection: payload.selection,
       });
       if (!recorded) {

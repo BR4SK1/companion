@@ -39,8 +39,15 @@ import { engagementMigrations } from "./engagement/migrations.ts";
 import { loadEngagementBands } from "./engagement/bands.ts";
 import { createEngagementStore } from "./engagement/store.ts";
 import { memoryMigrations } from "./memory/migrations.ts";
+import { articleMigrations } from "./articles/migrations.ts";
 import { loadMemoryConfig } from "./memory/config.ts";
 import { createMemoryLlmCaller } from "./memory/llm.ts";
+import { startArticleRuntime } from "./articles/runner.ts";
+import {
+  loadArticleShareContext,
+  recordArticleShareInclusion,
+} from "./articles/share.ts";
+import { getRecentArticleMemories } from "./articles/retrieval.ts";
 import { loadMemoryConfiguration, MemoryConfigurationError } from "./memory/subjects.ts";
 import {
   PROMPT_KINDS,
@@ -98,11 +105,13 @@ async function main(): Promise<void> {
 
   let api: ReturnType<typeof createApiServer> | undefined;
   let memoryRuntime: ReturnType<typeof startMemoryRuntime> | undefined;
+  let articleRuntime: ReturnType<typeof startArticleRuntime> | undefined;
   try {
     const migrations = await runMigrations(pool, [
       ...conversationMigrations,
       ...memoryMigrations,
       ...engagementMigrations,
+      ...articleMigrations,
     ]);
     if (migrations.applied.length > 0) {
       console.log(`applied migrations: ${migrations.applied.join(", ")}`);
@@ -203,6 +212,9 @@ async function main(): Promise<void> {
         // a failure in one section logs a warning and drops only that section,
         // never the whole memory context.
         let memoryContext: string | undefined;
+        // Fact keys the recall chunk surfaced this turn — the dedupe input
+        // for the per-turn article-memory share candidates.
+        let recallFactKeys: string[] = [];
         if (memoryConfig.recallEnabled) {
           try {
             const recallQuery = userText.trim().split(/\s+/).slice(0, 16).join(" ").slice(0, 512);
@@ -219,6 +231,9 @@ async function main(): Promise<void> {
                 items: recall.results,
                 now,
               });
+              recallFactKeys = recall.results
+                .filter((item) => item.type === "fact")
+                .map((item) => item.id);
               await recordMemoryOperation(pool, {
                 kind: "recall",
                 outcome: "ok",
@@ -301,9 +316,33 @@ async function main(): Promise<void> {
           ...(memoryContext !== undefined ? { memoryContext } : {}),
           ...(temporalContext !== undefined ? { temporalContext } : {}),
           ...(profileSection !== undefined ? { profileSection } : {}),
+          ...(recallFactKeys.length > 0 ? { recallFactKeys } : {}),
         };
       };
     }
+
+    // Article ingestion domain. Started on every worker run, independent of
+    // the memory feature flag: the article domain has its own provisioned
+    // enable switch, and every article input (feeds, prompts, policy, model,
+    // and the assistant subject reactions are attributed to) is loaded from
+    // PostgreSQL at every attempt. An unprovisioned article domain is a
+    // fail-closed no-op that logs exactly `ingestion not configured`, so
+    // starting the scheduler unconditionally is safe and keeps the
+    // documented contract honest: provisioning (or disabling) the article
+    // tables takes effect on the next poll without a restart. The
+    // OpenRouter endpoint and credential are environment configuration,
+    // available regardless of provisioning state.
+    articleRuntime = startArticleRuntime({
+      pool,
+      callLlm: (model, input) =>
+        createMemoryLlmCaller({
+          url: `${memoryConfig.openrouterBaseUrl}/chat/completions`,
+          apiKey: config.openrouter.apiKey,
+          model,
+          timeoutMs: memoryConfig.chatTimeoutMs,
+        })(input),
+      log: (message) => console.log(message),
+    });
 
     // Const alias so the recall closure can rely on the provisioned
     // configuration's narrowing (a captured `let` would not stay narrowed).
@@ -355,6 +394,17 @@ async function main(): Promise<void> {
             },
           }
         : {}),
+      // Programmatic article-memory retrieval: deterministic newest-first
+      // accepted memories, caller-configurable limit with safe defaults and
+      // maxima. Wired unconditionally, matching the article runtime's
+      // unconditional start: the article domain's enable switch is its
+      // provisioned configuration (applied migrations + article tables), not
+      // the memory feature flag, and this read-only surface reads
+      // article-sourced facts that exist regardless of the memory flag. The
+      // private API route reports 503 only when the surface is unwired
+      // (embedding without the article domain), never because memory is off.
+      articleMemories: (input: { limit?: number }) =>
+        getRecentArticleMemories(pool, input),
       ready: async () => {
         try {
           await pool.query("SELECT 1");
@@ -425,6 +475,7 @@ async function main(): Promise<void> {
                 store.recordDecisionSelection({
                   turnId: work.turn.id,
                   leaseOwner,
+                  questionId: payload.questionId,
                   selection: payload.selection,
                 }),
               ),
@@ -445,6 +496,23 @@ async function main(): Promise<void> {
                 }),
               ),
             loadMemoryContext,
+            ...(articleRuntime !== undefined
+              ? {
+                  loadArticleShareCandidates: (input: {
+                    readonly recallFactKeys: readonly string[];
+                  }) =>
+                    loadArticleShareContext(pool, { recallFactKeys: input.recallFactKeys })
+                      .then((context) => context?.candidates ?? null),
+                  recordArticleShareInclusion: (input: {
+                    readonly turnId: string;
+                    readonly reactionId: string;
+                  }) =>
+                    recordArticleShareInclusion(pool, {
+                      turnId: input.turnId,
+                      reactionId: input.reactionId,
+                    }),
+                }
+              : {}),
           }),
         leaseSeconds: config.leaseSeconds,
         pollSeconds: config.pollSeconds,
@@ -471,6 +539,13 @@ async function main(): Promise<void> {
       await memoryRuntime.close().catch((error: unknown) => {
         console.error(
           `memory runtime shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }
+    if (articleRuntime !== undefined) {
+      await articleRuntime.close().catch((error: unknown) => {
+        console.error(
+          `article runtime shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       });
     }

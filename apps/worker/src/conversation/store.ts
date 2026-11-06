@@ -350,6 +350,12 @@ export interface RecordDecisionSelectionParams {
   readonly turnId: string;
   readonly leaseOwner: string;
   /**
+   * The decision question this selection resolves: the decision trace holds
+   * one row per (attempt, question), so the selection write targets its own
+   * question's row.
+   */
+  readonly questionId: string;
+  /**
    * The selection outcome, recorded after the boundary and separately from
    * it: the chosen pattern id, or the rejection with its reason.
    */
@@ -873,8 +879,10 @@ export function createConversationStore(
           return false;
         }
       } else {
-        // A rejection writes no turn state; still fenced by the same
-        // in-flight lease the boundary and other records use.
+        // An article-memory selection writes no turn state (it is not a
+        // response pattern), and a rejection writes no turn state either;
+        // both are still fenced by the same in-flight lease the boundary and
+        // other records use.
         const current = await client.query<{ id: string }>(
           `SELECT id FROM conversation_turn
            WHERE id = $1 AND status = 'in_flight'
@@ -893,15 +901,27 @@ export function createConversationStore(
       if (attemptId === null) {
         return true;
       }
+      // The trace column records the selection in its own vocabulary: an
+      // article-memory selection — a chosen reaction, or the legitimate
+      // no-action `none` outcome — is a `selected` on its own question's row
+      // (the choice column already carries the chosen option id, `none`
+      // included), so a successful selection is never misrecorded as a
+      // rejection.
+      const selectionValue =
+        params.selection.kind === "selected-article" ||
+        params.selection.kind === "selected-none"
+          ? "selected"
+          : params.selection.kind;
       await client.query(
         `UPDATE trace_attempt_decision
          SET selection = $2,
              rejection_reason = $3
-         WHERE attempt_id = $1 AND selection IS NULL`,
+         WHERE attempt_id = $1 AND question_id = $4 AND selection IS NULL`,
         [
           attemptId,
-          params.selection.kind,
+          selectionValue,
           params.selection.kind === "rejected" ? params.selection.reason : null,
+          params.questionId,
         ],
       );
       return true;
@@ -935,7 +955,7 @@ export function createConversationStore(
       `INSERT INTO trace_attempt_decision
          (attempt_id, state, question_id, question_type, request_model, instructions)
        VALUES ($1, 'requested', $2, $3, $4, $5)
-       ON CONFLICT (attempt_id) DO UPDATE SET
+       ON CONFLICT (attempt_id, question_id) DO UPDATE SET
          question_id = EXCLUDED.question_id,
          question_type = EXCLUDED.question_type,
          request_model = EXCLUDED.request_model,
@@ -1032,7 +1052,7 @@ export function createConversationStore(
           usage_input_tokens, usage_output_tokens, usage_cost,
           error_kind, error_message, error_body)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
-       ON CONFLICT (attempt_id) DO UPDATE SET
+       ON CONFLICT (attempt_id, question_id) DO UPDATE SET
          state = EXCLUDED.state,
          question_id = EXCLUDED.question_id,
          question_type = EXCLUDED.question_type,
@@ -1671,7 +1691,11 @@ export function createConversationStore(
              FROM trace_attempt_pattern WHERE attempt_id = $1 ORDER BY position`,
             [attemptRow.id],
           );
-          // Decision trace (one row per attempt, when the decision was recorded).
+          // Decision traces: one row per (attempt, question) since the
+          // article-share question joined the per-turn decision request.
+          // Every row is reported in `decisions`; the response-pattern row
+          // stays the legacy `decision` (falling back to the only row for
+          // single-question attempts).
           const decisionResult = await client.query<DecisionRow>(
             `SELECT id, state, question_id, question_type, request_model, instructions,
                     choice, confidence, probabilities_present, selection, rejection_reason,
@@ -1679,12 +1703,12 @@ export function createConversationStore(
                     response_id, usage_input_tokens, usage_output_tokens,
                     usage_cost, error_kind, error_message, error_body,
                     recorded_at
-             FROM trace_attempt_decision WHERE attempt_id = $1`,
+             FROM trace_attempt_decision WHERE attempt_id = $1
+             ORDER BY question_id`,
             [attemptRow.id],
           );
-          let decision: TraceDecision | null = null;
-          const decisionRow = decisionResult.rows[0];
-          if (decisionRow !== undefined) {
+          const decisions: TraceDecision[] = [];
+          for (const decisionRow of decisionResult.rows) {
             const probabilitiesResult = await client.query<{
               option_id: string;
               value: string;
@@ -1694,7 +1718,7 @@ export function createConversationStore(
                WHERE decision_id = $1 ORDER BY option_id`,
               [decisionRow.id],
             );
-            decision = {
+            decisions.push({
               state: decisionRow.state,
               questionId: decisionRow.question_id,
               questionType: decisionRow.question_type,
@@ -1719,8 +1743,12 @@ export function createConversationStore(
                 value: Number(row.value),
               })),
               recordedAt: decisionRow.recorded_at.toISOString(),
-            };
+            });
           }
+          const decision =
+            decisions.find((entry) => entry.questionId === "response_pattern") ??
+            decisions[0] ??
+            null;
           // Chat trace (one row per attempt, when the chat was recorded).
           const chatResult = await client.query<ChatRow>(
             `SELECT state, request_model, temperature, max_tokens,
@@ -1817,6 +1845,7 @@ export function createConversationStore(
               responseGuidance: row.response_guidance,
             })),
             decision,
+            decisions,
             chat,
           });
         }

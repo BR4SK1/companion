@@ -4,7 +4,10 @@
  * Assembles a human-readable (or machine-readable JSON) report of a turn's
  * full recorded trace: every attempt, its snapshot of the mutable pattern
  * configuration and the exact ordered context it saw, the native decision
- * boundary values (choice, optional probabilities/confidence), and the chat
+ * boundary values (choice, optional probabilities/confidence) for every
+ * recorded decision question — the response-pattern decision and, when
+ * asked, the per-turn article-memory share decision, whose action is
+ * annotated as prompt inclusion only, never a share claim — and the chat
  * boundary (request messages, response choices, usage).
  *
  * The CLI only ever reads; it never writes. It requires no provider
@@ -19,6 +22,7 @@ import {
 } from "@companion/postgres";
 
 import { createConversationStore } from "./conversation/store.ts";
+import { ARTICLE_SHARE_QUESTION_ID } from "./articles/share.ts";
 import type {
   TraceChat,
   TraceDecision,
@@ -148,6 +152,38 @@ export function renderChat(chat: TraceChat): readonly string[] {
   return lines;
 }
 
+/**
+ * Question-aware annotation appended after a decision's boundary block. Only
+ * the article-memory share question carries one: that decision row records
+ * the context-inclusion choice (which candidate, or the permanent none
+ * option), so the annotation states what the row means and cross-references
+ * the recorded chat request for the actual inclusion evidence. It records
+ * prompt inclusion only — it never claims an included memory was shared.
+ */
+export function renderDecisionAnnotation(
+  decision: TraceDecision,
+  chat: TraceChat | null,
+): readonly string[] {
+  if (decision.questionId !== ARTICLE_SHARE_QUESTION_ID) {
+    return [];
+  }
+  const lines: string[] = [];
+  lines.push(
+    "    article action: context-inclusion decision — prompt inclusion only, never a share claim",
+  );
+  if (chat === null) {
+    lines.push(
+      "    article context in the sent chat request: (chat not recorded)",
+    );
+  } else {
+    const present = chat.messages.some((message) => message.chunk === "article");
+    lines.push(
+      `    article context in the sent chat request: ${present ? "present" : "absent"}`,
+    );
+  }
+  return lines;
+}
+
 export function renderAttempt(attempt: TurnAttemptTrace): readonly string[] {
   const lines: string[] = [];
   const outcome = attempt.outcome ?? "in flight (never finalized)";
@@ -179,8 +215,19 @@ export function renderAttempt(attempt: TurnAttemptTrace): readonly string[] {
     lines.push(`        selection: ${JSON.stringify(pattern.selectionDescription)}`);
     lines.push(`        guidance: ${JSON.stringify(pattern.responseGuidance)}`);
   }
-  if (attempt.decision !== null) {
-    lines.push(...renderDecision(attempt.decision));
+  // Every recorded decision question, in question-id order, each with its
+  // own boundary and selection outcome. The store always populates
+  // `decisions`; the legacy single-`decision` fallback keeps reports (and
+  // hand-built fixtures) from before that field rendering exactly as before.
+  const decisions = attempt.decisions ?? (attempt.decision !== null ? [attempt.decision] : []);
+  if (decisions.length > 1) {
+    lines.push(`  decisions (${String(decisions.length)} recorded questions):`);
+  }
+  if (decisions.length > 0) {
+    for (const decision of decisions) {
+      lines.push(...renderDecision(decision));
+      lines.push(...renderDecisionAnnotation(decision, attempt.chat));
+    }
   } else {
     lines.push("  decision: (not recorded)");
   }

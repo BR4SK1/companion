@@ -29,7 +29,9 @@ export type EvidenceBasis =
 export type ObservationOmissionReason =
   | "insufficient_distinct_turns"
   | "one_turn_without_direct_statement"
-  | "event_specific_temporal_anchor";
+  | "event_specific_temporal_anchor"
+  | "insufficient_independent_sources"
+  | "unsupported_kind_for_source";
 
 export type EvidenceStrength = "tentative" | "supported" | "strong";
 
@@ -108,12 +110,17 @@ export interface FactExtractionOutput {
   readonly sources?: readonly FactExtractionSource[];
 }
 
-/** A durable production fact, linked to its source messages. */
+/** A durable production fact, linked to its source. A fact has exactly one
+ *  source: a conversation turn, or an accepted article reaction (article-
+ *  sourced facts carry the reaction id instead of a turn and keep no source
+ *  messages). */
 export interface MemoryFact {
   readonly id: string;
   readonly factKey: string;
-  readonly turnId: string;
-  readonly turnKey: string;
+  readonly turnId: string | null;
+  readonly turnKey: string | null;
+  /** Present for article-sourced facts only; conversation facts have none. */
+  readonly articleReactionId: string | null;
   readonly subject: string;
   readonly kind: FactKind;
   readonly claim: string;
@@ -466,9 +473,27 @@ export interface CanonicalRecallItem {
   readonly type: "fact" | "observation";
   readonly id: string;
   readonly subject: string;
+  /**
+   * The subject's configured role, read from `memory_subject` at recall
+   * time ("user", "assistant", or "relationship"). Recall always populates
+   * it; optional so older hand-built items stay valid. Renderers must use
+   * it for attribution: an assistant-role memory is the assistant's own
+   * record, never user-specific context.
+   */
+  readonly subjectRole?: "user" | "assistant" | "relationship";
   readonly kind: string;
   readonly claim: string;
+  /** Present for conversation-sourced facts only; article facts have none. */
   readonly turnId?: string;
+  /**
+   * Where the memory came from. Facts default to "conversation";
+   * article-sourced reaction facts carry "article" plus their reaction id.
+   * Observations carry the source of their support evidence: aggregated
+   * conversation facts are "conversation", while observations consolidated
+   * from article-reaction facts (assistant interests) carry "article".
+   */
+  readonly sourceType?: "conversation" | "article";
+  readonly articleReactionId?: string;
   readonly condition?: string;
   readonly consequence?: string;
   readonly topics: readonly string[];
@@ -511,4 +536,11 @@ export interface MemoryChatContext {
   readonly memoryContext?: string;
   readonly temporalContext?: string;
   readonly profileSection?: string;
+  /**
+   * Fact keys the lexical recall chunk surfaced this turn — the dedupe input
+   * for the per-turn article-memory share candidates (a fact the recall
+   * chunk already carries is not offered again as a separate article chunk).
+   * Never rendered; bookkeeping only.
+   */
+  readonly recallFactKeys?: readonly string[];
 }

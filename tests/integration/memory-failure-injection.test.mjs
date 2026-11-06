@@ -23,6 +23,7 @@ import {
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
+import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { loadMemoryConfig } from "../../apps/worker/src/memory/config.ts";
 import { ingestTurns } from "../../apps/worker/src/memory/ingest.ts";
 import { runScheduledConsolidation } from "../../apps/worker/src/memory/consolidation.ts";
@@ -371,7 +372,11 @@ describe("memory durability under failure injection (PostgreSQL)", { skip: !hasD
   before(async () => {
     pool = createPostgresPool({ connectionString: DATABASE_URL });
     store = createConversationStore(pool);
-    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations]);
+    await runMigrations(pool, [
+      ...conversationMigrations,
+      ...memoryMigrations,
+      ...articleMigrations,
+    ]);
   });
 
   after(async () => {

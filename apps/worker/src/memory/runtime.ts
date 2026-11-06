@@ -69,7 +69,9 @@ export type MemoryOperationKind =
   | "temporal_summary"
   | "profile_summary"
   | "observation_profile"
-  | "recall";
+  | "recall"
+  | "article_ingestion"
+  | "article_memory_share";
 
 export interface MemoryOperationInput {
   readonly kind: MemoryOperationKind;

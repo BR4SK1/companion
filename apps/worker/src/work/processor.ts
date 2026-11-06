@@ -64,6 +64,13 @@ import {
 } from "./decision.ts";
 import { buildChatPrompt } from "./chat.ts";
 import type { MemoryChatContext } from "../memory/types.ts";
+import {
+  ARTICLE_SHARE_QUESTION_ID,
+  buildArticleShareContextForPrompt,
+  buildArticleShareQuestion,
+  selectArticleShare,
+} from "../articles/share.ts";
+import type { ArticleMemoryCandidate } from "../articles/types.ts";
 import { OpenRouterTransportError } from "@companion/openrouter/transport";
 import type {
   ChatRequest,
@@ -118,10 +125,14 @@ export interface TurnProcessorDeps {
    */
   readonly recordDecisionOutcome?: (payload: DecisionOutcomeTracePayload) => Promise<void>;
   /**
-   * Records the selection outcome (`selected` with the chosen pattern, or
-   * `rejected` with the reason) separately from the boundary.
+   * Records the selection outcome for the named decision question (one trace
+   * row per (attempt, question)): `selected` with the chosen pattern,
+   * `selected-article` with the chosen article-memory candidate,
+   * `selected-none` for the article-share question's legitimate no-action
+   * outcome, or `rejected` with the reason.
    */
   readonly recordDecisionSelection?: (payload: {
+    readonly questionId: string;
     readonly selection: DecisionSelectionTrace;
   }) => Promise<void>;
   /**
@@ -144,6 +155,28 @@ export interface TurnProcessorDeps {
     readonly turnId: string;
     readonly userText: string;
   }) => Promise<MemoryChatContext | null>;
+  /**
+   * Loads the per-turn article-memory share candidates (cooldown-eligible
+   * accepted reactions, newest-first, deduplicated against the turn's recall
+   * fact keys). Runs after the memory context so the recall dedupe input is
+   * available. Absent, failing, or returning null all mean "ask no article
+   * question this turn" — the article share is optional context, and its
+   * loading must never fail a chat turn.
+   */
+  readonly loadArticleShareCandidates?: (input: {
+    readonly turnId: string;
+    readonly recallFactKeys: readonly string[];
+  }) => Promise<readonly ArticleMemoryCandidate[] | null>;
+  /**
+   * Records the prompt-inclusion event for the chosen article-memory
+   * candidate (the `article_share` row plus its metadata-only trace). The
+   * record is an inclusion record, never a share claim; a failed write is
+   * logged and never fails the turn.
+   */
+  readonly recordArticleShareInclusion?: (input: {
+    readonly turnId: string;
+    readonly reactionId: string;
+  }) => Promise<void>;
 }
 
 /** The terminal result of one attempt, published by the engine. */
@@ -240,122 +273,22 @@ export async function processTurnWork(
   }
 
   let selected: ResponsePattern | undefined;
+  // The chosen article-memory candidate's context chunk, rendered when the
+  // article-share decision selects a candidate; null otherwise.
+  let articleChunk: string | null = null;
 
-  if (patterns.length > 0) {
-    const request = buildPatternChoiceRequest({
-      model: deps.decisionModel,
-      patterns,
-      state: decisionState(history, work.messages),
-    });
-    // Round-trip the built request through the contract parser so what is
-    // sent is exactly what the contract validates.
-    const validated = parseDecisionsRequest(request);
-    const decisionTrace: DecisionRequestTracePayload = {
-      questionId: DECISION_QUESTION_ID,
-      request: validated,
-    };
-
-    // Decision request boundary: persisted before the provider call. This
-    // write is deliberate, not best-effort: a failure here fails the attempt
-    // rather than calling the provider with an unrecorded request.
-    if (deps.recordDecisionRequest !== undefined) {
-      await deps.recordDecisionRequest({ trace: decisionTrace });
-    }
-
-    let rawResponse: unknown;
-    try {
-      rawResponse = await deps.callDecisions(validated);
-    } catch (error) {
-      // Transport failure: record the actual error (best-effort — a trace
-      // write failure must never mask the original error) and rethrow so the
-      // engine records a failed turn.
-      if (deps.recordDecisionOutcome !== undefined) {
-        try {
-          await deps.recordDecisionOutcome({
-            trace: decisionTrace,
-            outcome: decisionFailureTrace(error),
-          });
-        } catch {
-          // best-effort; the original error propagates
-        }
-      }
-      throw error;
-    }
-
-    let response: DecisionsResponse;
-    try {
-      response = parseDecisionsExchange(validated, rawResponse);
-    } catch (error) {
-      // Contract failure: a body arrived but did not validate.
-      if (deps.recordDecisionOutcome !== undefined) {
-        try {
-          await deps.recordDecisionOutcome({
-            trace: decisionTrace,
-            outcome: { kind: "invalid", message: errorMessage(error) },
-          });
-        } catch {
-          // best-effort; the original error propagates
-        }
-      }
-      throw error;
-    }
-
-    // Decision outcome boundary: the full validated exchange, persisted
-    // BEFORE the selection step — so a rejected selection or a later chat
-    // failure still leaves the complete native response behind. This write
-    // is deliberate, not best-effort: a failure here fails the attempt rather
-    // than selecting from an unrecorded response.
-    if (deps.recordDecisionOutcome !== undefined) {
-      await deps.recordDecisionOutcome({
-        trace: decisionTrace,
-        outcome: {
-          kind: "responded",
-          trace: {
-            questionId: DECISION_QUESTION_ID,
-            request: validated,
-            response,
-          },
-        },
-      });
-    }
-
-    // Selection step, separate from the boundary. A rejection is recorded
-    // (best-effort: never masks the original error) and then rethrown, so
-    // the engine fails the attempt exactly as before.
-    let selection;
-    try {
-      selection = selectResponsePattern(response, patterns);
-    } catch (error) {
-      if (deps.recordDecisionSelection !== undefined) {
-        try {
-          await deps.recordDecisionSelection({
-            selection: { kind: "rejected", reason: errorMessage(error) },
-          });
-        } catch {
-          // best-effort; the original error propagates
-        }
-      }
-      throw error;
-    }
-    selected = patterns.find((pattern) => pattern.id === selection.patternId);
-    if (selected === undefined) {
-      throw new Error("selected pattern disappeared between load and use");
-    }
-    if (deps.recordDecisionSelection !== undefined) {
-      await deps.recordDecisionSelection({
-        selection: { kind: "selected", patternId: selected.id },
-      });
-    }
-  }
-
-  // Memory context assembly. Memory must never fail a turn: loader errors
-  // are logged and the turn continues without the failed section. Each
-  // loaded section is sent as its own synthetic system message (null message
-  // source in the chat trace); a section that rendered nothing contributes
-  // no chunk at all.
+  // Memory context assembly, before the decision step so the article-memory
+  // share candidates can deduplicate against the turn's lexical recall (the
+  // decision state remains conversation-only, so the reorder has no
+  // behavioral effect on the decision itself). Memory must never fail a
+  // turn: loader errors are logged and the turn continues without the failed
+  // section. Each loaded section is sent as its own synthetic system message
+  // (null message source in the chat trace); a section that rendered nothing
+  // contributes no chunk at all.
   let profilesChunk: string | null = null;
   let temporalChunk: string | null = null;
   let recallChunk: string | null = null;
+  let recallFactKeys: string[] = [];
   if (deps.loadMemoryContext !== undefined) {
     const userText = work.messages
       .filter((message) => message.role === "user")
@@ -371,6 +304,7 @@ export async function processTurnWork(
         profilesChunk = loaded?.profileSection ?? null;
         temporalChunk = loaded?.temporalContext ?? null;
         recallChunk = loaded?.memoryContext ?? null;
+        recallFactKeys = [...(loaded?.recallFactKeys ?? [])];
       } catch (error) {
         console.warn(
           `[MEMORY] context assembly failed for turn ${work.turn.id}: ${errorMessage(error)}; continuing without memory`,
@@ -378,6 +312,221 @@ export async function processTurnWork(
         profilesChunk = null;
         temporalChunk = null;
         recallChunk = null;
+        recallFactKeys = [];
+      }
+    }
+  }
+
+  // Article-memory share candidates: cooldown-eligible accepted reactions,
+  // newest-first, deduplicated against this turn's recall fact keys. Loading
+  // is optional and degrading: any failure means "ask no article question
+  // this turn", never a failed chat turn.
+  let articleCandidates: readonly ArticleMemoryCandidate[] = [];
+  if (deps.loadArticleShareCandidates !== undefined) {
+    try {
+      const loaded = await deps.loadArticleShareCandidates({
+        turnId: work.turn.id,
+        recallFactKeys,
+      });
+      if (loaded !== null) articleCandidates = loaded;
+    } catch (error) {
+      console.warn(
+        `[ARTICLE] share candidates failed for turn ${work.turn.id}: ${errorMessage(error)}; continuing without article context`,
+      );
+      articleCandidates = [];
+    }
+  }
+  const articleShareAsked = articleCandidates.length > 0;
+
+  if (patterns.length > 0 || articleShareAsked) {
+    const state = decisionState(history, work.messages);
+    const baseRequest = patterns.length > 0
+      ? buildPatternChoiceRequest({
+          model: deps.decisionModel,
+          patterns,
+          state,
+        })
+      : {
+          model: deps.decisionModel,
+          state,
+          questions: {} as Record<string, never>,
+        };
+    const articleQuestion = articleShareAsked
+      ? buildArticleShareQuestion(articleCandidates)
+      : undefined;
+    const request: DecisionsRequest = articleQuestion === undefined
+      ? baseRequest
+      : {
+          model: baseRequest.model,
+          state: baseRequest.state,
+          questions: {
+            ...baseRequest.questions,
+            [articleQuestion.questionId]: articleQuestion.question,
+          },
+        };
+    // Round-trip the built request through the contract parser so what is
+    // sent is exactly what the contract validates.
+    const validated = parseDecisionsRequest(request);
+
+    // Decision request boundary: persisted before the provider call, one row
+    // per asked question (the per-(attempt, question) trace). This write is
+    // deliberate, not best-effort: a failure here fails the attempt rather
+    // than calling the provider with an unrecorded request.
+    if (deps.recordDecisionRequest !== undefined) {
+      for (const questionId of Object.keys(validated.questions)) {
+        await deps.recordDecisionRequest({ trace: { questionId, request: validated } });
+      }
+    }
+
+    let rawResponse: unknown;
+    try {
+      rawResponse = await deps.callDecisions(validated);
+    } catch (error) {
+      // Transport failure: record the actual error (best-effort — a trace
+      // write failure must never mask the original error) and rethrow so the
+      // engine records a failed turn.
+      if (deps.recordDecisionOutcome !== undefined) {
+        try {
+          for (const questionId of Object.keys(validated.questions)) {
+            await deps.recordDecisionOutcome({
+              trace: { questionId, request: validated },
+              outcome: decisionFailureTrace(error),
+            });
+          }
+        } catch {
+          // best-effort; the original error propagates
+        }
+      }
+      throw error;
+    }
+
+    let response: DecisionsResponse;
+    try {
+      response = parseDecisionsExchange(validated, rawResponse);
+    } catch (error) {
+      // Contract failure: a body arrived but did not validate.
+      if (deps.recordDecisionOutcome !== undefined) {
+        try {
+          for (const questionId of Object.keys(validated.questions)) {
+            await deps.recordDecisionOutcome({
+              trace: { questionId, request: validated },
+              outcome: { kind: "invalid", message: errorMessage(error) },
+            });
+          }
+        } catch {
+          // best-effort; the original error propagates
+        }
+      }
+      throw error;
+    }
+
+    // Decision outcome boundary: the full validated exchange, persisted
+    // BEFORE the selection step — so a rejected selection or a later chat
+    // failure still leaves the complete native response behind. This write
+    // is deliberate, not best-effort: a failure here fails the attempt rather
+    // than selecting from an unrecorded response.
+    if (deps.recordDecisionOutcome !== undefined) {
+      for (const questionId of Object.keys(validated.questions)) {
+        await deps.recordDecisionOutcome({
+          trace: { questionId, request: validated },
+          outcome: {
+            kind: "responded",
+            trace: {
+              questionId,
+              request: validated,
+              response,
+            },
+          },
+        });
+      }
+    }
+
+    // Selection step, separate from the boundary, per question. A rejection
+    // is recorded (best-effort: never masks the original error) and then
+    // rethrown, so the engine fails the attempt exactly as before.
+    if (patterns.length > 0) {
+      let selection;
+      try {
+        selection = selectResponsePattern(response, patterns);
+      } catch (error) {
+        if (deps.recordDecisionSelection !== undefined) {
+          try {
+            await deps.recordDecisionSelection({
+              questionId: DECISION_QUESTION_ID,
+              selection: { kind: "rejected", reason: errorMessage(error) },
+            });
+          } catch {
+            // best-effort; the original error propagates
+          }
+        }
+        throw error;
+      }
+      selected = patterns.find((pattern) => pattern.id === selection.patternId);
+      if (selected === undefined) {
+        throw new Error("selected pattern disappeared between load and use");
+      }
+      if (deps.recordDecisionSelection !== undefined) {
+        await deps.recordDecisionSelection({
+          questionId: DECISION_QUESTION_ID,
+          selection: { kind: "selected", patternId: selected.id },
+        });
+      }
+    }
+
+    // The article-share selection resolves the optional context question: a
+    // chosen candidate becomes this turn's article context chunk, `none`
+    // includes nothing. An unusable answer is an error, consistent with the
+    // pattern selection policy — no silent fallback.
+    if (articleShareAsked) {
+      let articleSelection;
+      try {
+        articleSelection = selectArticleShare(response, articleCandidates);
+      } catch (error) {
+        if (deps.recordDecisionSelection !== undefined) {
+          try {
+            await deps.recordDecisionSelection({
+              questionId: ARTICLE_SHARE_QUESTION_ID,
+              selection: { kind: "rejected", reason: errorMessage(error) },
+            });
+          } catch {
+            // best-effort; the original error propagates
+          }
+        }
+        throw error;
+      }
+      if (deps.recordDecisionSelection !== undefined) {
+        await deps.recordDecisionSelection({
+          questionId: ARTICLE_SHARE_QUESTION_ID,
+          // A `none` answer is the question's legitimate no-action outcome,
+          // not a rejection: the selection step succeeded and chose the
+          // permanent none option (the question's trace row carries
+          // choice `none` with selection `selected`). Only an unusable
+          // answer is a rejection, handled above.
+          selection: articleSelection.kind === "none"
+            ? { kind: "selected-none" }
+            : {
+                kind: "selected-article",
+                reactionId: articleSelection.candidate.reactionId,
+              },
+        });
+      }
+      if (articleSelection.kind === "selected") {
+        const chosen = articleSelection.candidate;
+        articleChunk = buildArticleShareContextForPrompt(chosen);
+        // The inclusion record is a prompt-inclusion event (never a share
+        // claim); a failed write is logged and never fails the turn.
+        if (deps.recordArticleShareInclusion !== undefined) {
+          try {
+            await deps.recordArticleShareInclusion({
+              turnId: work.turn.id,
+              reactionId: chosen.reactionId,
+            });
+          } catch (error) {
+            console.warn(
+              `[ARTICLE] share inclusion record failed for turn ${work.turn.id}: ${errorMessage(error)}; continuing`,
+            );
+          }
+        }
       }
     }
   }
@@ -394,6 +543,7 @@ export async function processTurnWork(
     ...(profilesChunk !== null ? { profiles: profilesChunk } : {}),
     ...(temporalChunk !== null ? { temporal: temporalChunk } : {}),
     ...(recallChunk !== null ? { recall: recallChunk } : {}),
+    ...(articleChunk !== null ? { article: articleChunk } : {}),
     ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
     ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
   });

@@ -52,6 +52,11 @@ import {
 import type { CanonicalRecallResponse } from "../memory/types.ts";
 import type { EngagementSummary } from "../engagement/types.ts";
 import { CanonicalRecallValidationError } from "../memory/recall.ts";
+import type { ArticleMemoriesResponse } from "../articles/types.ts";
+import {
+  ArticleMemoriesValidationError,
+  MAX_ARTICLE_MEMORIES_LIMIT,
+} from "../articles/retrieval.ts";
 
 /** Maximum accepted JSON request body size, in bytes. */
 export const MAX_BODY_BYTES = 64 * 1024;
@@ -103,6 +108,17 @@ export interface ApiServerDeps {
    * server-side by design; the response carries the values in force.
    */
   readonly engagement?: () => Promise<EngagementSummary>;
+  /**
+   * Programmatic article-memory retrieval: deterministic newest-first
+   * accepted memories with a caller-configurable limit (bounded by the
+   * domain's safe defaults and maxima). Independent of lexical recall — a
+   * read-only surface that never writes state. Absent when the article
+   * domain is not active: the route then reports the surface as unavailable
+   * rather than serving an empty imitation of it.
+   */
+  readonly articleMemories?: (input: {
+    readonly limit?: number;
+  }) => Promise<ArticleMemoriesResponse>;
 }
 
 export interface ApiServer {
@@ -303,6 +319,23 @@ function parseThreadLimit(query: URLSearchParams): number | undefined {
   return value;
 }
 
+/**
+ * Parse the optional `limit` of the article-memory retrieval: null when
+ * absent (the domain's own default applies), the bounded value when valid,
+ * undefined when malformed or out of the transport-level range.
+ */
+function parseArticleMemoriesLimit(query: URLSearchParams): number | null | undefined {
+  const raw = query.get("limit");
+  if (raw === null) {
+    return null;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > MAX_ARTICLE_MEMORIES_LIMIT) {
+    return undefined;
+  }
+  return value;
+}
+
 /** Upper sanity bound for a client-supplied seq (safe-integer range). */
 const MAX_SEQ_VALUE = Number.MAX_SAFE_INTEGER;
 
@@ -370,6 +403,7 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       url.pathname !== "/v1/messages" &&
       url.pathname !== "/v1/thread" &&
       url.pathname !== "/v1/memory/recall" &&
+      url.pathname !== "/v1/articles/memories" &&
       url.pathname !== "/v1/engagement"
     ) {
       writeGenericError(response, 404, "not_found");
@@ -397,6 +431,11 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       return;
     }
     if (url.pathname === "/v1/engagement" && request.method !== "GET") {
+      writeJson(response, 405, { error: "method_not_allowed" }, { allow: "GET" });
+      request.resume();
+      return;
+    }
+    if (url.pathname === "/v1/articles/memories" && request.method !== "GET") {
       writeJson(response, 405, { error: "method_not_allowed" }, { allow: "GET" });
       request.resume();
       return;
@@ -520,6 +559,34 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
         writeJson(response, 200, { ...result });
       } catch (error) {
         if (error instanceof CanonicalRecallValidationError) {
+          writeJson(response, 400, { error: "invalid_query", message: error.message });
+          return;
+        }
+        throw error;
+      }
+      return;
+    }
+
+    if (route === "GET /v1/articles/memories") {
+      // The article-memory retrieval surface exists only when the article
+      // domain is active; reporting it as unavailable (not 404) distinguishes
+      // an unprovisioned deployment from an unknown route.
+      if (deps.articleMemories === undefined) {
+        writeGenericError(response, 503, "unavailable");
+        return;
+      }
+      const limit = parseArticleMemoriesLimit(url.searchParams);
+      if (limit === undefined) {
+        writeGenericError(response, 400, "bad_request");
+        return;
+      }
+      try {
+        const result = await deps.articleMemories(limit === null ? {} : { limit });
+        // Spread into a fresh literal: writeJson's parameter is a string-index
+        // record, which an interface type does not structurally satisfy.
+        writeJson(response, 200, { ...result });
+      } catch (error) {
+        if (error instanceof ArticleMemoriesValidationError) {
           writeJson(response, 400, { error: "invalid_query", message: error.message });
           return;
         }

@@ -168,9 +168,12 @@ const OBSERVATION_VECTOR =
 interface FactCandidateRow {
   fact_key: string;
   subject_id: string;
+  subject_role: string;
   kind: string;
   claim: string;
-  turn_id: string;
+  turn_id: string | null;
+  source_type: string;
+  article_reaction_id: string | null;
   condition: string | null;
   consequence: string | null;
   topics: string[];
@@ -182,6 +185,8 @@ interface FactCandidateRow {
 interface ObservationCandidateRow {
   canonical_observation_id: string;
   subject_id: string;
+  subject_role: string;
+  article_sourced: boolean;
   kind: string;
   claim: string;
   condition: string | null;
@@ -256,51 +261,75 @@ export async function recallCanonical(
       : "o.first_observed_at < $4::timestamptz AND o.last_observed_at >= $3::timestamptz")
     : "";
   const factSql = mode === "timeline"
-    ? `SELECT f.fact_key, f.subject_id, f.kind, f.claim, f.turn_id, f.condition,
+    ? `SELECT f.fact_key, f.subject_id, s.role AS subject_role, f.kind, f.claim, f.turn_id, f.source_type, f.article_reaction_id, f.condition,
               f.consequence, f.topics, f.observed_at, f.explicitness,
               NULL::real AS text_score
        FROM memory_fact f
+       JOIN memory_subject s ON s.id = f.subject_id
        WHERE ${factWindowPredicate}
        ORDER BY f.observed_at DESC
        LIMIT $1`
     : emptyQueryFallback
-      ? `SELECT f.fact_key, f.subject_id, f.kind, f.claim, f.turn_id, f.condition,
+      ? `SELECT f.fact_key, f.subject_id, s.role AS subject_role, f.kind, f.claim, f.turn_id, f.source_type, f.article_reaction_id, f.condition,
               f.consequence, f.topics, f.observed_at, f.explicitness,
               NULL::real AS text_score
        FROM memory_fact f
+       JOIN memory_subject s ON s.id = f.subject_id
        ORDER BY f.observed_at DESC
        LIMIT $1`
-      : `SELECT f.fact_key, f.subject_id, f.kind, f.claim, f.turn_id, f.condition,
+      : `SELECT f.fact_key, f.subject_id, s.role AS subject_role, f.kind, f.claim, f.turn_id, f.source_type, f.article_reaction_id, f.condition,
               f.consequence, f.topics, f.observed_at, f.explicitness,
               ts_rank(${FACT_VECTOR}, q.query) AS text_score
        FROM memory_fact f
+       JOIN memory_subject s ON s.id = f.subject_id
        CROSS JOIN (SELECT websearch_to_tsquery('english', $2) AS query) q
        WHERE q.query @@ ${FACT_VECTOR}${dateWindow ? ` AND ${factWindowPredicate}` : ""}
        ORDER BY text_score DESC, f.observed_at DESC
        LIMIT $1`;
   const observationSql = mode === "timeline"
-    ? `SELECT o.canonical_observation_id, o.subject_id, o.kind, o.claim,
+    ? `SELECT o.canonical_observation_id, o.subject_id, s.role AS subject_role,
+              EXISTS (
+                SELECT 1 FROM memory_fact sf
+                WHERE sf.fact_key = ANY(o.source_fact_keys)
+                  AND sf.source_type = 'article'
+              ) AS article_sourced,
+              o.kind, o.claim,
               o.condition, o.consequence, o.topics, o.last_observed_at,
               o.evidence_strength, o.support_count, o.distinct_day_count,
               NULL::real AS text_score
        FROM memory_canonical_observation o
+       JOIN memory_subject s ON s.id = o.subject_id
        WHERE o.status = 'active' AND ${observationWindowPredicate}
        ORDER BY o.last_observed_at DESC
        LIMIT $1`
     : emptyQueryFallback
-      ? `SELECT o.canonical_observation_id, o.subject_id, o.kind, o.claim,
+      ? `SELECT o.canonical_observation_id, o.subject_id, s.role AS subject_role,
+              EXISTS (
+                SELECT 1 FROM memory_fact sf
+                WHERE sf.fact_key = ANY(o.source_fact_keys)
+                  AND sf.source_type = 'article'
+              ) AS article_sourced,
+              o.kind, o.claim,
               o.condition, o.consequence, o.topics, o.last_observed_at,
               o.evidence_strength, o.support_count, o.distinct_day_count,
               NULL::real AS text_score
        FROM memory_canonical_observation o
+       JOIN memory_subject s ON s.id = o.subject_id
        WHERE o.status = 'active'
        ORDER BY o.last_observed_at DESC
        LIMIT $1`
-      : `SELECT o.canonical_observation_id, o.subject_id, o.kind, o.claim,
+      : `SELECT o.canonical_observation_id, o.subject_id, s.role AS subject_role,
+              EXISTS (
+                SELECT 1 FROM memory_fact sf
+                WHERE sf.fact_key = ANY(o.source_fact_keys)
+                  AND sf.source_type = 'article'
+              ) AS article_sourced,
+              o.kind, o.claim,
               o.condition, o.consequence, o.topics, o.last_observed_at,
               o.evidence_strength, o.support_count, o.distinct_day_count,
               ts_rank(${OBSERVATION_VECTOR}, q.query) AS text_score
        FROM memory_canonical_observation o
+       JOIN memory_subject s ON s.id = o.subject_id
        CROSS JOIN (SELECT websearch_to_tsquery('english', $2) AS query) q
        WHERE o.status = 'active' AND q.query @@ ${OBSERVATION_VECTOR}${dateWindow ? ` AND ${observationWindowPredicate}` : ""}
        ORDER BY text_score DESC, o.last_observed_at DESC
@@ -335,9 +364,14 @@ export async function recallCanonical(
       type: "fact",
       id: row.fact_key,
       subject: row.subject_id,
+      subjectRole: row.subject_role as "user" | "assistant" | "relationship",
       kind: row.kind,
       claim: row.claim,
-      turnId: row.turn_id,
+      ...(row.turn_id !== null ? { turnId: row.turn_id } : {}),
+      sourceType: row.source_type === "article" ? "article" : "conversation",
+      ...(row.article_reaction_id !== null
+        ? { articleReactionId: row.article_reaction_id }
+        : {}),
       ...(row.condition !== null ? { condition: row.condition } : {}),
       ...(row.consequence !== null ? { consequence: row.consequence } : {}),
       topics: row.topics,
@@ -365,8 +399,10 @@ export async function recallCanonical(
       type: "observation",
       id: row.canonical_observation_id,
       subject: row.subject_id,
+      subjectRole: row.subject_role as "user" | "assistant" | "relationship",
       kind: row.kind,
       claim: row.claim,
+      sourceType: row.article_sourced ? "article" : "conversation",
       ...(row.condition !== null ? { condition: row.condition } : {}),
       ...(row.consequence !== null ? { consequence: row.consequence } : {}),
       topics: row.topics,
