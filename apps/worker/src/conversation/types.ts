@@ -30,6 +30,7 @@ export type ChatChunkName =
   | "profiles"
   | "temporal"
   | "recall"
+  | "article"
   | "guidance"
   | "conversation";
 
@@ -212,12 +213,18 @@ export interface DecisionOutcomeTracePayload {
 
 /**
  * The outcome of the selection step, recorded separately from the decision
- * boundary: either the selected pattern, or the rejection with its reason
- * (the `UnusableDecisionError` message). `rejected` never overwrites or
- * invents the boundary above; it only records how the selection step resolved.
+ * boundary: the selected response pattern, the selected article-memory
+ * candidate (the article-share question's own selection), the article-share
+ * question's legitimate no-action outcome (`selected-none`: the answer named
+ * the permanent `none` option, so the selection step succeeded and includes
+ * nothing — never a rejection), or the rejection with its reason (the
+ * `UnusableDecisionError` message). `rejected` never overwrites or invents
+ * the boundary above; it only records how the selection step resolved.
  */
 export type DecisionSelectionTrace =
   | { readonly kind: "selected"; readonly patternId: string }
+  | { readonly kind: "selected-article"; readonly reactionId: string }
+  | { readonly kind: "selected-none" }
   | { readonly kind: "rejected"; readonly reason: string };
 
 /**
@@ -387,7 +394,20 @@ export interface TurnAttemptTrace {
   readonly snapshotRecordedAt: string | null;
   readonly context: readonly TraceContextMessage[];
   readonly patterns: readonly TracePatternSnapshot[];
+  /**
+   * The primary decision boundary, kept for the report's established shape:
+   * the response-pattern question's row, falling back to the only recorded
+   * row for attempts that asked a single non-pattern question. Prefer
+   * `decisions` for anything question-aware.
+   */
   readonly decision: TraceDecision | null;
+  /**
+   * Every decision question recorded for the attempt, one entry per
+   * (attempt, question) trace row in question-id order — the response-pattern
+   * decision and, when asked, the article-memory share decision with its own
+   * boundary and selection outcome.
+   */
+  readonly decisions: readonly TraceDecision[];
   readonly chat: TraceChat | null;
 }
 

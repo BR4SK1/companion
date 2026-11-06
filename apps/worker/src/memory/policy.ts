@@ -134,6 +134,34 @@ export function evaluateObservationCandidate(
   const supportFacts = item.sourceFactIds
     .map((id) => factsById.get(id))
     .filter((fact): fact is MemoryFact => fact !== undefined);
+
+  // Source-aware evidence counting. An observation's support set is
+  // single-source by construction (each consolidation run's fact set is one
+  // source); a mixed set is a provenance-isolation violation, not a policy
+  // outcome. An empty support set (every cited fact missing) classifies as
+  // neither source and keeps the legacy breadth rules below.
+  const articleSourced = supportFacts.length > 0 &&
+    supportFacts.every((fact) => fact.turnKey === null);
+  const turnSourced = supportFacts.length > 0 &&
+    supportFacts.every((fact) => fact.turnKey !== null);
+  if (supportFacts.length > 0 && !articleSourced && !turnSourced) {
+    throw new Error("observation candidate has mixed-source support evidence");
+  }
+
+  if (articleSourced) {
+    // Article-sourced reactions contribute to assistant interests/preferences
+    // evidence only: the supported kind is the preference kind, and the
+    // evidence breadth is distinct independent reactions — never turns (an
+    // article fact has no turn; counting one would be false turn evidence).
+    if (item.kind !== "preference") {
+      return { eligible: false, reason: "unsupported_kind_for_source" };
+    }
+    if (distinctReactionCount(supportFacts) < 2) {
+      return { eligible: false, reason: "insufficient_independent_sources" };
+    }
+    return { eligible: true };
+  }
+
   const distinctTurns = new Set(supportFacts.map((fact) => fact.turnKey));
   if (item.kind === "habit" || item.kind === "conditional_pattern") {
     if (distinctTurns.size < 2) {
@@ -149,6 +177,22 @@ export function evaluateObservationCandidate(
     }
   }
   return { eligible: true };
+}
+
+/**
+ * Distinct independent article reactions among support facts. Each accepted
+ * reaction produces exactly one fact, so this equals the support count while
+ * that invariant holds; the distinct count stays correct even if it ever
+ * breaks.
+ */
+export function distinctReactionCount(
+  supportFacts: readonly MemoryFact[],
+): number {
+  return new Set(
+    supportFacts
+      .map((fact) => fact.articleReactionId)
+      .filter((id): id is string => id !== null),
+  ).size;
 }
 
 /**

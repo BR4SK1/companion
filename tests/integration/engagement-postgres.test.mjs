@@ -30,6 +30,7 @@ import {
 } from "../../libraries/postgres/src/index.ts";
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
+import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { engagementMigrations } from "../../apps/worker/src/engagement/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { createEngagementStore } from "../../apps/worker/src/engagement/store.ts";
@@ -76,6 +77,7 @@ describe("engagement domain and ingest timing (PostgreSQL)", { skip: !hasDatabas
     await runMigrations(pool, [
       ...conversationMigrations,
       ...memoryMigrations,
+      ...articleMigrations,
       ...engagementMigrations,
     ]);
   });
@@ -108,6 +110,7 @@ describe("engagement domain and ingest timing (PostgreSQL)", { skip: !hasDatabas
     const second = await runMigrations(pool, [
       ...conversationMigrations,
       ...memoryMigrations,
+      ...articleMigrations,
       ...engagementMigrations,
     ]);
     assert.deepEqual(second.applied, []);
@@ -117,6 +120,9 @@ describe("engagement domain and ingest timing (PostgreSQL)", { skip: !hasDatabas
       "0004_chat_identity",
       "0005_message_timing",
       "0003_memory_work",
+      "0007_article_work",
+      "0008_article_share_and_evidence",
+      "0009_article_observation_claim",
       "0006_engagement_assessment",
     ]);
   });

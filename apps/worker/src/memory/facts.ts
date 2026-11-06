@@ -23,7 +23,8 @@ type SqlExecutor = PostgresPool | PostgresPoolClient;
 interface FactRow {
   id: string;
   fact_key: string;
-  turn_id: string;
+  turn_id: string | null;
+  article_reaction_id: string | null;
   subject_id: string;
   kind: string;
   claim: string;
@@ -207,6 +208,7 @@ export function normalizeProductionFact(
     }),
     turnId: sourceTurn.turnId,
     turnKey: sourceTurn.turnKey,
+    articleReactionId: null,
     subject: item.subject,
     kind: item.kind,
     claim,
@@ -305,7 +307,10 @@ async function insertProductionFacts(
     const row = inserted.rows[0];
     if (row === undefined) continue;
     insertedCount += 1;
-    const sourceMessageIds = sourceMessageIdsByTurn.get(fact.turnKey) ?? [];
+    // Only turn-sourced facts have source messages; article-sourced facts
+    // carry their provenance in the reaction link instead.
+    const sourceMessageIds =
+      fact.turnKey !== null ? (sourceMessageIdsByTurn.get(fact.turnKey) ?? []) : [];
     if (sourceMessageIds.length > 0) {
       await client.query(
         `INSERT INTO memory_fact_source_message (fact_id, position, message_id)
@@ -324,6 +329,7 @@ function mapFact(row: FactRow): MemoryFact {
     factKey: row.fact_key,
     turnId: row.turn_id,
     turnKey: row.turn_id,
+    articleReactionId: row.article_reaction_id,
     subject: row.subject_id,
     kind: row.kind as MemoryFact["kind"],
     claim: row.claim,
@@ -338,7 +344,7 @@ function mapFact(row: FactRow): MemoryFact {
   };
 }
 
-const FACT_COLUMNS = `id, fact_key, turn_id, subject_id, kind, claim, condition,
+const FACT_COLUMNS = `id, fact_key, turn_id, article_reaction_id, subject_id, kind, claim, condition,
   consequence, topics, observed_at, explicitness, evidence_basis,
   extraction_version, ingest_version`;
 

@@ -295,17 +295,27 @@ function assertArtifactForPromotion(
   ) {
     throw new Error(`${label} has an invalid evidence date range`);
   }
-  const distinctTurns = new Set(supportFacts.map((fact) => fact.turnKey));
+  // Source-aware evidence: a support set is single-source by construction
+  // (each consolidation run's fact set is one source); a mixed set is a
+  // provenance-isolation violation, not a policy outcome.
+  const articleSourced = supportFacts.length > 0 &&
+    supportFacts.every((fact) => fact.turnKey === null);
+  const turnSourced = supportFacts.length > 0 &&
+    supportFacts.every((fact) => fact.turnKey !== null);
+  if (!articleSourced && !turnSourced) {
+    throw new Error(`${label} has mixed-source evidence`);
+  }
+  // Turn breadth counts non-null turn keys only: an article-sourced
+  // observation honestly records zero turn evidence. The recorded breadth is
+  // verified before the policy evaluation, exactly as before.
+  const distinctTurns = new Set(
+    supportFacts
+      .map((fact) => fact.turnKey)
+      .filter((turnKey): turnKey is string => turnKey !== null),
+  );
   const distinctDays = new Set(
     supportFacts.map((fact) => behavioralDay(fact.observedAt, behavior)),
   );
-  if (
-    artifact.distinctTurnCount !== distinctTurns.size ||
-    artifact.distinctDayCount !== distinctDays.size
-  ) {
-    throw new Error(`${label} has invalid evidence breadth`);
-  }
-
   const item = {
     subject: artifact.subject,
     kind: artifact.kind as CanonicalSnapshot["kind"],
@@ -316,6 +326,22 @@ function assertArtifactForPromotion(
     sourceFactIds: artifact.sourceFactIds,
     contradictionFactIds: artifact.contradictionFactIds,
   } as const;
+  if (articleSourced) {
+    if (
+      artifact.distinctTurnCount !== 0 ||
+      // The artifact's recorded day breadth must equal the breadth
+      // recomputed from the supporting facts under the same behavioral
+      // boundary — a corrupted artifact is rejected, never promoted.
+      artifact.distinctDayCount !== distinctDays.size
+    ) {
+      throw new Error(`${label} has invalid evidence breadth`);
+    }
+  } else if (
+    artifact.distinctTurnCount !== distinctTurns.size ||
+    artifact.distinctDayCount !== distinctDays.size
+  ) {
+    throw new Error(`${label} has invalid evidence breadth`);
+  }
   const policy = evaluateObservationCandidate(item, factsById);
   const expectedStrength = evidenceStrengthOf(item, supportFacts as MemoryFact[], behavior);
   if (artifact.evidenceStrength !== expectedStrength) {
@@ -324,6 +350,52 @@ function assertArtifactForPromotion(
   if (!validDate(artifact.createdAt) || !validDate(artifact.updatedAt)) {
     throw new Error(`${label} has invalid artifact dates`);
   }
+
+  if (articleSourced) {
+    // Article-sourced reactions contribute to assistant interests/preferences
+    // evidence only: the preference kind, the artifact's own subject shared
+    // by every support fact, and breadth in distinct independent reactions —
+    // never turn counts (there is no turn; recording one would be false turn
+    // evidence).
+    if (artifact.kind !== "preference") {
+      throw new Error(`${label} has an unsupported kind for article-sourced evidence`);
+    }
+    const subjects = new Set(supportFacts.map((fact) => fact.subject));
+    if (subjects.size !== 1 || !subjects.has(artifact.subject)) {
+      throw new Error(`${label} has a subject-isolation violation`);
+    }
+    const distinctReactions = new Set(
+      supportFacts
+        .map((fact) => fact.articleReactionId)
+        .filter((id): id is string => id !== null),
+    ).size;
+    if (!policy.eligible) {
+      return {
+        eligible: false,
+        reason: policy.reason === "event_specific_temporal_anchor"
+          ? "event_specific_temporal_anchor"
+          : policy.reason === "insufficient_independent_sources"
+            ? "insufficient_recurrence_evidence"
+            : "source_policy_rejected",
+        distinctTurnCount: 0,
+        distinctDayCount: distinctDays.size,
+      };
+    }
+    if (distinctReactions < 2) {
+      return {
+        eligible: false,
+        reason: "insufficient_recurrence_evidence",
+        distinctTurnCount: 0,
+        distinctDayCount: distinctDays.size,
+      };
+    }
+    return {
+      eligible: true,
+      distinctTurnCount: 0,
+      distinctDayCount: distinctDays.size,
+    };
+  }
+
   if (!policy.eligible) {
     return {
       eligible: false,

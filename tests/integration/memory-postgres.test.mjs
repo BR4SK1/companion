@@ -27,6 +27,7 @@ import {
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
+import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { loadMemoryConfig } from "../../apps/worker/src/memory/config.ts";
 import { loadMemoryConfiguration } from "../../apps/worker/src/memory/subjects.ts";
 import { ingestTurns } from "../../apps/worker/src/memory/ingest.ts";
@@ -238,7 +239,15 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
   before(async () => {
     pool = createPostgresPool({ connectionString: DATABASE_URL });
     store = createConversationStore(pool);
-    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations]);
+    // The memory extension migrations (article domain) extend memory_fact and
+    // the trace tables the memory surfaces read, so the article set belongs
+    // to this suite's composition, exactly like the worker composition in
+    // main.ts.
+    await runMigrations(pool, [
+      ...conversationMigrations,
+      ...memoryMigrations,
+      ...articleMigrations,
+    ]);
   });
 
   after(async () => {

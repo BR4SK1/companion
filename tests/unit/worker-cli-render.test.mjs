@@ -14,6 +14,7 @@ import {
   renderAttempt,
   renderChat,
   renderDecision,
+  renderDecisionAnnotation,
   renderReport,
 } from "../../apps/worker/src/cli.ts";
 
@@ -426,5 +427,137 @@ describe("worker trace CLI rendering", () => {
     assert.ok(text.includes("selection: selected"));
     assert.ok(text.includes("state: invalid"));
     assert.ok(text.includes('error message: "bad contract"'));
+  });
+});
+
+describe("worker trace CLI rendering: per-question decisions and the article action", () => {
+  const articleDecision = {
+    ...baseDecision,
+    questionId: "article_memory_share",
+    choice: "9e3d1f5e-1111-4222-8333-444455556666",
+    selection: "selected",
+  };
+
+  it("renders every recorded decision of a multi-question attempt in question-id order", () => {
+    const lines = renderAttempt({
+      ...baseAttempt,
+      decisions: [
+        articleDecision,
+        { ...baseDecision, choice: "concise", selection: "selected" },
+      ],
+    });
+    const text = lines.join("\n");
+    assert.ok(
+      text.includes("decisions (2 recorded questions):"),
+      `expected the multi-decision header, got:\n${text}`,
+    );
+    const articleAt = text.indexOf("question article_memory_share");
+    const patternAt = text.indexOf("question response_pattern");
+    assert.ok(articleAt !== -1, `missing the article decision, got:\n${text}`);
+    assert.ok(patternAt !== -1, `missing the pattern decision, got:\n${text}`);
+    assert.ok(articleAt < patternAt, "decisions render in question-id order");
+  });
+
+  it("annotates the article action as prompt inclusion, never a share claim", () => {
+    const lines = renderAttempt({
+      ...baseAttempt,
+      decisions: [articleDecision],
+      chat: {
+        ...baseChat,
+        messages: [
+          {
+            position: 1,
+            role: "system",
+            content: "An article you read earlier, offered as background context.",
+            sourceMessageId: null,
+            chunk: "article",
+          },
+        ],
+      },
+    });
+    const text = lines.join("\n");
+    assert.ok(
+      text.includes(
+        "article action: context-inclusion decision — prompt inclusion only, never a share claim",
+      ),
+      `expected the article action annotation, got:\n${text}`,
+    );
+    assert.ok(
+      text.includes("article context in the sent chat request: present"),
+      `expected the chat-evidence line, got:\n${text}`,
+    );
+    assert.ok(
+      !/\bshared\b/.test(text),
+      `the trace must never claim a memory was shared, got:\n${text}`,
+    );
+  });
+
+  it("reports the article context as absent when the none option was chosen", () => {
+    const lines = renderAttempt({
+      ...baseAttempt,
+      decisions: [{ ...articleDecision, choice: "none" }],
+      chat: {
+        ...baseChat,
+        messages: [
+          {
+            position: 1,
+            role: "system",
+            content: "identity",
+            sourceMessageId: null,
+            chunk: "identity",
+          },
+        ],
+      },
+    });
+    const text = lines.join("\n");
+    assert.ok(text.includes("choice: none"));
+    assert.ok(
+      text.includes("article context in the sent chat request: absent"),
+      `expected the absent marker, got:\n${text}`,
+    );
+    assert.ok(!/\bshared\b/.test(text));
+  });
+
+  it("makes no inclusion claim when the chat request was never recorded", () => {
+    const lines = renderAttempt({
+      ...baseAttempt,
+      decisions: [articleDecision],
+      chat: null,
+    });
+    const text = lines.join("\n");
+    assert.ok(
+      text.includes("article context in the sent chat request: (chat not recorded)"),
+    );
+    assert.ok(!/\bshared\b/.test(text));
+  });
+
+  it("annotates only the article-share question", () => {
+    assert.deepEqual(
+      renderDecisionAnnotation({ ...baseDecision }, null),
+      [],
+    );
+    assert.deepEqual(
+      renderDecisionAnnotation(
+        { ...baseDecision, questionId: "article_memory_share" },
+        null,
+      ),
+      [
+        "    article action: context-inclusion decision — prompt inclusion only, never a share claim",
+        "    article context in the sent chat request: (chat not recorded)",
+      ],
+    );
+  });
+
+  it("leaves the response-pattern decision and legacy fixtures unannotated", () => {
+    // A legacy-shaped attempt (only the primary decision field, no
+    // decisions array) renders exactly the pre-existing block.
+    const lines = renderAttempt({
+      ...baseAttempt,
+      decision: { ...baseDecision, selection: "selected" },
+    });
+    const text = lines.join("\n");
+    assert.ok(text.includes("decision (choice, question response_pattern):"));
+    assert.ok(!text.includes("article action:"));
+    assert.ok(!text.includes("decisions ("));
   });
 });

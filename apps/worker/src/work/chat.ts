@@ -17,12 +17,15 @@
  *                     relative order the single-memory-message layout used.
  * 3. `temporal`     — optional recent temporal memory summaries.
  * 4. `recall`       — optional long-term canonical recall for this turn.
- * 5. `guidance`     — the selected response pattern's response guidance
+ * 5. `article`      — optional per-turn article-memory context (the chosen
+ *                     article-memory share decision), placed after recall so
+ *                     the lexical chunk stays first among memory sections.
+ * 6. `guidance`     — the selected response pattern's response guidance
  *                     (absent when no pattern was selected — with no
  *                     patterns enabled, or none selected, the request simply
  *                     carries no guidance chunk; fallback policy for missing
  *                     selections is unresolved).
- * 6. `conversation` — the prior-turn history (oldest first, bounded to the
+ * 7. `conversation` — the prior-turn history (oldest first, bounded to the
  *                     most recent window by `getThreadContext`) followed by
  *                     the exact user messages grouped into the turn.
  *
@@ -50,7 +53,8 @@ export interface AssembledChatMessage {
   readonly chunk: ChatChunkName;
   /**
    * The conversation_message id for `conversation` messages; null for every
-   * synthetic system chunk (identity, profiles, temporal, recall, guidance).
+   * synthetic system chunk (identity, profiles, temporal, recall, article,
+   * guidance).
    */
   readonly sourceMessageId: string | null;
 }
@@ -78,6 +82,12 @@ export interface BuildChatRequestParams {
   readonly temporal?: string | null;
   /** Optional long-term-recall chunk. */
   readonly recall?: string | null;
+  /**
+   * Optional per-turn article-memory context chunk (the chosen candidate of
+   * the article-memory share decision). Rendered by the article domain; the
+   * chat assembly only classifies it as its own chunk.
+   */
+  readonly article?: string | null;
   readonly temperature?: number;
   readonly maxTokens?: number;
 }
@@ -111,6 +121,7 @@ export function buildChatPrompt(
     ["profiles", params.profiles],
     ["temporal", params.temporal],
     ["recall", params.recall],
+    ["article", params.article],
   ] as const) {
     if (hasContent(section)) {
       messages.push({

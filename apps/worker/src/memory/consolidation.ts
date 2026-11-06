@@ -137,7 +137,14 @@ function normalizeOptionalText(value: string, maxChars: number): string | undefi
   return normalized || undefined;
 }
 
-function buildObservationDocument(
+/**
+ * Build one observation document (the accepted-artifact shape) from a
+ * consolidation item and its resolved facts. Source-aware: turn breadth is
+ * counted over the support facts' non-null turn keys only, so an
+ * article-sourced observation honestly records zero turn evidence (its
+ * breadth is distinct independent reactions, validated at promotion time).
+ */
+export function buildObservationDocument(
   item: ConsolidationItem,
   factsById: ReadonlyMap<string, MemoryFact>,
   run: { runId: string; observationSetId: string; factSetId: string; consolidationVersion: string },
@@ -198,7 +205,11 @@ function buildObservationDocument(
       consequence,
       topics: [...item.topics],
       supportCount: supportIds.length,
-      distinctTurnCount: new Set(supportFacts.map((fact) => fact.turnKey)).size,
+      distinctTurnCount: new Set(
+        supportFacts
+          .map((fact) => fact.turnKey)
+          .filter((turnKey): turnKey is string => turnKey !== null),
+      ).size,
       distinctDayCount: new Set(supportFacts.map((fact) => behavioralDay(fact.observedAt, behavior))).size,
       contradictionCount: contradictionIds.length,
       firstObservedAt: new Date(Math.min(...observedTimes)),
@@ -388,7 +399,13 @@ async function consolidateObservations(
     );
   }
 
-  const factsForPrompt = facts.map((fact) => ({
+  // Turn-sourced facts only: observation consolidation builds evidence from
+  // conversation turns; article-sourced facts (turnKey null) carry their
+  // provenance in the reaction link and never feed turn consolidation.
+  const turnFacts = facts.filter(
+    (fact): fact is MemoryFact & { turnKey: string } => fact.turnKey !== null,
+  );
+  const factsForPrompt = turnFacts.map((fact) => ({
     id: factIdentifier(fact),
     subject: fact.subject,
     kind: fact.kind,
