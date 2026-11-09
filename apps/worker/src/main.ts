@@ -40,8 +40,15 @@ import { loadEngagementBands } from "./engagement/bands.ts";
 import { createEngagementStore } from "./engagement/store.ts";
 import { memoryMigrations } from "./memory/migrations.ts";
 import { articleMigrations } from "./articles/migrations.ts";
+import { relationshipMigrations } from "./relationship/migrations.ts";
+import {
+  createRelationshipStore,
+  loadRelationshipConfiguration,
+  RelationshipConfigurationError,
+} from "./relationship/store.ts";
+import { renderRelationshipContext } from "./relationship/runtime.ts";
 import { loadMemoryConfig } from "./memory/config.ts";
-import { createMemoryLlmCaller } from "./memory/llm.ts";
+import { createMemoryLlmCaller, taskPresets } from "./memory/llm.ts";
 import { startArticleRuntime } from "./articles/runner.ts";
 import {
   loadArticleShareContext,
@@ -112,6 +119,7 @@ async function main(): Promise<void> {
       ...memoryMigrations,
       ...engagementMigrations,
       ...articleMigrations,
+      ...relationshipMigrations,
     ]);
     if (migrations.applied.length > 0) {
       console.log(`applied migrations: ${migrations.applied.join(", ")}`);
@@ -141,6 +149,38 @@ async function main(): Promise<void> {
         "[ENGAGEMENT] band configuration not provisioned (engagement_bands is empty); engagement stays disabled as a no-op until the row is provisioned and the worker restarts",
       );
     }
+
+    // Relationship/familiarity is a database-configured domain. Missing or
+    // invalid configuration disables only this optional context/learning
+    // feature; no type, tier, day boundary, or question content is invented.
+    let relationshipStore: ReturnType<typeof createRelationshipStore> | undefined;
+    try {
+      const relationshipConfiguration = await loadRelationshipConfiguration(pool);
+      if (relationshipConfiguration === null) {
+        console.warn(
+          "[RELATIONSHIP] configuration not provisioned (relationship_settings singleton is missing); provision relationship_settings, relationship_tier, relationship_question_type, and enabled relationship_question rows, then restart to enable relationship context and answer learning",
+        );
+      } else {
+        relationshipStore = createRelationshipStore({ pool, configuration: relationshipConfiguration });
+      }
+    } catch (error) {
+      if (error instanceof RelationshipConfigurationError) {
+        console.warn(
+          `[RELATIONSHIP] invalid configuration (${error.message}); relationship context and answer learning stay disabled until configuration is corrected and the worker restarts`,
+        );
+      } else {
+        throw error;
+      }
+    }
+    const relationshipCallLlm = relationshipStore === undefined
+      ? undefined
+      : createMemoryLlmCaller({
+          url: `${memoryConfig.openrouterBaseUrl}/chat/completions`,
+          apiKey: config.openrouter.apiKey,
+          model: memoryConfig.model,
+          timeoutMs: memoryConfig.chatTimeoutMs,
+        });
+    const relationshipExtractionPreset = taskPresets(memoryConfig).memoryFactExtraction;
 
     const store = createConversationStore(pool, {
       clientTimeMaxAheadMs: config.clientTimeMaxAheadMs,
@@ -347,6 +387,8 @@ async function main(): Promise<void> {
     // Const alias so the recall closure can rely on the provisioned
     // configuration's narrowing (a captured `let` would not stay narrowed).
     const provisionedMemoryConfiguration = memoryConfiguration;
+    const provisionedRelationshipStore = relationshipStore;
+    const provisionedRelationshipCallLlm = relationshipCallLlm;
     api = createApiServer({
       store,
       token: config.apiToken,
@@ -496,6 +538,25 @@ async function main(): Promise<void> {
                 }),
               ),
             loadMemoryContext,
+            ...(provisionedRelationshipStore !== undefined &&
+                provisionedRelationshipCallLlm !== undefined
+              ? {
+                  loadRelationshipContext: async () =>
+                    renderRelationshipContext(
+                      await provisionedRelationshipStore.getSummary(new Date()),
+                    ),
+                  extractRelationshipAnswers: (input: {
+                    readonly userText: string;
+                    readonly assistantText: string;
+                  }) =>
+                    provisionedRelationshipStore.extractAnswers({
+                      userText: input.userText,
+                      assistantText: input.assistantText,
+                      callLlm: provisionedRelationshipCallLlm,
+                      taskPreset: relationshipExtractionPreset,
+                    }),
+                }
+              : {}),
             ...(articleRuntime !== undefined
               ? {
                   loadArticleShareCandidates: (input: {
@@ -519,6 +580,12 @@ async function main(): Promise<void> {
         ownerLabel: "companion-worker",
         log: (message) => console.log(message),
         onTurnPublished: (turnId) => memoryRuntime?.onTurnPublished(turnId),
+        ...(provisionedRelationshipStore !== undefined
+          ? {
+              recordRelationshipAnswers: (client, answers) =>
+                provisionedRelationshipStore.recordAnswers(client, answers),
+            }
+          : {}),
       },
       { signal: shutdown.signal },
     );

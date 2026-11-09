@@ -20,12 +20,14 @@
  * 5. `article`      — optional per-turn article-memory context (the chosen
  *                     article-memory share decision), placed after recall so
  *                     the lexical chunk stays first among memory sections.
- * 6. `guidance`     — the selected response pattern's response guidance
+ * 6. `relationship` — optional runtime-configured relationship/familiarity
+ *                     context, after article context and before guidance.
+ * 7. `guidance`     — the selected response pattern's response guidance
  *                     (absent when no pattern was selected — with no
  *                     patterns enabled, or none selected, the request simply
  *                     carries no guidance chunk; fallback policy for missing
  *                     selections is unresolved).
- * 7. `conversation` — the prior-turn history (oldest first, bounded to the
+ * 8. `conversation` — the prior-turn history (oldest first, bounded to the
  *                     most recent window by `getThreadContext`) followed by
  *                     the exact user messages grouped into the turn.
  *
@@ -88,6 +90,8 @@ export interface BuildChatRequestParams {
    * chat assembly only classifies it as its own chunk.
    */
   readonly article?: string | null;
+  /** Optional generic relationship/familiarity context. */
+  readonly relationship?: string | null;
   readonly temperature?: number;
   readonly maxTokens?: number;
 }
@@ -122,6 +126,7 @@ export function buildChatPrompt(
     ["temporal", params.temporal],
     ["recall", params.recall],
     ["article", params.article],
+    ["relationship", params.relationship],
   ] as const) {
     if (hasContent(section)) {
       messages.push({
