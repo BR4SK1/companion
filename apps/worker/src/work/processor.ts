@@ -71,6 +71,7 @@ import {
   selectArticleShare,
 } from "../articles/share.ts";
 import type { ArticleMemoryCandidate } from "../articles/types.ts";
+import type { RelationshipExtractionItem } from "../relationship/types.ts";
 import { OpenRouterTransportError } from "@companion/openrouter/transport";
 import type {
   ChatRequest,
@@ -177,12 +178,22 @@ export interface TurnProcessorDeps {
     readonly turnId: string;
     readonly reactionId: string;
   }) => Promise<void>;
+  /** Optional database-configured relationship context; failures degrade to no context. */
+  readonly loadRelationshipContext?: (turnId: string) => Promise<string | null>;
+  /** Learns only from the just-completed new turn; failures never fail chat. */
+  readonly extractRelationshipAnswers?: (input: {
+    readonly turnId: string;
+    readonly userText: string;
+    readonly assistantText: string;
+  }) => Promise<readonly RelationshipExtractionItem[]>;
 }
 
 /** The terminal result of one attempt, published by the engine. */
 export interface TurnOutcome {
   readonly reply: string;
   readonly selectedPatternId: string | null;
+  /** Prepared interpretations committed atomically with this reply when present. */
+  readonly relationshipAnswers?: readonly RelationshipExtractionItem[];
 }
 
 /** Conversation state presented to the decision model: the visible thread so far. */
@@ -531,6 +542,20 @@ export async function processTurnWork(
     }
   }
 
+  // Relationship context is independently optional and degrading, like the
+  // other domain-owned context loaders. It contains only runtime-configured
+  // labels, thresholds, prompts, and answer-bank content.
+  let relationshipChunk: string | null = null;
+  if (deps.loadRelationshipContext !== undefined) {
+    try {
+      relationshipChunk = await deps.loadRelationshipContext(work.turn.id);
+    } catch {
+      console.warn(
+        `[RELATIONSHIP] context load failed for turn ${work.turn.id}; continuing without relationship context`,
+      );
+    }
+  }
+
   // The assembled prompt is the single source of truth for the wire request
   // and its trace metadata: chunk classification and source linkage are
   // index-aligned by construction.
@@ -544,6 +569,7 @@ export async function processTurnWork(
     ...(temporalChunk !== null ? { temporal: temporalChunk } : {}),
     ...(recallChunk !== null ? { recall: recallChunk } : {}),
     ...(articleChunk !== null ? { article: articleChunk } : {}),
+    ...(relationshipChunk !== null ? { relationship: relationshipChunk } : {}),
     ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
     ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
   });
@@ -636,9 +662,38 @@ export async function processTurnWork(
     throw new Error("chat response has no choices");
   }
 
+  // Relationship answer interpretation is a best-effort extraction over this
+  // new turn only. The resulting typed updates are committed by the
+  // conversation store in the same transaction as publication, so a fenced or
+  // failed attempt never changes the current answers.
+  let relationshipAnswers: readonly RelationshipExtractionItem[] | undefined;
+  if (deps.extractRelationshipAnswers !== undefined) {
+    const userText = work.messages
+      .filter((message) => message.role === "user")
+      .map((message) => message.content.trim())
+      .filter(Boolean)
+      .join("\n");
+    if (userText.length > 0 && choice.message.content.trim().length > 0) {
+      try {
+        relationshipAnswers = await deps.extractRelationshipAnswers({
+          turnId: work.turn.id,
+          userText,
+          assistantText: choice.message.content,
+        });
+      } catch {
+        console.warn(
+          `[RELATIONSHIP] answer interpretation failed for turn ${work.turn.id}; continuing without this turn's answer updates`,
+        );
+      }
+    }
+  }
+
   // `choice` is narrowed here by the throw above, so the reply is a string.
   return {
     reply: choice.message.content,
     selectedPatternId: selected !== undefined ? selected.id : null,
+    ...(relationshipAnswers !== undefined && relationshipAnswers.length > 0
+      ? { relationshipAnswers }
+      : {}),
   };
 }

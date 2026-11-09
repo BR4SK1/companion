@@ -18,6 +18,8 @@ import { randomUUID } from "node:crypto";
 import type { ConversationStore } from "../conversation/store.ts";
 import type { TurnWork } from "../conversation/types.ts";
 import type { TurnOutcome } from "./processor.ts";
+import type { PostgresPoolClient } from "@companion/postgres";
+import type { RelationshipExtractionItem } from "../relationship/types.ts";
 import { heartbeatIntervalMs, MIN_LEASE_SECONDS } from "./timing.ts";
 
 export interface EngineDeps {
@@ -38,6 +40,11 @@ export interface EngineDeps {
    * engine cycle, so implementations are expected to enqueue work and return.
    */
   readonly onTurnPublished?: (turnId: string) => void | Promise<void>;
+  /** Optional typed domain updates committed with a successful reply publication. */
+  readonly recordRelationshipAnswers?: (
+    client: PostgresPoolClient,
+    answers: readonly RelationshipExtractionItem[],
+  ) => Promise<void>;
 }
 
 export type EngineCycleResult = "worked" | "idle";
@@ -103,6 +110,13 @@ export async function runEngineOnce(deps: EngineDeps): Promise<EngineCycleResult
       turnId: work.turn.id,
       leaseOwner: owner,
       content: outcome.reply,
+      ...(outcome.relationshipAnswers !== undefined &&
+          deps.recordRelationshipAnswers !== undefined
+        ? {
+            onPublicationTransaction: (client) =>
+              deps.recordRelationshipAnswers!(client, outcome.relationshipAnswers!),
+          }
+        : {}),
     });
     if (publish === "fenced") {
       await deps.store.markAttemptFenced({

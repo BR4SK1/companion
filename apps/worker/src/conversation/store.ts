@@ -291,6 +291,12 @@ export interface PublishReplyParams {
   readonly turnId: string;
   readonly leaseOwner: string;
   readonly content: string;
+  /**
+   * Optional domain-owned work committed atomically with the reply. The
+   * conversation store runs it behind a savepoint so optional-domain failure
+   * cannot block publication; the callback receives this transaction's client.
+   */
+  readonly onPublicationTransaction?: (client: PostgresPoolClient) => Promise<void>;
 }
 
 export interface FailTurnParams {
@@ -1483,6 +1489,22 @@ export function createConversationStore(
            VALUES ('assistant', $1, $2, now(), 'server', 'absent', now())`,
           [params.content, params.turnId],
         );
+        if (params.onPublicationTransaction !== undefined) {
+          await client.query("SAVEPOINT optional_publication_hook");
+          try {
+            await params.onPublicationTransaction(client);
+            await client.query("RELEASE SAVEPOINT optional_publication_hook");
+          } catch {
+            // Optional domain writes must be atomic with themselves but cannot
+            // prevent a valid reply from publishing. Savepoint rollback keeps
+            // a partial set of answer updates from leaking into the commit.
+            await client.query("ROLLBACK TO SAVEPOINT optional_publication_hook");
+            await client.query("RELEASE SAVEPOINT optional_publication_hook");
+            console.warn(
+              "[CONVERSATION] optional publication transaction hook failed; reply published without optional updates",
+            );
+          }
+        }
         const attemptId = await findOpenAttemptAfterTransition(
           client,
           params.turnId,

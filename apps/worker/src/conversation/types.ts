@@ -20,8 +20,8 @@ export type MessageRole = "user" | "assistant";
 /**
  * Which assembly chunk a chat-request message belongs to. Synthetic system
  * messages are classified by their source (identity, generated subject
- * profiles, temporal memory, long-term recall, selected response-pattern
- * guidance); every conversation message is `conversation`. The classification
+ * profiles, temporal memory, long-term recall, article and relationship
+ * context, selected response-pattern guidance); every conversation message is `conversation`. The classification
  * is trace metadata only — the rendered text itself is already recorded in
  * the chat boundary as sent.
  */
@@ -31,6 +31,7 @@ export type ChatChunkName =
   | "temporal"
   | "recall"
   | "article"
+  | "relationship"
   | "guidance"
   | "conversation";
 
