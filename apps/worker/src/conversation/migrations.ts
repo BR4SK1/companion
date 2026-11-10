@@ -391,6 +391,84 @@ CREATE INDEX conversation_message_user_seq_idx
   ON conversation_message (seq) WHERE role = 'user';
 `;
 
+const ADD_CONVERSATION_THREAD_ORDER = `
+-- A turn's first user seq can predate a standalone announcement even when the
+-- turn is claimed later. Persist one shared event order for turn claims and
+-- standalone assistant publications so context does not treat queued input as
+-- conversationally earlier than an intervening notice.
+CREATE SEQUENCE conversation_thread_order_seq AS bigint;
+ALTER TABLE conversation_turn ADD COLUMN thread_order bigint;
+ALTER TABLE conversation_message ADD COLUMN thread_order bigint;
+-- Preserve the established first-user-seq ordering of existing turns. For
+-- legacy standalone assistants, no publication ordinal was persisted, so place
+-- each one after the turn with the greatest first-user seq below its message
+-- seq (or before all turns when none precedes it), matching the prior context
+-- projection deterministically. Timestamp ordering is only a final tie-breaker
+-- for empty turns that have no user message and therefore no context position.
+CREATE TEMP TABLE conversation_thread_order_backfill ON COMMIT DROP AS
+WITH turn_keys AS (
+  SELECT t.id, t.created_at,
+         min(m.seq) FILTER (WHERE m.role = 'user') AS first_user_seq
+  FROM conversation_turn AS t
+  LEFT JOIN conversation_message AS m ON m.turn_id = t.id
+  GROUP BY t.id
+), events AS (
+  SELECT t.id AS turn_id, NULL::uuid AS message_id,
+         t.first_user_seq AS slot_seq, 0 AS event_kind,
+         t.first_user_seq AS tie_seq, t.created_at AS tie_time,
+         0 AS empty_turn
+  FROM turn_keys AS t
+  WHERE t.first_user_seq IS NOT NULL
+  UNION ALL
+  SELECT NULL::uuid AS turn_id, m.id AS message_id,
+         COALESCE((
+           SELECT max(previous.first_user_seq)
+           FROM turn_keys AS previous
+           WHERE previous.first_user_seq < m.seq
+         ), 0) AS slot_seq,
+         1 AS event_kind, m.seq AS tie_seq, m.created_at AS tie_time,
+         0 AS empty_turn
+  FROM conversation_message AS m
+  WHERE m.turn_id IS NULL AND m.role = 'assistant'
+  UNION ALL
+  SELECT t.id AS turn_id, NULL::uuid AS message_id,
+         NULL::bigint AS slot_seq, 0 AS event_kind, NULL::bigint AS tie_seq,
+         t.created_at AS tie_time, 1 AS empty_turn
+  FROM turn_keys AS t
+  WHERE t.first_user_seq IS NULL
+)
+SELECT turn_id, message_id,
+       row_number() OVER (
+         ORDER BY empty_turn, slot_seq NULLS LAST, event_kind,
+                  tie_seq NULLS LAST, tie_time, turn_id, message_id
+       ) AS thread_order
+FROM events;
+UPDATE conversation_turn AS t
+SET thread_order = backfill.thread_order
+FROM conversation_thread_order_backfill AS backfill
+WHERE backfill.turn_id = t.id;
+UPDATE conversation_message AS m
+SET thread_order = backfill.thread_order
+FROM conversation_thread_order_backfill AS backfill
+WHERE backfill.message_id = m.id;
+ALTER TABLE conversation_turn ALTER COLUMN thread_order SET DEFAULT nextval('conversation_thread_order_seq');
+ALTER TABLE conversation_turn ALTER COLUMN thread_order SET NOT NULL;
+SELECT setval(
+  'conversation_thread_order_seq',
+  COALESCE((SELECT max(thread_order) FROM (
+    SELECT thread_order FROM conversation_turn
+    UNION ALL
+    SELECT thread_order FROM conversation_message WHERE thread_order IS NOT NULL
+  ) AS orders), 1),
+  EXISTS (SELECT 1 FROM conversation_turn)
+    OR EXISTS (SELECT 1 FROM conversation_message WHERE thread_order IS NOT NULL)
+);
+CREATE UNIQUE INDEX conversation_turn_thread_order_idx ON conversation_turn (thread_order);
+CREATE UNIQUE INDEX conversation_message_standalone_thread_order_idx
+  ON conversation_message (thread_order)
+  WHERE thread_order IS NOT NULL;
+`;
+
 export const conversationMigrations: readonly Migration[] = [
   {
     id: "0001_conversation_work",
@@ -407,5 +485,9 @@ export const conversationMigrations: readonly Migration[] = [
   {
     id: "0005_message_timing",
     sql: ADD_MESSAGE_TIMING,
+  },
+  {
+    id: "0006_conversation_thread_order",
+    sql: ADD_CONVERSATION_THREAD_ORDER,
   },
 ];

@@ -381,6 +381,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       "0002_conversation_tracing",
       "0004_chat_identity",
       "0005_message_timing",
+      "0006_conversation_thread_order",
       "0003_memory_work",
       "0007_article_work",
       "0008_article_share_and_evidence",

@@ -22,12 +22,14 @@
  *                     the lexical chunk stays first among memory sections.
  * 6. `relationship` — optional runtime-configured relationship/familiarity
  *                     context, after article context and before guidance.
- * 7. `guidance`     — the selected response pattern's response guidance
+ * 7. `routine`     — optional scheduled/applied routine state and configured
+ *                     interaction context, before response guidance.
+ * 8. `guidance`     — the selected response pattern's response guidance
  *                     (absent when no pattern was selected — with no
  *                     patterns enabled, or none selected, the request simply
  *                     carries no guidance chunk; fallback policy for missing
  *                     selections is unresolved).
- * 8. `conversation` — the prior-turn history (oldest first, bounded to the
+ * 9. `conversation` — the prior-turn history (oldest first, bounded to the
  *                     most recent window by `getThreadContext`) followed by
  *                     the exact user messages grouped into the turn.
  *
@@ -56,7 +58,7 @@ export interface AssembledChatMessage {
   /**
    * The conversation_message id for `conversation` messages; null for every
    * synthetic system chunk (identity, profiles, temporal, recall, article,
-   * guidance).
+   * relationship, routine, guidance).
    */
   readonly sourceMessageId: string | null;
 }
@@ -92,6 +94,8 @@ export interface BuildChatRequestParams {
   readonly article?: string | null;
   /** Optional generic relationship/familiarity context. */
   readonly relationship?: string | null;
+  /** Optional configured routine state and reactive interaction context. */
+  readonly routine?: string | null;
   readonly temperature?: number;
   readonly maxTokens?: number;
 }
@@ -127,6 +131,7 @@ export function buildChatPrompt(
     ["recall", params.recall],
     ["article", params.article],
     ["relationship", params.relationship],
+    ["routine", params.routine],
   ] as const) {
     if (hasContent(section)) {
       messages.push({
