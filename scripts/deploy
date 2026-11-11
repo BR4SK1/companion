@@ -1,0 +1,4 @@
+#!/bin/sh
+printf '%s
+' 'Deployment is not configured for this repo.'
+exit 1
