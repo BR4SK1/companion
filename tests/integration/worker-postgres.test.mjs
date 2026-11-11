@@ -14,6 +14,7 @@
 
 import { describe, it, before, beforeEach, after } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import {
@@ -106,6 +107,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       "0002_conversation_tracing",
       "0004_chat_identity",
       "0005_message_timing",
+      "0006_conversation_thread_order",
       "0003_memory_work",
       "0007_article_work",
       "0008_article_share_and_evidence",
@@ -126,6 +128,66 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         "response_pattern",
       ],
     );  });
+
+  it("backfills thread order by first-user seq despite inverted turn timestamps, with defined legacy notice placement", async () => {
+    const schema = `thread_order_upgrade_${randomUUID().replaceAll("-", "")}`;
+    await pool.query(`CREATE SCHEMA "${schema}"`);
+    let upgradePool;
+    try {
+      const connection = new URL(DATABASE_URL);
+      connection.searchParams.set("options", `-csearch_path=${schema}`);
+      upgradePool = createPostgresPool({ connectionString: connection.toString() });
+      assert.equal((await upgradePool.query("SELECT current_schema() AS schema")).rows[0].schema, schema);
+      await runMigrations(upgradePool, conversationMigrations.slice(0, -1));
+
+      const firstTurn = randomUUID();
+      const secondTurn = randomUUID();
+      await upgradePool.query(
+        `INSERT INTO conversation_turn (id, status, created_at, completed_at)
+         VALUES ($1, 'completed', '2026-11-10T12:00:00Z', '2026-11-10T12:01:00Z'),
+                ($2, 'completed', '2026-11-10T11:00:00Z', '2026-11-10T11:01:00Z')`,
+        [firstTurn, secondTurn],
+      );
+      const insertMessage = (role, content, turnId) => upgradePool.query(
+        `INSERT INTO conversation_message
+           (role, content, turn_id, effective_at, time_source,
+            client_time_status, server_received_at)
+         VALUES ($1, $2, $3, '2026-11-10T10:00:00Z', 'server', 'absent',
+                 '2026-11-10T10:00:00Z')`,
+        [role, content, turnId],
+      );
+      await insertMessage("user", "legacy u1", firstTurn);
+      await insertMessage("assistant", "legacy standalone notice", null);
+      await insertMessage("user", "legacy u2", secondTurn);
+      await insertMessage("assistant", "legacy r1", firstTurn);
+      await insertMessage("assistant", "legacy r2", secondTurn);
+
+      const threadOrderMigration = conversationMigrations.at(-1);
+      assert.ok(threadOrderMigration);
+      await runMigrations(upgradePool, [threadOrderMigration]);
+      const orderedTurns = await upgradePool.query(
+        `SELECT id, thread_order FROM conversation_turn ORDER BY thread_order`,
+      );
+      assert.deepEqual(orderedTurns.rows.map((row) => row.id), [firstTurn, secondTurn],
+        "legacy turns retain first-user-seq order even when created_at is inverted");
+
+      const store = createConversationStore(upgradePool);
+      await store.appendUserMessage({ content: "current u3" });
+      const current = await store.claimNextTurn({ owner: "legacy-order-check", leaseSeconds: 60 });
+      assert.equal(current.kind, "claimed");
+      const context = await store.getThreadContext({ turnId: current.work.turn.id, limit: 20 });
+      assert.deepEqual(context.map((message) => message.content), [
+        "legacy u1",
+        "legacy r1",
+        "legacy standalone notice",
+        "legacy u2",
+        "legacy r2",
+      ], "legacy standalone notices use the documented prior-turn-by-first-user-seq placement");
+    } finally {
+      if (upgradePool !== undefined) await closePostgresPool(upgradePool);
+      await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
+    }
+  });
 
   it("upgrades a populated pre-timing schema with honest provenance and no invented client time", async () => {
     // The upgrade path a deployment that predates the timing columns takes:
@@ -504,6 +566,65 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.deepEqual(
       t2Context.map((message) => `${message.role}:${message.content}`),
       ["user:u1", "assistant:r1"],
+    );
+  });
+
+  it("orders notices by turn/publication order, not queued user seq, including bounded later-turn context", async () => {
+    await store.appendUserMessage({ content: "notice scenario u1" });
+    const first = await store.claimNextTurn({ owner: "notice-o1", leaseSeconds: 60 });
+    assert.equal(first.kind, "claimed");
+    await store.appendUserMessage({ content: "notice scenario u2 queued before notice" });
+    await store.publishReply({
+      turnId: first.work.turn.id,
+      leaseOwner: "notice-o1",
+      content: "notice scenario r1",
+    });
+
+    assert.equal(await store.publishScheduledAssistantMessage({
+      prepare: async () => ({
+        content: "synthetic standalone schedule notice",
+        validUntil: null,
+        cancel: async () => {},
+        recordPublication: async () => {},
+      }),
+    }), true);
+
+    const second = await store.claimNextTurn({ owner: "notice-o2", leaseSeconds: 60 });
+    assert.equal(second.kind, "claimed");
+    assert.deepEqual(second.work.messages.map((message) => message.content), [
+      "notice scenario u2 queued before notice",
+    ]);
+    await store.publishReply({
+      turnId: second.work.turn.id,
+      leaseOwner: "notice-o2",
+      content: "notice scenario r2",
+    });
+
+    await store.appendUserMessage({ content: "notice scenario u3" });
+    const third = await store.claimNextTurn({ owner: "notice-o3", leaseSeconds: 60 });
+    assert.equal(third.kind, "claimed");
+    const context = await store.getThreadContext({ turnId: third.work.turn.id, limit: 20 });
+    assert.deepEqual(
+      context.map((message) => `${message.role}:${message.content}`),
+      [
+        "user:notice scenario u1",
+        "assistant:notice scenario r1",
+        "assistant:synthetic standalone schedule notice",
+        "user:notice scenario u2 queued before notice",
+        "assistant:notice scenario r2",
+      ],
+      "the queued user's later turn follows the announcement that was published before that turn was claimed",
+    );
+    const bounded = await store.getThreadContext({ turnId: third.work.turn.id, limit: 4 });
+    assert.deepEqual(
+      bounded.map((message) => `${message.role}:${message.content}`),
+      [
+        "assistant:notice scenario r1",
+        "assistant:synthetic standalone schedule notice",
+        "user:notice scenario u2 queued before notice",
+        "assistant:notice scenario r2",
+      ],
+      "the bounded tail preserves the same persisted turn/publication order",
     );
   });
 

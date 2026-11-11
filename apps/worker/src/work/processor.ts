@@ -180,6 +180,8 @@ export interface TurnProcessorDeps {
   }) => Promise<void>;
   /** Optional database-configured relationship context; failures degrade to no context. */
   readonly loadRelationshipContext?: (turnId: string) => Promise<string | null>;
+  /** Optional configured scheduled/applied routine state; failures degrade to no context. */
+  readonly loadRoutineContext?: (turnId: string) => Promise<string | null>;
   /** Learns only from the just-completed new turn; failures never fail chat. */
   readonly extractRelationshipAnswers?: (input: {
     readonly turnId: string;
@@ -556,6 +558,21 @@ export async function processTurnWork(
     }
   }
 
+  // Routine context is also optional and reactive-only. It is read near chat
+  // assembly so a newly scheduled unavailable state can inform this still-
+  // running reply; a transition after this snapshot cannot retroactively alter
+  // the assembled provider request.
+  let routineChunk: string | null = null;
+  if (deps.loadRoutineContext !== undefined) {
+    try {
+      routineChunk = await deps.loadRoutineContext(work.turn.id);
+    } catch {
+      console.warn(
+        `[ROUTINE] context load failed for turn ${work.turn.id}; continuing without routine context`,
+      );
+    }
+  }
+
   // The assembled prompt is the single source of truth for the wire request
   // and its trace metadata: chunk classification and source linkage are
   // index-aligned by construction.
@@ -570,6 +587,7 @@ export async function processTurnWork(
     ...(recallChunk !== null ? { recall: recallChunk } : {}),
     ...(articleChunk !== null ? { article: articleChunk } : {}),
     ...(relationshipChunk !== null ? { relationship: relationshipChunk } : {}),
+    ...(routineChunk !== null ? { routine: routineChunk } : {}),
     ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
     ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
   });

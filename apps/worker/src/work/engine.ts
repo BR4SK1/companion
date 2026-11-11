@@ -28,6 +28,8 @@ export interface EngineDeps {
     work: TurnWork,
     context: { readonly leaseOwner: string },
   ) => Promise<TurnOutcome>;
+  /** Optional transactional gate for newly created turns; expired work still recovers. */
+  readonly canStartNewTurn?: (client: PostgresPoolClient) => Promise<boolean>;
   readonly leaseSeconds: number;
   readonly pollSeconds: number;
   /** Stable-ish label for logs; the claim token itself is always unique. */
@@ -68,6 +70,9 @@ export async function runEngineOnce(deps: EngineDeps): Promise<EngineCycleResult
   const claim = await deps.store.claimNextTurn({
     owner,
     leaseSeconds: deps.leaseSeconds,
+    ...(deps.canStartNewTurn !== undefined
+      ? { canStartNewTurn: deps.canStartNewTurn }
+      : {}),
   });
   if (claim.kind !== "claimed") {
     return "idle";

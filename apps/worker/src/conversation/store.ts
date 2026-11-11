@@ -188,6 +188,10 @@ const MESSAGE_COLUMNS =
   "id, seq, role, content, turn_id, client_key, created_at, " +
   "client_sent_at, effective_at, time_source, client_time_status, " +
   "server_received_at";
+const MESSAGE_COLUMNS_FROM_M =
+  "m.id, m.seq, m.role, m.content, m.turn_id, m.client_key, m.created_at, " +
+  "m.client_sent_at, m.effective_at, m.time_source, m.client_time_status, " +
+  "m.server_received_at";
 const TURN_COLUMNS =
   "id, status, attempt, lease_owner, lease_expires_at, selected_pattern_id, decision, error, created_at, completed_at";
 
@@ -278,6 +282,12 @@ export interface ClaimParams {
   /** Unique lease owner token for this claim (e.g. a fresh UUID per claim). */
   readonly owner: string;
   readonly leaseSeconds: number;
+  /**
+   * Optional domain-owned gate for creating a new turn. It runs under the
+   * claim/ingest serialization lock and after expired-turn recovery, so
+   * existing work remains recoverable while new work can be held.
+   */
+  readonly canStartNewTurn?: (client: PostgresPoolClient) => Promise<boolean>;
 }
 
 export type PublishOutcome =
@@ -438,6 +448,23 @@ export interface ThreadPage {
   readonly hasMore: boolean;
 }
 
+export interface PreparedAssistantMessage {
+  readonly content: string;
+  /** The first instant at which this prepared publication becomes stale, if any. */
+  readonly validUntil: Date | null;
+  /** Cancel its locked domain event if the final pre-insert time has expired. */
+  readonly cancel: (
+    client: PostgresPoolClient,
+    cancelledAt: Date,
+  ) => Promise<void>;
+  /** Required domain-owned event link, committed with this message. */
+  readonly recordPublication: (
+    client: PostgresPoolClient,
+    messageId: string,
+    publishedAt: Date,
+  ) => Promise<void>;
+}
+
 export interface ConversationStore {
   appendUserMessage(
     params: AppendUserMessageParams,
@@ -451,6 +478,12 @@ export interface ConversationStore {
   recordChatRequest(params: RecordChatRequestParams): Promise<boolean>;
   recordChatOutcome(params: RecordChatOutcomeParams): Promise<boolean>;
   publishReply(params: PublishReplyParams): Promise<PublishOutcome>;
+  /** Publish one scheduled assistant-only message and its domain event atomically. */
+  publishScheduledAssistantMessage(params: {
+    readonly prepare: (
+      client: PostgresPoolClient,
+    ) => Promise<PreparedAssistantMessage | null>;
+  }): Promise<boolean>;
   failTurn(params: FailTurnParams): Promise<FailOutcome>;
   markAttemptFenced(params: {
     turnId: string;
@@ -698,7 +731,15 @@ export function createConversationStore(
         return { kind: "idle" };
       }
 
-      // 3. Group the entire unassigned trailing run of user messages into one
+      // 3. Existing in-flight work is recovered above even while the routine
+      // says unavailable. Only a brand-new grouped turn is subject to this
+      // optional gate, evaluated inside the same serialized transaction.
+      if (params.canStartNewTurn !== undefined &&
+          !(await params.canStartNewTurn(client))) {
+        return { kind: "idle" };
+      }
+
+      // 4. Group the entire unassigned trailing run of user messages into one
       //    new in-flight turn. Rows locked here are exactly the snapshot; a
       //    message ingested after this SELECT is grouped into the next turn.
       const pending = await client.query<MessageRow>(
@@ -710,10 +751,18 @@ export function createConversationStore(
       if (pending.rows.length === 0) {
         return { kind: "idle" };
       }
+      // The message-row lock above can wait behind another transaction. Sample
+      // the schedule again after that wait so a claim cannot cross a departure
+      // boundary using the earlier pre-lock clock; expired-turn recovery above
+      // remains intentionally independent of this admission gate.
+      if (params.canStartNewTurn !== undefined &&
+          !(await params.canStartNewTurn(client))) {
+        return { kind: "idle" };
+      }
       const turnId = randomUUID();
       const turn = await client.query<TurnRow>(
-        `INSERT INTO conversation_turn (id, lease_owner, lease_expires_at)
-         VALUES ($1, $2, now() + make_interval(secs => $3::double precision))
+        `INSERT INTO conversation_turn (id, lease_owner, lease_expires_at, created_at)
+         VALUES ($1, $2, now() + make_interval(secs => $3::double precision), clock_timestamp())
          RETURNING ${TURN_COLUMNS}`,
         [turnId, params.owner, params.leaseSeconds],
       );
@@ -1463,10 +1512,65 @@ export function createConversationStore(
     });
   }
 
+  async function publishScheduledAssistantMessage(params: {
+    readonly prepare: (
+      client: PostgresPoolClient,
+    ) => Promise<PreparedAssistantMessage | null>;
+  }): Promise<boolean> {
+    return withTransaction(pool, async (client) => {
+      // Use the same serialization point as user ingest and turn claims. This
+      // publishes a schedule notice as a normal assistant thread message, but
+      // never groups or claims queued user messages.
+      await client.query("SELECT pg_advisory_xact_lock($1)", [
+        CLAIM_ADVISORY_LOCK_KEY,
+      ]);
+      const active = await client.query(
+        `SELECT 1 FROM conversation_turn WHERE status = 'in_flight' LIMIT 1`,
+      );
+      if (active.rows.length > 0) return false;
+
+      // Acquire the message-table write lock before preparing and sampling the
+      // final publication time, so a DDL lock wait cannot carry a stale notice
+      // across its configured return boundary.
+      await client.query(`LOCK TABLE conversation_message IN ROW EXCLUSIVE MODE`);
+      const prepared = await params.prepare(client);
+      if (prepared === null) return false;
+      const clock = await client.query<{ now: Date }>(
+        "SELECT clock_timestamp() AS now",
+      );
+      const publishedAt = clock.rows[0]?.now;
+      if (!(publishedAt instanceof Date) || !Number.isFinite(publishedAt.getTime())) {
+        throw new Error("assistant notice publication clock returned no valid timestamp");
+      }
+      if (prepared.validUntil !== null && publishedAt.getTime() >= prepared.validUntil.getTime()) {
+        await prepared.cancel(client, publishedAt);
+        return false;
+      }
+      const inserted = await client.query<{ id: string }>(
+        `INSERT INTO conversation_message
+           (role, content, turn_id, created_at, effective_at, time_source,
+            client_time_status, server_received_at, thread_order)
+         VALUES ('assistant', $1, NULL, $2, $2, 'server', 'absent', $2,
+                 nextval('conversation_thread_order_seq'))
+         RETURNING id`,
+        [prepared.content, publishedAt],
+      );
+      const message = inserted.rows[0];
+      if (message === undefined) throw new Error("assistant notice insert returned no row");
+      await prepared.recordPublication(client, message.id, publishedAt);
+      return true;
+    });
+  }
+
   async function publishReply(
     params: PublishReplyParams,
   ): Promise<PublishOutcome> {
     return withTransaction(pool, async (client) => {
+      // Serialize assistant publication with ingestion, claiming, and
+      // schedule-owned assistant messages before taking the turn row lock.
+      await client.query("SELECT pg_advisory_xact_lock($1)", [
+        CLAIM_ADVISORY_LOCK_KEY,
+      ]);
       // Fenced transition: only the current lease holder of an in-flight turn
       // may complete it and persist the reply, and both happen atomically.
       const guard = await client.query<{ id: string }>(
@@ -1934,18 +2038,17 @@ export function createConversationStore(
    * grouped into the *next* turn, so its `seq` is lower than that
    * previous turn's reply (published later). The reply still precedes
    * that message conversationally. Ordering therefore reconstructs the
-   * thread per turn: for each turn, in turn order, its user messages in
-   * `seq` order followed by its assistant reply. Turn order is the order
-   * of the turns' first user-message `seq`, which is strictly increasing
-   * in claim order because a claim always groups the entire unassigned
-   * run while holding the serialization lock (see `claimNextTurn`) —
-   * every message of a later turn has a higher `seq` than every message
-   * of an earlier turn, so a later turn (claimed after this one) is
-   * excluded by the same first-seq bound that selects prior turns.
+   * thread by persisted turn/publication order: each turn and standalone
+   * assistant notice receives an ordinal from one shared sequence while
+   * holding the conversation serialization lock. All messages in a turn use
+   * the turn's ordinal and retain their `seq` order; a notice uses its own
+   * publication ordinal. Thus a user message queued before a notice cannot
+   * drag the later-claimed turn ahead of that notice.
    *
    * Excluded from the snapshot:
-   * - unassigned messages (`turn_id IS NULL`): they belong to a future
-   *   turn and must never leak into an earlier turn's context;
+   * - unassigned user messages (`turn_id IS NULL`): they belong to a future
+   *   turn and must never leak into an earlier turn's context; standalone
+   *   assistant schedule announcements are the exception and are included;
    * - the requested turn's own messages: the caller appends them
    *   separately, so including them would duplicate them;
    * - messages of turns claimed after this one: they are later
@@ -1960,20 +2063,36 @@ export function createConversationStore(
     readonly ConversationMessage[]
   > {
     const result = await pool.query<MessageRow>(
-      `SELECT id, seq, role, content, turn_id, client_key, created_at,
+      `WITH current_turn AS (
+         SELECT t.thread_order
+         FROM conversation_turn AS t
+         WHERE t.id = $1
+       ), prior_turn_message AS (
+         SELECT ${MESSAGE_COLUMNS_FROM_M}, t.thread_order,
+                min(m.seq) OVER (PARTITION BY m.turn_id) AS turn_first_seq
+         FROM conversation_message AS m
+         JOIN conversation_turn AS t ON t.id = m.turn_id
+         WHERE m.turn_id IS NOT NULL
+       ), prior_context AS (
+         SELECT id, seq, role, content, turn_id, client_key, created_at,
+                client_sent_at, effective_at, time_source, client_time_status,
+                server_received_at, thread_order
+         FROM prior_turn_message
+         WHERE turn_id <> $1
+           AND thread_order < (SELECT thread_order FROM current_turn)
+         UNION ALL
+         SELECT m.id, m.seq, m.role, m.content, m.turn_id, m.client_key,
+                m.created_at, m.client_sent_at, m.effective_at, m.time_source,
+                m.client_time_status, m.server_received_at, m.thread_order
+         FROM conversation_message AS m
+         WHERE m.turn_id IS NULL AND m.role = 'assistant'
+           AND m.thread_order < (SELECT thread_order FROM current_turn)
+       )
+       SELECT id, seq, role, content, turn_id, client_key, created_at,
               client_sent_at, effective_at, time_source, client_time_status,
               server_received_at
-       FROM (
-         SELECT ${MESSAGE_COLUMNS},
-                min(seq) OVER (PARTITION BY turn_id) AS turn_first_seq
-         FROM conversation_message
-         WHERE turn_id IS NOT NULL
-       ) prior_turn_message
-       WHERE turn_id <> $1
-         AND turn_first_seq < (
-           SELECT min(seq) FROM conversation_message WHERE turn_id = $1
-         )
-       ORDER BY turn_first_seq DESC, seq DESC
+       FROM prior_context
+       ORDER BY thread_order DESC, seq DESC
        LIMIT $2`,
       [params.turnId, params.limit],
     );
@@ -2131,6 +2250,7 @@ export function createConversationStore(
     recordChatRequest,
     recordChatOutcome,
     publishReply,
+    publishScheduledAssistantMessage,
     failTurn,
     markAttemptFenced,
     getEnabledResponsePatterns,

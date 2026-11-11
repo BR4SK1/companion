@@ -32,6 +32,7 @@ export type ChatChunkName =
   | "recall"
   | "article"
   | "relationship"
+  | "routine"
   | "guidance"
   | "conversation";
 

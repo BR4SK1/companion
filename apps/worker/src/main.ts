@@ -47,6 +47,10 @@ import {
   RelationshipConfigurationError,
 } from "./relationship/store.ts";
 import { renderRelationshipContext } from "./relationship/runtime.ts";
+import { routineMigrations } from "./routine/migrations.ts";
+import { createRoutineStore } from "./routine/store.ts";
+import { renderRoutineContext } from "./routine/runtime.ts";
+import { startRoutineRuntime } from "./routine/runtime-loop.ts";
 import { loadMemoryConfig } from "./memory/config.ts";
 import { createMemoryLlmCaller, taskPresets } from "./memory/llm.ts";
 import { startArticleRuntime } from "./articles/runner.ts";
@@ -113,6 +117,7 @@ async function main(): Promise<void> {
   let api: ReturnType<typeof createApiServer> | undefined;
   let memoryRuntime: ReturnType<typeof startMemoryRuntime> | undefined;
   let articleRuntime: ReturnType<typeof startArticleRuntime> | undefined;
+  let routineRuntime: ReturnType<typeof startRoutineRuntime> | undefined;
   try {
     const migrations = await runMigrations(pool, [
       ...conversationMigrations,
@@ -120,6 +125,7 @@ async function main(): Promise<void> {
       ...engagementMigrations,
       ...articleMigrations,
       ...relationshipMigrations,
+      ...routineMigrations,
     ]);
     if (migrations.applied.length > 0) {
       console.log(`applied migrations: ${migrations.applied.join(", ")}`);
@@ -182,6 +188,15 @@ async function main(): Promise<void> {
         });
     const relationshipExtractionPreset = taskPresets(memoryConfig).memoryFactExtraction;
 
+    // The routine is generic relational runtime configuration. Missing
+    // configuration preserves ordinary chat and availability; malformed
+    // provisioned configuration fails startup rather than accidentally
+    // bypassing an intended unavailable interval. Configuration is reloaded
+    // on reconciliation, turn admission, and context reads so edits do not
+    // depend on a worker restart.
+    const routineStore = createRoutineStore({ pool });
+    await routineStore.reconcile();
+
     const store = createConversationStore(pool, {
       clientTimeMaxAheadMs: config.clientTimeMaxAheadMs,
       ...(engagementStore !== undefined
@@ -190,6 +205,30 @@ async function main(): Promise<void> {
               engagementStore.onUserMessageInserted(tx, inserted),
           }
         : {}),
+    });
+    routineRuntime = startRoutineRuntime({
+      store: routineStore,
+      publishPendingAnnouncement: () =>
+        store.publishScheduledAssistantMessage({
+          prepare: async (client) => {
+            const draft = await routineStore.prepareAnnouncement(client);
+            if (draft === null) return null;
+            return {
+              content: draft.content,
+              validUntil: draft.validUntil,
+              cancel: (transaction, cancelledAt) =>
+                routineStore.cancelAnnouncement(transaction, draft, cancelledAt),
+              recordPublication: (transaction, messageId, publishedAt) =>
+                routineStore.recordAnnouncementPublication(
+                  transaction,
+                  draft,
+                  messageId,
+                  publishedAt,
+                ),
+            };
+          },
+        }),
+      log: (message) => console.log(message),
     });
 
     // Memory domain. Disabled memory changes nothing about the chat path:
@@ -389,6 +428,7 @@ async function main(): Promise<void> {
     const provisionedMemoryConfiguration = memoryConfiguration;
     const provisionedRelationshipStore = relationshipStore;
     const provisionedRelationshipCallLlm = relationshipCallLlm;
+    const provisionedRoutineStore = routineStore;
     api = createApiServer({
       store,
       token: config.apiToken,
@@ -462,6 +502,7 @@ async function main(): Promise<void> {
     await runEngineLoop(
       {
         store,
+        canStartNewTurn: provisionedRoutineStore.canStartNewTurn,
         processTurn: (work, { leaseOwner }) =>
           processTurnWork(work, {
             decisionModel: config.openrouter.decisionModel,
@@ -557,6 +598,10 @@ async function main(): Promise<void> {
                     }),
                 }
               : {}),
+            loadRoutineContext: async () => {
+              const snapshot = await provisionedRoutineStore.getSnapshot();
+              return snapshot === null ? null : renderRoutineContext(snapshot);
+            },
             ...(articleRuntime !== undefined
               ? {
                   loadArticleShareCandidates: (input: {
@@ -613,6 +658,13 @@ async function main(): Promise<void> {
       await articleRuntime.close().catch((error: unknown) => {
         console.error(
           `article runtime shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }
+    if (routineRuntime !== undefined) {
+      await routineRuntime.close().catch((error: unknown) => {
+        console.error(
+          `routine runtime shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       });
     }

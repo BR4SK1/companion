@@ -8,14 +8,20 @@ BFF edge and loopback test-entry gate, and the real worker (private HTTP API,
 durable work, response-pattern decision, chat generation) — against a local
 fake OpenRouter provider and a disposable throwaway PostgreSQL.
 
-Run from this directory (or `pnpm --filter @companion/e2e test` after
-`pnpm install` and `pnpm --filter @companion/web build`):
+The Playwright/E2E toolchain is pinned to Node.js **22.23.4** in
+[`.nvmrc`](.nvmrc) and in this package's `engines` field. Its test,
+smoke, and browser-install package scripts fail closed unless the active Node
+runtime is exactly that version; this does not change the root project's Node
+requirement or any application container/runtime. Select Node 22.23.4 when
+running these commands (for example, from this directory with `nvm use`). Keep
+the ordinary root install and web production build on the project's normal
+runtime:
 
 ```sh
-pnpm install                      # installs the pinned Playwright
-pnpm exec playwright install chromium   # the pinned browser build
-pnpm --filter @companion/web build      # the suite serves the production build
-pnpm exec playwright test
+pnpm install                                      # installs the pinned Playwright
+pnpm --filter @companion/web build                # the suite serves the production build
+pnpm --filter @companion/e2e install:chromium     # installs the pinned browser build (Node 22.23.4)
+pnpm --filter @companion/e2e test                 # disposable-stack Playwright suite (Node 22.23.4)
 ```
 
 ### Request scope: full E2E versus local-only
@@ -235,15 +241,15 @@ above):
 
 ```sh
 E2E_DEPLOYED_SMOKE_ALLOWED=1 E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1 \
-  node tests/e2e/deployed-dev-smoke.mjs
+  pnpm --filter @companion/e2e test:deployed-smoke
 ```
 
 Recover an interrupted run's synthetic data (idempotent):
 
 ```sh
-E2E_DEPLOYED_SMOKE_ALLOWED=1 node tests/e2e/deployed-dev-smoke.mjs --recover
+E2E_DEPLOYED_SMOKE_ALLOWED=1 pnpm --filter @companion/e2e test:deployed-smoke -- --recover
 # or with an explicit marker (or a path to a marker/ownership file):
-E2E_DEPLOYED_SMOKE_ALLOWED=1 node tests/e2e/deployed-dev-smoke.mjs --recover <marker>
+E2E_DEPLOYED_SMOKE_ALLOWED=1 pnpm --filter @companion/e2e test:deployed-smoke -- --recover <marker>
 ```
 
 Regression tests for this smoke's core (decision state machine, output
@@ -251,7 +257,7 @@ redaction, graceful shutdown, generated pod-script integrity, and the
 delete-vs-claim race against a disposable local PostgreSQL) run with:
 
 ```sh
-node --test tests/e2e/deployed-smoke.test.mjs
+pnpm --filter @companion/e2e test:smoke
 ```
 
 ## Limits and open questions
