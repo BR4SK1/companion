@@ -3,6 +3,7 @@ import Box from "@mui/material/Box";
 import { LiveThread } from "@/components/live-thread";
 import { SignInView, UnavailableView } from "@/components/gate-views";
 import { loadWebConfigSafe } from "@/lib/server/config";
+import { shouldAutoRedirectToLogin } from "@/lib/server/home-page-auth";
 import { nowSeconds } from "@/lib/server/respond";
 import {
   resolveRequestChannel,
@@ -17,10 +18,11 @@ import { redirect } from "next/navigation";
  *
  * Server-rendered decision, fail-closed in both directions: without valid
  * BFF configuration the page renders a generic unavailability view rather
- * than any conversation surface, and without a verified session it renders
- * the sign-in view. Only a verified owner session reaches the live thread.
- * The `?auth=` query parameter (set by the sign-in flow on failure) toggles
- * the one generic retry notice; its value is never interpreted further.
+ * than any conversation surface. An unauthenticated owner-channel visit
+ * starts the existing OIDC sign-in flow automatically; auth-flow failure
+ * notices keep the generic retry view visible rather than restarting login.
+ * Only a verified owner session reaches the live thread. The `?auth=` query
+ * parameter's value is never interpreted beyond whether it is present.
  *
  * Non-production-only test channel: when the request is attested by the
  * loopback test listener (`TEST_ATTESTATION_HEADER` carrying the
@@ -77,6 +79,9 @@ export default async function HomePage({
     config.sessionSecret,
     nowSeconds(),
   );
+  if (shouldAutoRedirectToLogin(session !== null, authNotice)) {
+    redirect("/api/auth/login");
+  }
   if (session === null) {
     return <SignInView notice={authNotice} />;
   }
