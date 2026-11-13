@@ -20,7 +20,7 @@ export class RelationshipConfigurationError extends Error {
 
 interface SettingsRow {
   relationship_type: string;
-  timezone: string;
+  timezone: string | null;
   day_start_hour: number;
   tier_movement_enabled: boolean;
   tier_up_min_days: number | null;
@@ -107,19 +107,28 @@ function validateConfiguration(
  */
 export async function loadRelationshipConfiguration(
   pool: PostgresPool,
+  authoritativeTimezone?: string | null,
 ): Promise<RelationshipConfiguration | null> {
+  const timezoneExpression = authoritativeTimezone === undefined ? "t.timezone" : "$1::text";
+  const settingsJoin = authoritativeTimezone === undefined
+    ? "CROSS JOIN companion_time_settings t"
+    : "";
+  const settingsPredicate = authoritativeTimezone === undefined ? " AND t.id = true" : "";
   const settingsResult = await pool.query<SettingsRow>(
-    `SELECT relationship_type, timezone, day_start_hour, tier_movement_enabled,
-            tier_up_min_days, tier_up_min_active_streak, tier_down_missed_streak,
-            answer_extraction_prompt, clarification_guidance
-     FROM relationship_settings WHERE id = true`,
+    `SELECT r.relationship_type, ${timezoneExpression} AS timezone, r.day_start_hour, r.tier_movement_enabled,
+            r.tier_up_min_days, r.tier_up_min_active_streak, r.tier_down_missed_streak,
+            r.answer_extraction_prompt, r.clarification_guidance
+     FROM relationship_settings r
+     ${settingsJoin}
+     WHERE r.id = true${settingsPredicate}`,
+    authoritativeTimezone === undefined ? [] : [authoritativeTimezone],
   );
   const settings = settingsResult.rows[0];
   if (settings === undefined) return null;
 
   // Use the same ICU timezone validation and day-boundary contract as memory.
-  if (!isValidTimezone(settings.timezone)) {
-    throw new RelationshipConfigurationError("relationship_settings.timezone is not a valid IANA timezone");
+  if (settings.timezone === null || !isValidTimezone(settings.timezone)) {
+    throw new RelationshipConfigurationError("authoritative timezone is not configured or is not a valid IANA timezone");
   }
   if (!Number.isInteger(settings.day_start_hour) || settings.day_start_hour < 0 || settings.day_start_hour > 23) {
     throw new RelationshipConfigurationError("relationship_settings.day_start_hour must be an integer from 0 through 23");

@@ -265,6 +265,7 @@ describe("may-have-earlier-history rule", () => {
 describe("thread snapshot response validation", () => {
   it("accepts a well-formed page with status and paging bounds", () => {
     const parsed = parseThreadSnapshotResponse({
+      timezone: "America/New_York",
       messages: [
         { id: "a", seq: 1, role: "user", text: "hi", sentAt: "2026-10-30T00:00:00.000Z" },
         { id: "b", seq: 2, role: "assistant", text: "hello", sentAt: "2026-10-30T00:00:01.000Z" },
@@ -294,6 +295,7 @@ describe("thread snapshot response validation", () => {
 
   it("accepts an empty page with a null oldest seq", () => {
     const parsed = parseThreadSnapshotResponse({
+      timezone: "America/New_York",
       messages: [],
       status: {
         queued: 0,
@@ -309,6 +311,28 @@ describe("thread snapshot response validation", () => {
       hasMore: false,
       messages: [],
     });
+  });
+
+  it("carries an explicitly unconfigured timezone without guessing from the browser", () => {
+    const parsed = parseThreadSnapshotResponse({
+      timezone: null,
+      messages: [],
+      status: { queued: 0, generating: false, highestAllocatedSeq: 0, hasRecentFailure: false },
+      page: { oldestSeq: null, hasMore: false },
+    });
+    assert.ok(parsed !== null);
+    assert.equal(parsed.timezone, null);
+  });
+
+  it("keeps a structurally valid snapshot when this browser lacks the worker's timezone data", () => {
+    const parsed = parseThreadSnapshotResponse({
+      timezone: "Mars/Olympus_Mons",
+      messages: [threadMessage("zone-fallback", 1)],
+      status: { queued: 0, generating: false, highestAllocatedSeq: 1, hasRecentFailure: false },
+      page: { oldestSeq: 1, hasMore: false },
+    });
+    assert.ok(parsed !== null);
+    assert.equal(parsed.timezone, "Mars/Olympus_Mons");
   });
 
   it("rejects malformed pages instead of crashing", () => {

@@ -85,6 +85,7 @@ function toUiMessage(message: ThreadMessage): Message {
 export function LiveThread() {
   const router = useRouter();
   const [messages, setMessages] = useState<readonly ThreadMessage[]>([]);
+  const [timezone, setTimezone] = useState<string | null>(null);
   const [status, setStatus] = useState<ThreadStatus>({
     queued: 0,
     generating: false,
@@ -136,6 +137,7 @@ export function LiveThread() {
       messages: readonly ThreadMessage[];
       status: ThreadStatus;
       page: ThreadPage;
+      timezone: string | null;
     }) => {
       const merged = mergeThreadMessages(messagesRef.current, parsed.messages);
       messagesRef.current = merged;
@@ -143,6 +145,7 @@ export function LiveThread() {
         merged.length > 0 ? (merged[0]?.seq ?? null) : null;
       statusRef.current = parsed.status;
       setMessages(merged);
+      setTimezone(parsed.timezone);
       setStatus(parsed.status);
       setPending((previous) => dropConfirmedPending(previous, parsed.messages));
     },
@@ -579,7 +582,7 @@ export function LiveThread() {
           </Typography>
         </Box>
       ) : (
-        <Thread messages={uiMessages} onOpenImage={setLightboxImage} />
+        <Thread messages={uiMessages} timezone={timezone} onOpenImage={setLightboxImage} />
       )}
       {connection === "live" && composing && (
         <Box sx={{ px: 2, pb: 0.5 }}>

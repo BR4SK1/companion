@@ -16,6 +16,8 @@
  * is treated as an unavailable upstream rather than trusted.
  */
 
+import { isValidInstant, isValidTimezone } from "../time.ts";
+
 export interface WorkerMessage {
   readonly id: string;
   readonly seq: number;
@@ -25,6 +27,8 @@ export interface WorkerMessage {
 }
 
 export interface ThreadSnapshot {
+  /** Authoritative worker timezone, null only while unconfigured. */
+  readonly timezone: string | null;
   readonly messages: readonly WorkerMessage[];
   readonly queued: number;
   readonly generating: boolean;
@@ -114,7 +118,7 @@ function parseWorkerMessage(value: unknown): WorkerMessage | null {
     (role !== "user" && role !== "assistant") ||
     typeof content !== "string" ||
     typeof createdAt !== "string" ||
-    Number.isNaN(Date.parse(createdAt))
+    !isValidInstant(createdAt)
   ) {
     return null;
   }
@@ -126,10 +130,15 @@ function parseThreadSnapshot(value: unknown): ThreadSnapshot | null {
     return null;
   }
   const rawMessages = value.messages;
+  // Older workers predate timezone propagation. At this trusted BFF boundary,
+  // absence is the explicit unconfigured state; a present malformed value is
+  // still rejected below.
+  const timezone = value.timezone === undefined ? null : value.timezone;
   const status = value.status;
   const page = value.page;
   if (
     !Array.isArray(rawMessages) ||
+    !(timezone === null || (typeof timezone === "string" && isValidTimezone(timezone))) ||
     !isRecord(status) ||
     !isRecord(page)
   ) {
@@ -163,6 +172,7 @@ function parseThreadSnapshot(value: unknown): ThreadSnapshot | null {
     messages.push(message);
   }
   return {
+    timezone,
     messages,
     queued,
     generating,

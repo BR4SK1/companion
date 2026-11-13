@@ -11,6 +11,7 @@ import { expect, test } from "@playwright/test";
 
 import { gateOrigin, messagePost, threadGet, uniqueKey } from "../helpers/api.mjs";
 import { PATTERNS, seedPatterns, seedIdentity, E2E_IDENTITY } from "../helpers/db.mjs";
+import { config } from "../helpers/config.mjs";
 import { waitForQuiescent } from "../helpers/quiesce.mjs";
 import {
   chatRecords,
@@ -22,6 +23,16 @@ import {
 } from "../helpers/provider.mjs";
 
 const greetingGuidance = PATTERNS[0].responseGuidance;
+
+function temporalSystemMessage(messages) {
+  const temporal = messages.find(
+    (message) => message.role === "system" && message.content.startsWith("Current local date and time:"),
+  );
+  expect(temporal).toBeTruthy();
+  expect(temporal.content).toContain(`(${config.temporalTimezone},`);
+  expect(temporal.content).toMatch(/Meteorological season(?::| is unspecified)/);
+  return temporal;
+}
 
 test.beforeAll(async () => {
   // Never script the provider or touch the pattern table while a turn from
@@ -83,15 +94,21 @@ test.describe("accept, answer, persist", () => {
     expect(decision.questions.response_pattern.criteria["e2e-detail"]).toBe(PATTERNS[1].selectionDescription);
     expect(decision.questions.response_pattern.instructions).toBeTruthy();
 
-    // The chat generation carries the seeded identity as the leading system
-    // message and the selected pattern's response guidance as the second
-    // (the provider answers with the first offered option, i.e. the first
-    // seeded pattern).
+    // The identity leads the system chunks; temporal context is a distinct
+    // system message, and the selected pattern guidance follows it (the
+    // provider chooses the first offered pattern). Assert the structure, not
+    // the volatile local date/time values.
     const chats = await chatRecords();
     expect(chats.length).toBeGreaterThanOrEqual(1);
     const chat = chats.at(-1).body;
     expect(chat.messages[0]).toEqual({ role: "system", content: E2E_IDENTITY });
-    expect(chat.messages[1]).toEqual({ role: "system", content: greetingGuidance });
+    const temporal = temporalSystemMessage(chat.messages);
+    const temporalIndex = chat.messages.indexOf(temporal);
+    const guidanceIndex = chat.messages.findIndex(
+      (message) => message.role === "system" && message.content === greetingGuidance,
+    );
+    expect(temporalIndex).toBeGreaterThan(0);
+    expect(guidanceIndex).toBeGreaterThan(temporalIndex);
     expect(chat.messages.some((message) => message.role === "user" && message.content === text)).toBe(true);
     expect(chat.model).toBe("e2e-fake-chat-model");
   });
@@ -137,18 +154,23 @@ test.describe("accept, answer, persist", () => {
     expect(chats.length).toBe(chatsBefore + 2);
     const secondTurnRequest = chats.at(-1).body;
     const roles = secondTurnRequest.messages.map((message) => message.role);
-    // Leading identity, then guidance, then prior context and this turn's
-    // message.
+    // Identity leads, temporal context and selected guidance precede the prior
+    // conversation, whose chronology ends with this turn's own message.
     expect(roles[0]).toBe("system");
     expect(secondTurnRequest.messages[0].content).toBe(E2E_IDENTITY);
-    expect(secondTurnRequest.messages[1].content).toBe(greetingGuidance);
+    const temporal = temporalSystemMessage(secondTurnRequest.messages);
+    const temporalIndex = secondTurnRequest.messages.indexOf(temporal);
+    const guidanceIndex = secondTurnRequest.messages.findIndex(
+      (message) => message.role === "system" && message.content === greetingGuidance,
+    );
+    expect(guidanceIndex).toBeGreaterThan(temporalIndex);
     const contents = secondTurnRequest.messages.map((message) => message.content);
     const firstIndex = contents.indexOf(first);
     const replyAfterFirstIndex = roles.findIndex(
       (role, index) => index > firstIndex && role === "assistant",
     );
     const secondIndex = contents.indexOf(second);
-    expect(firstIndex).toBeGreaterThan(1);
+    expect(firstIndex).toBeGreaterThan(guidanceIndex);
     expect(replyAfterFirstIndex).toBeGreaterThan(firstIndex);
     expect(secondIndex).toBeGreaterThan(replyAfterFirstIndex);
   });

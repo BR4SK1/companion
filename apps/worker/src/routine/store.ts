@@ -27,7 +27,7 @@ export class RoutineConfigurationError extends Error {
 }
 
 interface SettingsRow {
-  timezone: string;
+  timezone: string | null;
   departure_context: string | null;
 }
 interface TransitionRow {
@@ -73,8 +73,8 @@ function validateConfiguration(
   settings: SettingsRow,
   transitions: readonly RoutineTransition[],
 ): void {
-  if (!isValidTimezone(settings.timezone)) {
-    throw new RoutineConfigurationError("routine_settings.timezone is not a valid IANA timezone");
+  if (settings.timezone === null || !isValidTimezone(settings.timezone)) {
+    throw new RoutineConfigurationError("authoritative timezone is not configured or is not a valid IANA timezone");
   }
   if (!nonEmptyOptional(settings.departure_context)) {
     throw new RoutineConfigurationError("routine_settings.departure_context must be null or non-empty");
@@ -111,19 +111,24 @@ type RoutineQueryable = Pick<PostgresPool, "query">;
 
 export async function loadRoutineConfiguration(
   pool: RoutineQueryable,
+  authoritativeTimezone?: string | null,
 ): Promise<RoutineConfiguration | null> {
   // One statement is important here: callers such as the claim gate run at
   // READ COMMITTED, where separate settings/transition SELECTs can observe
-  // different commits. The LEFT JOIN also preserves the distinction between
-  // missing settings and an invalid configured schedule with no transitions.
+  // different commits. The configured authoritative zone is read from the
+  // singleton; worker composition may pin its startup snapshot so a zone edit
+  // takes effect only after a controlled restart.
+  const zone = authoritativeTimezone === undefined ? "settings.timezone" : "$1::text";
   const result = await pool.query<SettingsRow & TransitionRow>(
-    `SELECT s.timezone, s.departure_context,
+    `SELECT ${zone} AS timezone, s.departure_context,
             t.id, t.transition_key, t.weekday, t.local_minute, t.location,
             t.activity, t.available, t.interaction_context
      FROM routine_settings AS s
+     CROSS JOIN companion_time_settings AS settings
      LEFT JOIN routine_transition AS t ON t.enabled = true
-     WHERE s.id = true
+     WHERE s.id = true AND settings.id = true
      ORDER BY t.weekday, t.local_minute, t.transition_key`,
+    authoritativeTimezone === undefined ? [] : [authoritativeTimezone],
   );
   const first = result.rows[0];
   if (first === undefined) return null;
@@ -145,7 +150,7 @@ export async function loadRoutineConfiguration(
     }));
   validateConfiguration(settings, transitions);
   return {
-    timezone: settings.timezone,
+    timezone: settings.timezone!,
     departureContext: settings.departure_context,
     transitions,
   };
@@ -215,7 +220,7 @@ export interface RoutineStore {
   readonly reconcile: (now?: Date) => Promise<RoutineAppliedState | null>;
   /** Evaluate the current runtime configuration at the claim transaction's database time. */
   readonly canStartNewTurn: (client: PostgresPoolClient) => Promise<boolean>;
-  /** Reconcile and return current scheduled/applied context, or null if unconfigured. */
+  /** Read-only scheduled/applied projection at the supplied instant, or null if unconfigured. */
   readonly getSnapshot: (now?: Date) => Promise<RoutineSnapshot | null>;
   /** Prepare the current pending notice on the conversation publication transaction. */
   readonly prepareAnnouncement: (client: PostgresPoolClient) => Promise<RoutineAnnouncementDraft | null>;
@@ -236,8 +241,13 @@ export interface RoutineStore {
 
 export function createRoutineStore(input: {
   readonly pool: PostgresPool;
+  /** Startup snapshot of the worker-wide timezone; null disables this feature. */
+  readonly timezone?: string | null;
 }): RoutineStore {
   const { pool } = input;
+
+  const loadConfiguration = (queryable: RoutineQueryable) =>
+    loadRoutineConfiguration(queryable, input.timezone);
 
   async function synchronizeAnnouncement(
     client: PostgresPoolClient,
@@ -386,7 +396,7 @@ export function createRoutineStore(input: {
     // Load one coherent configuration revision after the lock, then use that
     // in-memory revision for every occurrence recorded by this transaction.
     // Editing schedule data takes effect without requiring a worker restart.
-    const configuration = await loadRoutineConfiguration(client);
+    const configuration = await loadConfiguration(client);
     if (configuration === null) {
       await client.query(
         `UPDATE routine_announcement
@@ -494,7 +504,7 @@ export function createRoutineStore(input: {
   }
 
   async function canStartNewTurn(client: PostgresPoolClient): Promise<boolean> {
-    const configuration = await loadRoutineConfiguration(client);
+    const configuration = await loadConfiguration(client);
     if (configuration === null) return true;
     const clock = await client.query<{ now: Date }>("SELECT clock_timestamp() AS now");
     const now = clock.rows[0]?.now;
@@ -520,7 +530,7 @@ export function createRoutineStore(input: {
     if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
       throw new Error("routine announcement clock query returned no valid timestamp");
     }
-    const configuration = await loadRoutineConfiguration(client);
+    const configuration = await loadConfiguration(client);
     if (configuration === null) {
       await client.query(
         `UPDATE routine_announcement
@@ -574,17 +584,36 @@ export function createRoutineStore(input: {
   }
 
   async function getSnapshot(requestedNow?: Date): Promise<RoutineSnapshot | null> {
-    return withTransaction(pool, async (client) => {
-      const result = await reconcileInTransaction(client, requestedNow);
-      if (result.configuration === null || result.applied === null) return null;
-      const scheduled = scheduledRoutineStateAt(result.now, result.configuration);
-      const next = nextRoutineTransition(result.now, result.configuration);
-      return {
-        scheduled,
-        applied: result.applied,
-        next,
-      };
-    });
+    return withTransaction(
+      pool,
+      async (client) => {
+        const clock = requestedNow === undefined
+          ? await client.query<{ now: Date }>("SELECT clock_timestamp() AS now")
+          : { rows: [{ now: new Date(requestedNow.getTime()) }] };
+        const now = clock.rows[0]?.now;
+        if (!(now instanceof Date) || !Number.isFinite(now.getTime())) {
+          throw new Error("routine snapshot clock query returned no valid timestamp");
+        }
+        const configuration = await loadConfiguration(client);
+        if (configuration === null) return null;
+        const appliedResult = await client.query<AppliedRow>(
+          `SELECT transition_id, transition_key, local_date::text AS local_date,
+                  scheduled_at, applied_at, location, activity, available, interaction_context
+           FROM routine_applied_transition
+           WHERE applied_at <= $1
+           ORDER BY scheduled_at DESC, transition_key COLLATE "C" DESC
+           LIMIT 1`,
+          [now],
+        );
+        const row = appliedResult.rows[0];
+        return {
+          scheduled: scheduledRoutineStateAt(now, configuration),
+          applied: row === undefined ? null : mapApplied(row),
+          next: nextRoutineTransition(now, configuration),
+        };
+      },
+      { readOnly: true, isolationLevel: "repeatable read" },
+    );
   }
 
   return {

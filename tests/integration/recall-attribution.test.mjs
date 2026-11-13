@@ -20,6 +20,7 @@ import {
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { recallCanonical } from "../../apps/worker/src/memory/recall.ts";
 import { loadMemoryConfig } from "../../apps/worker/src/memory/config.ts";
 import { buildCanonicalMemoryContextForPrompt } from "../../apps/worker/src/memory/chat-context.ts";
@@ -42,6 +43,7 @@ describe("canonical recall attribution (PostgreSQL)", { skip: !hasDatabase }, ()
       ...conversationMigrations,
       ...memoryMigrations,
       ...articleMigrations,
+      ...temporalMigrations,
     ]);
   });
 

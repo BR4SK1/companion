@@ -43,6 +43,8 @@ function strFromEnv(name, fallback) {
 }
 
 export const config = {
+  /** Synthetic authoritative zone used by the disposable stack's UI journeys. */
+  temporalTimezone: "America/Los_Angeles",
   /** Web app: main (owner-only) listener. */
   webPort: intFromEnv("E2E_WEB_PORT", 4620),
   /** Web app: loopback-only test-entry gate listener (what the tests drive). */

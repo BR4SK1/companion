@@ -1,9 +1,9 @@
 /**
  * History and scrolling: seeded durable history (completed past turns,
- * spread over three UTC days) is paged, the automatic bounded backfill stops
- * short of the bottom and the "Load earlier messages" control covers the
- * rest, day dividers mark the UTC days, and the scroll anchoring /
- * jump-to-latest behavior keeps the reader in control.
+ * spread over three configured Los Angeles calendar days) is paged, the
+ * automatic bounded backfill stops short of the bottom and the "Load earlier
+ * messages" control covers the rest, local-day dividers mark those dates, and
+ * scroll anchoring / jump-to-latest behavior keeps the reader in control.
  *
  * The seed is sized against the client's actual walk: the automatic
  * backfill runs once (up to five pages) and does not resume on later
@@ -17,11 +17,22 @@ import { expect, test } from "@playwright/test";
 
 import { gateOrigin, messagePost, threadGet, uniqueKey } from "../helpers/api.mjs";
 import { seedHistory } from "../helpers/db.mjs";
+import { config } from "../helpers/config.mjs";
 
 const HISTORY_TURNS = 350; // 700 messages: newest page + one 5-page walk + one load-earlier click reach the bottom.
+let expectedLocalDayLabels = [];
 
 test.beforeAll(async () => {
-  await seedHistory(HISTORY_TURNS);
+  const seededInstants = await seedHistory(HISTORY_TURNS);
+  const label = new Intl.DateTimeFormat("en-US", {
+    timeZone: config.temporalTimezone,
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  expect(seededInstants).toHaveLength(3);
+  expectedLocalDayLabels = seededInstants.map((instant) => label.format(new Date(instant)));
+  expect(new Set(expectedLocalDayLabels).size).toBe(3);
 });
 
 /**
@@ -55,6 +66,7 @@ test("the BFF newest page is bounded and reports more history", async ({ context
   expect(issuance.ok()).toBe(true);
   const thread = await threadGet(context);
   expect(thread.status).toBe(200);
+  expect(thread.body.timezone).toBe(config.temporalTimezone);
   expect(thread.body.messages.length).toBe(100);
   expect(thread.body.page.hasMore).toBe(true);
   expect(
@@ -84,23 +96,25 @@ test("older history is reachable through the load-earlier control", async ({ pag
   await expect(page.getByRole("button", { name: "Load earlier messages" })).toHaveCount(0);
 });
 
-test("UTC day dividers mark the seeded days", async ({ page }) => {
+test("configured local-day dividers mark the seeded dates", async ({ page }) => {
   await page.goto("/");
-  // Walk to the bottom so all seeded days are fully loaded: the day-divider
-  // rendering emits a divider at each UTC-day change, and the three-day
-  // seed provides two boundaries.
+  // Walk to the bottom so all seeded dates are loaded. The synthetic events
+  // are at 00:30 UTC, which is the preceding Los Angeles date; expected labels
+  // are independently derived from that configured zone rather than UTC.
   await walkToBottom(page);
   // Divider chips render a <time> inside a chip label; message clock times
   // are plain <time> elements, so scope to the chip labels.
   const dividers = page.locator(".MuiChip-label time");
   await expect(dividers.first()).toBeVisible();
-  const labels = new Set();
+  const labels = [];
   const count = await dividers.count();
-  expect(count).toBeGreaterThanOrEqual(2);
   for (let index = 0; index < count; index += 1) {
-    labels.add(await dividers.nth(index).textContent());
+    labels.push(await dividers.nth(index).textContent());
   }
-  expect(labels.size).toBeGreaterThanOrEqual(2);
+  // Three seeded dates produce dividers only at the two later date boundaries.
+  expect(labels).toEqual(expectedLocalDayLabels.slice(1));
+  expect(labels).toHaveLength(2);
+  expect(labels.every((label) => !label.includes("UTC"))).toBe(true);
 });
 
 test("scrolling up shows jump-to-latest and returns to the newest message", async ({ page }) => {

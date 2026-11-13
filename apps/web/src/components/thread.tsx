@@ -17,6 +17,7 @@ import { MessageClusterView } from "./message-cluster";
 
 interface ThreadProps {
   messages: readonly Message[];
+  timezone: string | null;
   onOpenImage: (image: MessageImage) => void;
 }
 
@@ -36,12 +37,12 @@ function geometryOf(element: HTMLElement): ScrollGeometry {
  * is never pulled down — a "jump to latest" button appears instead. This is
  * the core "don't pull the owner away from older messages" behavior.
  */
-export function Thread({ messages, onOpenImage }: ThreadProps) {
+export function Thread({ messages, timezone, onOpenImage }: ThreadProps) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const followRef = useRef(true);
   const [following, setFollowing] = useState(true);
 
-  const items = useMemo(() => groupThread(messages), [messages]);
+  const items = useMemo(() => groupThread(messages, timezone), [messages, timezone]);
 
   useEffect(() => {
     const element = scrollerRef.current;
@@ -128,7 +129,7 @@ export function Thread({ messages, onOpenImage }: ThreadProps) {
                   size="small"
                   variant="outlined"
                   label={
-                    <time dateTime={item.at}>{formatDayLabel(item.at)}</time>
+                    <time dateTime={item.at}>{formatDayLabel(item.at, timezone)}</time>
                   }
                 />
                 <Divider sx={{ flex: 1 }} />
@@ -137,6 +138,7 @@ export function Thread({ messages, onOpenImage }: ThreadProps) {
               <MessageClusterView
                 key={item.messages[0].id}
                 cluster={item}
+                timezone={timezone}
                 isThreadEnd={index === lastClusterIndex}
                 onOpenImage={onOpenImage}
               />

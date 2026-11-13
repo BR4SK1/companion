@@ -27,6 +27,7 @@ import { conversationMigrations } from "../../apps/worker/src/conversation/migra
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { engagementMigrations } from "../../apps/worker/src/engagement/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import {
   CLAIM_ADVISORY_LOCK_KEY,
   createConversationStore,
@@ -57,7 +58,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     // Fresh application against the provided non-production database; the
     // worker applies the conversation and memory domain migrations together
     // (see main.ts), so every test below assumes both domain schemas exist.
-    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations, ...articleMigrations]);
+    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations, ...articleMigrations, ...temporalMigrations]);
     // The chat identity is required runtime configuration (like
     // response_pattern): provision a generic fixture row so engine cycles
     // can run. It is configuration, not per-test data, so the beforeEach
@@ -96,6 +97,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       ...conversationMigrations,
       ...memoryMigrations,
       ...articleMigrations,
+      ...temporalMigrations,
     ]);
     assert.deepEqual(second.applied, []);
     // Ids are feature-owned labels, not a global sequence: the composition
@@ -112,6 +114,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       "0007_article_work",
       "0008_article_share_and_evidence",
       "0009_article_observation_claim",
+      "0016_authoritative_temporal_context",
+      "0017_trace_attempt_temporal_context",
     ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
@@ -263,6 +267,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         ...memoryMigrations,
         ...articleMigrations,
         ...engagementMigrations,
+        ...temporalMigrations,
       ]);
       await pool.query(
         `INSERT INTO chat_identity (id, content, revision)
@@ -2424,7 +2429,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     await pool.query(
       `DELETE FROM companion_schema_migration
        WHERE id IN ('0002_conversation_tracing', '0004_chat_identity',
-                    '0008_article_share_and_evidence')`,
+                    '0008_article_share_and_evidence', '0017_trace_attempt_temporal_context')`,
     );
 
     // A legacy turn exactly as pre-tracing code wrote it.
@@ -2454,11 +2459,13 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     const applied = await runMigrations(pool, [
       ...conversationMigrations,
       ...articleMigrations,
+      ...temporalMigrations,
     ]);
     assert.deepEqual(applied.applied, [
       "0002_conversation_tracing",
       "0004_chat_identity",
       "0008_article_share_and_evidence",
+      "0017_trace_attempt_temporal_context",
     ]);
 
     // The legacy row is untouched: the decision JSONB is exactly as inserted,

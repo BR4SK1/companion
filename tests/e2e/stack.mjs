@@ -726,53 +726,90 @@ async function up() {
     log("postgres ready (accepts queries)");
 
     // 3. Worker (real application code) against the throwaway database and
-    //    the fake provider; strict configuration, no fallbacks.
-    children.worker = spawnManaged({
-      name: "worker",
-      command: "node",
-      args: ["--experimental-strip-types", "src/main.ts"],
-      cwd: config.workerDir,
-      env: {
-        WORKER_DATABASE_URL: `postgres://${dbUser}:${dbPassword}@${GATE_HOST}:${String(config.pgPort)}/${dbName}`,
-        OPENROUTER_API_KEY: providerKey,
-        WORKER_CHAT_MODEL: "e2e-fake-chat-model",
-        WORKER_DECISION_MODEL: "e2e-fake-decision-model",
-        WORKER_API_TOKEN: workerToken,
-        WORKER_HTTP_HOST: GATE_HOST,
-        WORKER_HTTP_PORT: String(config.workerPort),
-        WORKER_OPENROUTER_CHAT_URL: `http://${GATE_HOST}:${String(config.providerPort)}/api/v1/chat/completions`,
-        WORKER_OPENROUTER_DECISIONS_URL: `http://${GATE_HOST}:${String(config.providerPort)}/api/alpha/decisions`,
-        WORKER_LEASE_SECONDS: "6",
-        WORKER_POLL_SECONDS: "1",
-        WORKER_CHAT_TIMEOUT_MS: "15000",
-        WORKER_DECISION_TIMEOUT_MS: "10000",
-      },
-      runDir,
-    });
-    state.children.worker = {
-      pid: children.worker.pid,
-      starttime: procStarttime(children.worker.pid),
+    //    the fake provider; strict configuration, no fallbacks. The first
+    //    start applies migrations; below we provision a synthetic test zone
+    //    and restart so the worker captures it at startup, as production does.
+    const startWorker = () =>
+      spawnManaged({
+        name: "worker",
+        command: "node",
+        args: ["--experimental-strip-types", "src/main.ts"],
+        cwd: config.workerDir,
+        env: {
+          WORKER_DATABASE_URL: `postgres://${dbUser}:${dbPassword}@${GATE_HOST}:${String(config.pgPort)}/${dbName}`,
+          OPENROUTER_API_KEY: providerKey,
+          WORKER_CHAT_MODEL: "e2e-fake-chat-model",
+          WORKER_DECISION_MODEL: "e2e-fake-decision-model",
+          WORKER_API_TOKEN: workerToken,
+          WORKER_HTTP_HOST: GATE_HOST,
+          WORKER_HTTP_PORT: String(config.workerPort),
+          WORKER_OPENROUTER_CHAT_URL: `http://${GATE_HOST}:${String(config.providerPort)}/api/v1/chat/completions`,
+          WORKER_OPENROUTER_DECISIONS_URL: `http://${GATE_HOST}:${String(config.providerPort)}/api/alpha/decisions`,
+          WORKER_LEASE_SECONDS: "6",
+          WORKER_POLL_SECONDS: "1",
+          WORKER_CHAT_TIMEOUT_MS: "15000",
+          WORKER_DECISION_TIMEOUT_MS: "10000",
+        },
+        runDir,
+      });
+    const recordWorker = () => {
+      state.children.worker = {
+        pid: children.worker.pid,
+        starttime: procStarttime(children.worker.pid),
+      };
+      writeState(state);
     };
-    writeState(state);
-    await Promise.race([
-      childExitPromise(children.worker, "worker"),
-      waitForHttp(
-        `${urlOfWorker()}/healthz`,
-        config.timeouts.worker,
-        "worker /healthz",
-        (response) => response.status === 200,
-      ),
-    ]);
-    await Promise.race([
-      childExitPromise(children.worker, "worker"),
-      waitForHttp(
-        `${urlOfWorker()}/readyz`,
-        config.timeouts.worker,
-        "worker /readyz",
-        (response) => response.status === 200,
-      ),
-    ]);
+    const waitForWorkerReady = async () => {
+      await Promise.race([
+        childExitPromise(children.worker, "worker"),
+        waitForHttp(
+          `${urlOfWorker()}/healthz`,
+          config.timeouts.worker,
+          "worker /healthz",
+          (response) => response.status === 200,
+        ),
+      ]);
+      await Promise.race([
+        childExitPromise(children.worker, "worker"),
+        waitForHttp(
+          `${urlOfWorker()}/readyz`,
+          config.timeouts.worker,
+          "worker /readyz",
+          (response) => response.status === 200,
+        ),
+      ]);
+    };
+    children.worker = startWorker();
+    recordWorker();
+    await waitForWorkerReady();
     log("worker healthy and ready (migrations applied)");
+
+    const configuredZone = await docker([
+      "exec", containerName, "psql", "-U", dbUser, "-d", dbName,
+      "-tAc",
+      `UPDATE companion_time_settings SET timezone = '${config.temporalTimezone}', updated_at = now() WHERE id = true RETURNING timezone;`,
+    ]);
+    if (configuredZone.code !== 0 || configuredZone.stdout.trim() !== config.temporalTimezone) {
+      throw new Error(`could not provision the disposable E2E timezone: ${configuredZone.stderr.trim()}`);
+    }
+    const firstWorker = children.worker;
+    firstWorker.kill("SIGTERM");
+    for (let waited = 0; firstWorker.exitCode === null && waited < 100; waited += 1) {
+      await sleep(100);
+    }
+    if (firstWorker.exitCode === null) {
+      firstWorker.kill("SIGKILL");
+      for (let waited = 0; firstWorker.exitCode === null && waited < 30; waited += 1) {
+        await sleep(100);
+      }
+    }
+    if (firstWorker.exitCode === null) {
+      throw new Error("initial worker did not stop for the disposable timezone restart");
+    }
+    children.worker = startWorker();
+    recordWorker();
+    await waitForWorkerReady();
+    log(`worker restarted and captured disposable timezone ${config.temporalTimezone}`);
 
     // 4. Web production build with the loopback test gate (trusted local).
     if (buildId === null) {

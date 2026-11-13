@@ -302,7 +302,8 @@ describe("worker private HTTP API", () => {
     });
     // The response carries exactly the sanitized fields: no error text,
     // no turn identifiers, no provider detail anywhere in the payload.
-    assert.deepEqual(Object.keys(body).sort(), ["messages", "page", "status"]);
+    assert.deepEqual(Object.keys(body).sort(), ["messages", "page", "status", "timezone"]);
+    assert.equal(body.timezone, null);
   });
 
   it("rejects out-of-range or malformed page bounds and limits", async () => {

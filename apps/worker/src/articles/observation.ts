@@ -38,7 +38,7 @@ import { hashArtifact } from "../memory/hashing.ts";
 import { assertCompleteResponse } from "../memory/extraction.ts";
 import { buildObservationDocument } from "../memory/consolidation.ts";
 import { evaluateObservationCandidate, OBSERVATION_POLICY_VERSION } from "../memory/policy.ts";
-import type { BehaviorTime } from "../memory/time.ts";
+import { isValidTimezone, type BehaviorTime } from "../memory/time.ts";
 import { recordMemoryOperation } from "../memory/runtime.ts";
 import type { MemoryFact } from "../memory/types.ts";
 import { memoryErrorCategory } from "../memory/errors.ts";
@@ -76,6 +76,8 @@ class ConsolidationClaimLostError extends Error {
 
 export interface ArticleObservationDeps {
   readonly pool: PostgresPool;
+  /** Startup-captured authoritative zone; omitted only by direct domain callers/tests. */
+  readonly timezone?: string | null;
   readonly callLlm: ArticleRuntimeLlmCaller;
   readonly log?: (message: string) => void;
   /** Claim lease duration; tests shorten it to exercise recovery. */
@@ -94,7 +96,7 @@ export type ArticleObservationOutcome =
   | { readonly status: "failed"; readonly category: string };
 
 interface BehaviorRow {
-  timezone: string;
+  timezone: string | null;
   day_start_hour: number;
 }
 
@@ -125,12 +127,20 @@ export async function runArticleObservationConsolidation(
 
   // Provisioned behavioral-day boundary (memory-domain configuration): the
   // evidence-day counting input. Missing is a rollout state.
+  const timezoneExpression = deps.timezone === undefined ? "settings.timezone" : "$1::text";
   const behaviorResult = await pool.query<BehaviorRow>(
-    `SELECT timezone, day_start_hour FROM memory_behavior WHERE id = 'behavior'`,
+    `SELECT ${timezoneExpression} AS timezone, behavior.day_start_hour
+     FROM memory_behavior AS behavior
+     CROSS JOIN companion_time_settings AS settings
+     WHERE behavior.id = 'behavior' AND settings.id = true`,
+    deps.timezone === undefined ? [] : [deps.timezone],
   );
   const behaviorRow = behaviorResult.rows[0];
-  if (behaviorRow === undefined) {
+  if (behaviorRow === undefined || behaviorRow.timezone === null) {
     return { status: "skipped", reason: "behavior_boundary_not_provisioned" };
+  }
+  if (!isValidTimezone(behaviorRow.timezone)) {
+    return { status: "skipped", reason: "authoritative_timezone_invalid" };
   }
   const behavior: BehaviorTime = {
     timezone: behaviorRow.timezone,

@@ -13,7 +13,7 @@ What is implemented:
 - **Non-production-only loopback test entry.** An optional, fail-closed gate adds a `127.0.0.1`-bound listener inside the pod for E2E access without sign-in, with its own identity-free session kind, secret, and cookie; see the dedicated section below. The owner-only paths are unchanged when the gate is off (the default).
 - **Live thread UI.** The page is server-rendered fail-closed (unavailable → automatic sign-in for signed-out visits, with a generic retry view after auth errors → live thread), then a client component polls the BFF's newest page and merges it by message id. It walks history backwards (up to five pages per cycle until the bottom; an interrupted walk resumes where it stopped on a later cycle; older history behind a "Load earlier messages" control, which stays visible while allocated-but-uncommitted seqs may exist below the loaded bottom). Reconciliation has no timing assumptions: the client re-derives the gaps between its loaded seqs every cycle and spends a bounded page budget (three pages per cycle, round-robin across gaps, walk cursors persist between cycles) walking each gap downward — recovering late-committed messages buried under later traffic and waiting out in-flight transactions for as long as they take; a seq burned by a rolled-back insert never resolves, and its cost is bounded probing, never a missed message. Retried sends reuse the same idempotency key; a conflicting key reuse (409) recovers with a fresh key. Loading, connection-error (automatic retry plus an explicit retry control), ended-session, per-message failure states, and a sanitized notice when the trailing conversation includes a failed generation (no error detail) are all visible.
 - **Installable PWA shell.** A web app manifest (`/manifest.webmanifest`, static user-agnostic values) with the Companion name, `standalone` display, and icons generated at build time from source-defined drawing code; Apple home-screen metadata and a 180×180 `apple-touch-icon`; a minimal production-only service worker that serves one static offline fallback page and caches nothing else (see the PWA section below).
-- **Single continuous thread.** Clusters, UTC day dividers, scroll anchoring, and the composer carry over from the first client slice unchanged; internal turns and work grouping never fragment the visible thread.
+- **Single continuous thread.** Clusters, authoritative local-day dividers, scroll anchoring, and the composer carry over from the first client slice; internal turns and work grouping never fragment the visible thread. The BFF relays the worker's startup-captured IANA timezone with each page, and the browser does not infer a zone from its own environment. If the worker has no configured zone, or a browser's ICU data cannot format that zone, clocks fall back to explicitly labeled UTC and local-day dividers are omitted rather than guessed.
 
 Not implemented (by design): uploads, voice, image-generation integration, message editing/deletion, and any multi-user or tenant concept. Images exist only as presentation support in the message model; no backend produces them. The BFF's worker client also exposes an engagement-summary read (`getEngagement`, the worker's `GET /v1/engagement`) for future consumers, but no browser-facing engagement route or UI exists yet in this slice — the method is currently unused by any route.
 
@@ -110,6 +110,18 @@ The experience is one owner and one continuous client-visible conversation. Inte
 
 - Session hardening beyond the signed cookie (rotation, revocation list, IdP back-channel logout) when the threat model calls for it.
 - Token refresh and keep-alive of the IdP session; currently the BFF session simply expires.
-- Locale/timezone handling: thread labels are UTC-based for determinism; revisit with the owner's timezone preference.
+- Thread date/time labels and day dividers use the worker's authoritative IANA
+  timezone through the authenticated BFF response. A worker timezone change is
+  captured on worker restart; until configured, UTC is explicitly labeled and
+  day dividers are omitted. The BFF maps an absent timezone field from an older
+  worker to the explicit unconfigured (`null`) state, but rejects malformed
+  values when the field is present. If a browser cannot format an otherwise
+  validated zone due to older ICU data, it falls back to explicitly labeled UTC
+  without local-day dividers.
+- A residual compatibility risk remains: the BFF strictly validates against
+  its own Luxon/ICU timezone data, so a worker/BFF timezone-data mismatch could
+  make the BFF reject a zone valid to the worker and return an unavailable
+  thread page. Keep their runtime timezone data compatible; strict validation
+  is not bypassed.
 - Whether the fixed page size (currently 100 messages, BFF-fixed) and the automatic history backfill bound (currently 5 pages) should become configurable once history grows.
 - Rate limiting and abuse controls at the BFF edge (currently none beyond authentication, origin checks, and input bounds).

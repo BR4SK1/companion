@@ -1,13 +1,14 @@
 /**
  * The no-pattern decision path: with no enabled response patterns the worker
- * skips the decision step entirely and runs chat without guidance — no
+ * skips the decision step entirely and runs chat without pattern guidance — no
  * silent fallback, and no decision call at all.
  */
 
 import { expect, test } from "@playwright/test";
 
 import { threadGet } from "../helpers/api.mjs";
-import { disablePatterns, seedIdentity, E2E_IDENTITY } from "../helpers/db.mjs";
+import { disablePatterns, seedIdentity, E2E_IDENTITY, PATTERNS } from "../helpers/db.mjs";
+import { config } from "../helpers/config.mjs";
 import { waitForQuiescent } from "../helpers/quiesce.mjs";
 import {
   chatRecords,
@@ -27,7 +28,7 @@ test.beforeAll(async () => {
   await resetRecords();
 });
 
-test("without enabled patterns chat runs without decision calls or guidance", async ({ page, context }) => {
+test("without enabled patterns chat skips decisions and pattern guidance", async ({ page, context }) => {
   await page.goto("/");
   const text = `e2e-no-pattern-${Date.now().toString(36)}`;
   await page.getByPlaceholder("Message").fill(text);
@@ -45,10 +46,20 @@ test("without enabled patterns chat runs without decision calls or guidance", as
   const chats = await chatRecords();
   expect(chats.length).toBeGreaterThanOrEqual(1);
   const chat = chats.at(-1).body;
-  // The only system message is the seeded identity; no guidance chunk is
-  // sent because no pattern was selected.
+  // Identity leads the system chunks and current temporal context remains
+  // present. The skipped decision contributes none of the fixture's pattern
+  // guidance; avoid assuming temporal context is the only other system chunk.
   const systemMessages = chat.messages.filter((message) => message.role === "system");
-  expect(systemMessages).toEqual([{ role: "system", content: E2E_IDENTITY }]);
+  expect(systemMessages[0]).toEqual({ role: "system", content: E2E_IDENTITY });
+  const temporal = systemMessages.find(
+    (message) => message.content.startsWith("Current local date and time:"),
+  );
+  expect(temporal).toBeTruthy();
+  expect(temporal.content).toContain(`(${config.temporalTimezone},`);
+  expect(temporal.content).toMatch(/Meteorological season(?::| is unspecified)/);
+  expect(systemMessages.some((message) =>
+    PATTERNS.some((pattern) => message.content === pattern.responseGuidance),
+  )).toBe(false);
   expect(chat.messages.some((message) => message.role === "user" && message.content === text)).toBe(true);
 
   const thread = await threadGet(context);

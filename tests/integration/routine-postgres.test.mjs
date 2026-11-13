@@ -12,6 +12,7 @@ import { engagementMigrations } from "../../apps/worker/src/engagement/migration
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { relationshipMigrations } from "../../apps/worker/src/relationship/migrations.ts";
 import { routineMigrations } from "../../apps/worker/src/routine/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { createRoutineStore, loadRoutineConfiguration } from "../../apps/worker/src/routine/store.ts";
 
@@ -24,6 +25,7 @@ const MIGRATIONS = [
   ...articleMigrations,
   ...relationshipMigrations,
   ...routineMigrations,
+  ...temporalMigrations,
 ];
 
 function poolWithClock(pool, getNow, onQuery = () => {}) {
@@ -66,6 +68,9 @@ function prepareRoutineAnnouncement(routine) {
 
 async function provisionRoutine(pool, available) {
   await pool.query(
+    `UPDATE companion_time_settings SET timezone = 'UTC' WHERE id = true`,
+  );
+  await pool.query(
     `INSERT INTO routine_settings (id, timezone, departure_context)
      VALUES (true, 'UTC', 'Synthetic configured departure details')
      ON CONFLICT (id) DO UPDATE SET timezone = EXCLUDED.timezone,
@@ -92,7 +97,10 @@ describe("routine schedule (PostgreSQL)", { skip: !hasDatabase }, () => {
 
   before(async () => {
     pool = createPostgresPool({ connectionString: DATABASE_URL });
-    await runMigrations(pool, MIGRATIONS.slice(0, -1));
+    await runMigrations(
+      pool,
+      MIGRATIONS.filter((migration) => migration.id !== "0015_routine_announcement_period_id"),
+    );
     await pool.query(`TRUNCATE routine_announcement`);
     await pool.query(
       `INSERT INTO routine_announcement
@@ -587,6 +595,9 @@ describe("routine schedule (PostgreSQL)", { skip: !hasDatabase }, () => {
           changed = true;
           await withTransaction(writer, async (client) => {
             await client.query(
+              `UPDATE companion_time_settings SET timezone = 'America/Los_Angeles' WHERE id = true`,
+            );
+            await client.query(
               `UPDATE routine_settings SET timezone = 'America/Los_Angeles' WHERE id = true`,
             );
             await client.query(
@@ -622,6 +633,9 @@ describe("routine schedule (PostgreSQL)", { skip: !hasDatabase }, () => {
             if (!changed && String(sql).includes("routine_settings")) {
               changed = true;
               await withTransaction(writer, async (writerClient) => {
+                await writerClient.query(
+                  `UPDATE companion_time_settings SET timezone = 'America/Los_Angeles' WHERE id = true`,
+                );
                 await writerClient.query(
                   `UPDATE routine_settings SET timezone = 'America/Los_Angeles' WHERE id = true`,
                 );
@@ -861,7 +875,7 @@ describe("routine schedule (PostgreSQL)", { skip: !hasDatabase }, () => {
     const conversation = createConversationStore(pool);
     const routine = await provisionRoutine(pool, true);
     await conversation.appendUserMessage({ content: "synthetic pending behind invalid config" });
-    await pool.query(`UPDATE routine_settings SET timezone = 'Not/AZone' WHERE id = true`);
+    await pool.query(`UPDATE companion_time_settings SET timezone = 'Not/AZone' WHERE id = true`);
 
     await assert.rejects(
       conversation.claimNextTurn({

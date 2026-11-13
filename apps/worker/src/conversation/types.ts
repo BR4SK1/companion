@@ -160,6 +160,17 @@ export interface AttemptSnapshotPayload {
   readonly patterns: readonly ResponsePattern[];
 }
 
+/** Typed wall-clock context captured when an attempt assembles its chat request. */
+export interface TraceTemporalContext {
+  readonly asOf: string;
+  readonly timezone: string | null;
+  readonly localDate: string | null;
+  readonly localTime: string | null;
+  readonly season: "spring" | "summer" | "autumn" | "winter" | null;
+  readonly occasionKeys: readonly string[];
+  readonly occasionContext: string | null;
+}
+
 /**
  * The decision request boundary record, written before the provider call: the
  * validated native typed request as sent, with the question it asks. No
@@ -246,6 +257,8 @@ export interface ChatRequestTracePayload {
   readonly messageChunks: readonly ChatChunkName[];
   /** The `chat_identity` revision the request carried. */
   readonly identityRevision: number;
+  /** Current local clock/season/occasion facts used by this exact request. */
+  readonly temporalContext?: TraceTemporalContext;
 }
 
 /**
@@ -394,6 +407,7 @@ export interface TurnAttemptTrace {
   readonly finishedAt: string | null;
   readonly outcome: "published" | "failed" | "fenced" | "superseded" | null;
   readonly snapshotRecordedAt: string | null;
+  readonly temporalContext: TraceTemporalContext | null;
   readonly context: readonly TraceContextMessage[];
   readonly patterns: readonly TracePatternSnapshot[];
   /**

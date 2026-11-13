@@ -95,6 +95,7 @@ before(async () => {
       }
       if (req.method === "GET" && (req.url === "/v1/thread" || req.url.startsWith("/v1/thread?"))) {
         return json({
+          timezone: "UTC",
           messages: [
             {
               id: "fake-1",

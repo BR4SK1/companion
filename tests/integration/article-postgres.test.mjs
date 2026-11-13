@@ -36,6 +36,7 @@ import {
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { loadArticleConfiguration } from "../../apps/worker/src/articles/config.ts";
 import {
@@ -272,7 +273,10 @@ function makeFeedTransport(xmlHolder) {
 /** A fake host resolver: every feed host "resolves" to a public address. */
 const FAKE_RESOLVER = async () => ({ ok: true });
 
-function provisionArticleConfig(pool) {
+async function provisionArticleConfig(pool) {
+  await pool.query(
+    `UPDATE companion_time_settings SET timezone = 'America/New_York' WHERE id = true`,
+  );
   return pool.query(
     `${SUBJECTS_SQL}; ${MEMORY_BEHAVIOR_SQL}; ${ARTICLE_BEHAVIOR_SQL}; ${ARTICLE_FEEDS_SQL}; ${ARTICLE_PROMPTS_SQL};`,
   );
@@ -349,6 +353,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       ...conversationMigrations,
       ...memoryMigrations,
       ...articleMigrations,
+      ...temporalMigrations,
     ]);
   });
 
@@ -374,6 +379,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       ...conversationMigrations,
       ...memoryMigrations,
       ...articleMigrations,
+      ...temporalMigrations,
     ]);
     assert.deepEqual(second.applied, []);
     assert.deepEqual(second.alreadyApplied, [
@@ -386,6 +392,8 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       "0007_article_work",
       "0008_article_share_and_evidence",
       "0009_article_observation_claim",
+      "0016_authoritative_temporal_context",
+      "0017_trace_attempt_temporal_context",
     ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables

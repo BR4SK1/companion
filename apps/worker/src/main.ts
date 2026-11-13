@@ -24,30 +24,24 @@ import process from "node:process";
 import {
   closePostgresPool,
   createPostgresPool,
-  runMigrations,
 } from "@companion/postgres";
 import { postJson } from "@companion/openrouter/transport";
 
 import { loadWorkerConfig } from "./config.ts";
 import { createApiServer } from "./api/server.ts";
-import { conversationMigrations } from "./conversation/migrations.ts";
 import {
   createConversationStore,
   TraceWriteFencedError,
 } from "./conversation/store.ts";
-import { engagementMigrations } from "./engagement/migrations.ts";
+import { applyWorkerMigrations } from "./migrations.ts";
 import { loadEngagementBands } from "./engagement/bands.ts";
 import { createEngagementStore } from "./engagement/store.ts";
-import { memoryMigrations } from "./memory/migrations.ts";
-import { articleMigrations } from "./articles/migrations.ts";
-import { relationshipMigrations } from "./relationship/migrations.ts";
 import {
   createRelationshipStore,
   loadRelationshipConfiguration,
   RelationshipConfigurationError,
 } from "./relationship/store.ts";
 import { renderRelationshipContext } from "./relationship/runtime.ts";
-import { routineMigrations } from "./routine/migrations.ts";
 import { createRoutineStore } from "./routine/store.ts";
 import { renderRoutineContext } from "./routine/runtime.ts";
 import { startRoutineRuntime } from "./routine/runtime-loop.ts";
@@ -78,6 +72,7 @@ import {
 import { getTemporalSummaryPromptContext } from "./memory/temporal/store.ts";
 import { getProfileDocument } from "./memory/profiles-v2.ts";
 import { memoryErrorCategory } from "./memory/errors.ts";
+import { loadTemporalSettings } from "./temporal/store.ts";
 
 /**
  * Runs one fenced trace write and refuses to continue on a lost lease. The
@@ -119,20 +114,20 @@ async function main(): Promise<void> {
   let articleRuntime: ReturnType<typeof startArticleRuntime> | undefined;
   let routineRuntime: ReturnType<typeof startRoutineRuntime> | undefined;
   try {
-    const migrations = await runMigrations(pool, [
-      ...conversationMigrations,
-      ...memoryMigrations,
-      ...engagementMigrations,
-      ...articleMigrations,
-      ...relationshipMigrations,
-      ...routineMigrations,
-    ]);
+    const migrations = await applyWorkerMigrations(pool);
     if (migrations.applied.length > 0) {
       console.log(`applied migrations: ${migrations.applied.join(", ")}`);
     }
     if (migrations.unrecognized.length > 0) {
       console.warn(
         `unrecognized recorded migrations (left untouched): ${migrations.unrecognized.join(", ")}`,
+      );
+    }
+
+    const temporalSettings = await loadTemporalSettings(pool);
+    if (temporalSettings.timezone === null) {
+      console.warn(
+        "[TIME] authoritative timezone is not configured; local chat context and timezone-dependent features remain unspecified or disabled until provisioned and the worker restarts",
       );
     }
 
@@ -161,7 +156,10 @@ async function main(): Promise<void> {
     // feature; no type, tier, day boundary, or question content is invented.
     let relationshipStore: ReturnType<typeof createRelationshipStore> | undefined;
     try {
-      const relationshipConfiguration = await loadRelationshipConfiguration(pool);
+      const relationshipConfiguration = await loadRelationshipConfiguration(
+        pool,
+        temporalSettings.timezone,
+      );
       if (relationshipConfiguration === null) {
         console.warn(
           "[RELATIONSHIP] configuration not provisioned (relationship_settings singleton is missing); provision relationship_settings, relationship_tier, relationship_question_type, and enabled relationship_question rows, then restart to enable relationship context and answer learning",
@@ -191,10 +189,10 @@ async function main(): Promise<void> {
     // The routine is generic relational runtime configuration. Missing
     // configuration preserves ordinary chat and availability; malformed
     // provisioned configuration fails startup rather than accidentally
-    // bypassing an intended unavailable interval. Configuration is reloaded
-    // on reconciliation, turn admission, and context reads so edits do not
-    // depend on a worker restart.
-    const routineStore = createRoutineStore({ pool });
+    // bypassing an intended unavailable interval. Schedule rows are reloaded
+    // on reconciliation, turn admission, and context reads; the authoritative
+    // timezone remains pinned to the worker startup snapshot.
+    const routineStore = createRoutineStore({ pool, timezone: temporalSettings.timezone });
     await routineStore.reconcile();
 
     const store = createConversationStore(pool, {
@@ -251,7 +249,7 @@ async function main(): Promise<void> {
           temporal_summary: TEMPORAL_SUMMARY_PROMPT_VERSION,
           profile_summary: PROFILE_SUMMARY_PROMPT_VERSION,
           observation_profile: MEMORY_PROFILE_PROMPT_VERSION,
-        });
+        }, temporalSettings.timezone);
       } catch (error) {
         if (error instanceof MemoryConfigurationError) {
           console.warn(
@@ -281,8 +279,8 @@ async function main(): Promise<void> {
 
       // Per-turn memory context. Every section degrades independently: a
       // failed section logs a warning and the turn continues with the rest.
-      loadMemoryContext = async ({ userText }) => {
-        const now = new Date();
+      loadMemoryContext = async ({ userText, referenceTime }) => {
+        const now = referenceTime;
         const profileSubjects = configuration.subjects.filter(
           (subject) => subject.profileEnabled,
         );
@@ -413,6 +411,7 @@ async function main(): Promise<void> {
     // available regardless of provisioning state.
     articleRuntime = startArticleRuntime({
       pool,
+      timezone: temporalSettings.timezone,
       callLlm: (model, input) =>
         createMemoryLlmCaller({
           url: `${memoryConfig.openrouterBaseUrl}/chat/completions`,
@@ -434,6 +433,7 @@ async function main(): Promise<void> {
       token: config.apiToken,
       host: config.http.host,
       port: config.http.port,
+      timezone: temporalSettings.timezone,
       log: (message) => console.log(message),
       // Engagement summary: recomputed on each read from the engagement
       // anchor's effective time and the provisioned bands. Wired only when
@@ -507,6 +507,7 @@ async function main(): Promise<void> {
           processTurnWork(work, {
             decisionModel: config.openrouter.decisionModel,
             chatModel: config.openrouter.chatModel,
+            temporalSettings,
             callDecisions: (request) =>
               postJson(config.openrouter.decisionsUrl, request, {
                 apiKey: config.openrouter.apiKey,
@@ -582,9 +583,9 @@ async function main(): Promise<void> {
             ...(provisionedRelationshipStore !== undefined &&
                 provisionedRelationshipCallLlm !== undefined
               ? {
-                  loadRelationshipContext: async () =>
+                  loadRelationshipContext: async (_turnId, referenceTime) =>
                     renderRelationshipContext(
-                      await provisionedRelationshipStore.getSummary(new Date()),
+                      await provisionedRelationshipStore.getSummary(referenceTime),
                     ),
                   extractRelationshipAnswers: (input: {
                     readonly userText: string;
@@ -598,8 +599,8 @@ async function main(): Promise<void> {
                     }),
                 }
               : {}),
-            loadRoutineContext: async () => {
-              const snapshot = await provisionedRoutineStore.getSnapshot();
+            loadRoutineContext: async (_turnId, referenceTime) => {
+              const snapshot = await provisionedRoutineStore.getSnapshot(referenceTime);
               return snapshot === null ? null : renderRoutineContext(snapshot);
             },
             ...(articleRuntime !== undefined

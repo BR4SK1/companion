@@ -21,6 +21,7 @@ import {
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { processTurnWork } from "../../apps/worker/src/work/processor.ts";
 import { renderReport } from "../../apps/worker/src/cli.ts";
@@ -62,6 +63,7 @@ describe("turn trace report: every decision question (PostgreSQL)", { skip: !has
       ...conversationMigrations,
       ...memoryMigrations,
       ...articleMigrations,
+      ...temporalMigrations,
     ]);
     await pool.query(
       `INSERT INTO chat_identity (id, content, revision)
@@ -88,6 +90,36 @@ describe("turn trace report: every decision question (PostgreSQL)", { skip: !has
         memory_fact, memory_run, memory_observation,
         memory_canonical_observation RESTART IDENTITY CASCADE`,
     );
+  });
+
+  it("round-trips the temporal local civil date as an ISO string from PostgreSQL", async () => {
+    await store.appendUserMessage({ content: "temporal date trace" });
+    const claim = await store.claimNextTurn({ owner: "owner-temporal-date", leaseSeconds: 300 });
+    assert.equal(claim.kind, "claimed");
+    const temporalContext = {
+      asOf: "2026-11-03T12:30:00.000Z",
+      timezone: "America/New_York",
+      localDate: "2026-11-03",
+      localTime: "07:30:00",
+      season: "autumn",
+      occasionKeys: [],
+      occasionContext: null,
+    };
+    assert.equal(await store.recordChatRequest({
+      turnId: claim.work.turn.id,
+      leaseOwner: "owner-temporal-date",
+      payload: {
+        request: { model: "synthetic-chat-model", messages: [{ role: "system", content: "temporal context" }] },
+        messageSources: [null],
+        messageChunks: ["temporal"],
+        identityRevision: 1,
+        temporalContext,
+      },
+    }), true);
+
+    const report = await store.getTurnTraceReport({ turnId: claim.work.turn.id });
+    assert.deepEqual(report.attempts[0].temporalContext, temporalContext);
+    assert.equal(typeof report.attempts[0].temporalContext.localDate, "string");
   });
 
   it("records a legitimate article none as a successful no-action selection, not a rejection", async () => {

@@ -130,6 +130,63 @@ describe("routine schedule semantics", () => {
     ]);
   });
 
+  it("projects routine context at an old attempt instant without mutating live lifecycle state", async () => {
+    const attemptedAt = new Date("2026-11-09T10:00:00.000Z");
+    const queries = [];
+    const priorApplied = {
+      transition_id: "id-sunday",
+      transition_key: "sunday",
+      local_date: "2026-11-08",
+      scheduled_at: new Date("2026-11-08T00:00:00.000Z"),
+      applied_at: new Date("2026-11-08T00:00:01.000Z"),
+      location: "home",
+      activity: "resting",
+      available: true,
+      interaction_context: null,
+    };
+    const pool = {
+      connect: async () => ({
+        query: async (sql, values = []) => {
+          const text = String(sql);
+          queries.push({ text, values });
+          if (/^BEGIN/i.test(text) || /^COMMIT$/i.test(text)) return { rows: [] };
+          if (text.includes("FROM routine_settings AS s")) {
+            const common = {
+              timezone: "UTC",
+              departure_context: null,
+            };
+            return { rows: [
+              { ...common, id: "id-sunday", transition_key: "sunday", weekday: 7, local_minute: 0,
+                location: "home", activity: "resting", available: true, interaction_context: null },
+              { ...common, id: "id-monday-away", transition_key: "monday-away", weekday: 1, local_minute: 540,
+                location: "away", activity: "busy", available: false, interaction_context: null },
+              { ...common, id: "id-monday-home", transition_key: "monday-home", weekday: 1, local_minute: 1020,
+                location: "home", activity: "available", available: true, interaction_context: null },
+            ] };
+          }
+          if (text.includes("FROM routine_applied_transition")) return { rows: [priorApplied] };
+          if (/\\b(INSERT|UPDATE|DELETE)\\b/i.test(text)) {
+            throw new Error(`historical snapshot attempted lifecycle mutation: ${text}`);
+          }
+          throw new Error(`unexpected routine snapshot query: ${text}`);
+        },
+        release: () => {},
+      }),
+    };
+
+    const snapshot = await createRoutineStore({ pool, timezone: "UTC" }).getSnapshot(attemptedAt);
+    assert.equal(snapshot.scheduled.transitionKey, "monday-away");
+    assert.equal(snapshot.scheduled.available, false);
+    assert.equal(snapshot.applied.transitionKey, "sunday");
+    assert.deepEqual(
+      queries.find(({ text }) => text.includes("FROM routine_applied_transition")).values,
+      [attemptedAt],
+    );
+    assert.match(queries[0].text, /READ ONLY/);
+    assert.ok(queries.some(({ text }) => text.includes("applied_at <= $1")));
+    assert.ok(!queries.some(({ text }) => /\\b(INSERT|UPDATE|DELETE)\\b/i.test(text)));
+  });
+
   it("keeps in-flight routine context separate from the scheduled announcement", () => {
     const scheduled = scheduledRoutineStateAt(new Date("2026-11-09T09:00:00.000Z"), weekly);
     const prior = scheduledRoutineStateAt(new Date("2026-11-09T08:59:00.000Z"), weekly);
