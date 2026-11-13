@@ -67,7 +67,7 @@ async function createIsolatedMigrationFixture(ownerPool, databaseUrl, prefix) {
     connection.searchParams.set("options", `-csearch_path=${schema}`);
     fixturePool = createPostgresPool({ connectionString: connection.toString() });
     const path = await fixturePool.query(
-      "SELECT current_schema() AS schema, current_schemas(false) AS schemas",
+      "SELECT current_schema() AS schema, array_to_json(current_schemas(false)) AS schemas",
     );
     assert.equal(path.rows[0].schema, schema);
     assert.deepEqual(path.rows[0].schemas, [schema]);
