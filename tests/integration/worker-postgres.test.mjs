@@ -26,7 +26,8 @@ import {
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
-import { engagementMigrations } from "../../apps/worker/src/engagement/migrations.ts";
+import { relationshipMigrations } from "../../apps/worker/src/relationship/migrations.ts";
+import { routineMigrations } from "../../apps/worker/src/routine/migrations.ts";
 import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import {
   CLAIM_ADVISORY_LOCK_KEY,
@@ -2507,21 +2508,22 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
   it("preserves a legacy pre-tracing turn and its decision JSONB through the tracing migration", async () => {
     // Roll the database back to its pre-tracing shape: drop the tracing
     // tables and their migration bookkeeping rows, keep the domain tables.
-    // The chat-identity migration (0004) ALTERs the tracing tables, so it is
-    // rolled back and re-applied together with 0002 — the same order the
-    // conversation domain's migration array supplies.
+    // The chat-identity migration (0004) and the article, relationship, and
+    // routine chunk migrations also alter trace tables, so re-apply them in
+    // the same order as the worker's domain migration composition.
     await pool.query(
       `DROP TABLE IF EXISTS
          trace_attempt_chat_choice, trace_attempt_chat_message, trace_attempt_chat,
          trace_attempt_decision_probability, trace_attempt_decision,
          trace_attempt_pattern, trace_attempt_context, trace_attempt,
-         chat_identity CASCADE`,
+         chat_identity`,
     );
     await pool.query(`DROP INDEX IF EXISTS article_share_turn_reaction_idx`);
     await pool.query(
       `DELETE FROM companion_schema_migration
        WHERE id IN ('0002_conversation_tracing', '0004_chat_identity',
-                    '0008_article_share_and_evidence', '0017_trace_attempt_temporal_context')`,
+                    '0008_article_share_and_evidence', '0011_relationship_chat_chunk',
+                     '0013_routine_chat_chunk', '0017_trace_attempt_temporal_context')`,
     );
 
     // A legacy turn exactly as pre-tracing code wrote it.
@@ -2541,24 +2543,31 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       [legacyTurnId],
     );
 
-    // The tracing migrations apply cleanly over the legacy data. The article
-    // migration set is re-applied with them: 0008 owns the trace-decision
-    // uniqueness AND the article trace-kind/chunk constraint widenings this
-    // suite's later engine tests rely on (per-question trace rows; the
-    // article chunk classification), and re-running it over the recreated
-    // tracing tables restores that shape — the article composition belongs to
-    // the same array main.ts applies.
+    // Re-apply every migration that owns the recreated trace tables or adds
+    // a system-message chunk classification, in the worker composition order.
     const applied = await runMigrations(pool, [
       ...conversationMigrations,
       ...articleMigrations,
+      ...relationshipMigrations,
+      ...routineMigrations,
       ...temporalMigrations,
     ]);
     assert.deepEqual(applied.applied, [
       "0002_conversation_tracing",
       "0004_chat_identity",
       "0008_article_share_and_evidence",
+      "0011_relationship_chat_chunk",
+      "0013_routine_chat_chunk",
       "0017_trace_attempt_temporal_context",
     ]);
+    const chunkConstraint = await pool.query(
+      `SELECT pg_get_constraintdef(oid) AS definition
+       FROM pg_constraint
+       WHERE conrelid = 'trace_attempt_chat_message'::regclass
+         AND conname = 'trace_attempt_chat_message_chunk_check'`,
+    );
+    assert.match(chunkConstraint.rows[0].definition, /relationship/);
+    assert.match(chunkConstraint.rows[0].definition, /routine/);
 
     // The legacy row is untouched: the decision JSONB is exactly as inserted,
     // and no attempt rows were fabricated for it.
