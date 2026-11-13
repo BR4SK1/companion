@@ -18,10 +18,13 @@ import "./helpers/register-web-aliases.mjs";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { createRequire } from "node:module";
 
-const {
-  NextRequest,
-} = await import("next/server");
+// Next's `server.js` is CommonJS. Requiring it through the web workspace avoids
+// Node-version-dependent named-export interop in the ESM namespace while still
+// constructing the real framework NextRequest used by these route tests.
+const requireWeb = createRequire(new URL("../../apps/web/package.json", import.meta.url));
+const { NextRequest } = requireWeb("next/server");
 
 const messagesRoute = await import("../../apps/web/src/app/api/messages/route.ts");
 const threadRoute = await import("../../apps/web/src/app/api/thread/route.ts");
