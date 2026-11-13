@@ -786,7 +786,7 @@ async function up() {
 
     const configuredZone = await docker([
       "exec", containerName, "psql", "-U", dbUser, "-d", dbName,
-      "-tAc",
+      "-qAt", "-c",
       `UPDATE companion_time_settings SET timezone = '${config.temporalTimezone}', updated_at = now() WHERE id = true RETURNING timezone;`,
     ]);
     if (configuredZone.code !== 0 || configuredZone.stdout.trim() !== config.temporalTimezone) {
