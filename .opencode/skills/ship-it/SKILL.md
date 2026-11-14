@@ -149,14 +149,45 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
    repository's sequence places integration and E2E after the non-production
    deployment; they run against the identified candidate before publication
    (`deploy/helm/environments/non-production/README.md`).
-   - **Worker integration suites** — when the worker, the shared libraries,
-     or the database schema changed: the suites in `tests/integration`
-     against a disposable, isolated non-production database provided via
-     `WORKER_TEST_DATABASE_URL` — never a real application database (the
-     suites truncate the domain tables) — each suite in its own `node --test`
-     invocation, one at a time. They use their own disposable database, not
-     the deployed release. If no disposable database is available, stop and
-     report instead of skipping silently.
+   - **Worker integration suites** — when the worker, shared libraries, or
+     database schema changed, run `tests/integration` after the exact
+     candidate is deployed. These suites destructively clear/recreate schema
+     and synthetic configuration; under this ship-it workflow they use the
+     non-production application database via `WORKER_TEST_DATABASE_URL`, not
+     a separate throwaway database. This is an explicit non-production-only
+     exception; never use production credentials or target production.
+     Before any destructive statement, complete a read-only preflight:
+     positively verify the deployed release, candidate commit/tree/image, and
+     target server/database/role against the approved non-production-only
+     configuration; establish production separation from approved private
+     environment metadata without connecting to production; confirm required
+     database access/privileges and the candidate's full migration runner
+     route; and locate a complete owner-approved private restoration source
+     for every provisioned non-production runtime configuration. If the
+     identity, separation, route, privileges, or complete restoration source
+     cannot be established, stop before destruction.
+   - Serialize the maintenance window. Stop the non-production web and worker
+     deployments and every other consumer of the target database; prevent new
+     consumers from connecting and verify that no unidentified database
+     sessions remain. Run each integration suite in its own `node --test`
+     invocation, serially, with `WORKER_TEST_DATABASE_URL` sourced only from
+     the verified non-production credentials. Do not run recall evaluation or
+     any other tool as a substitute for these suites. Keep secrets and
+     configuration values out of command output and logs.
+   - After the suites, do not merely restart the worker: fully reconstruct a
+     clean schema using the deployed candidate's complete ordered migration
+     composition, restore all required non-production runtime configuration
+     from the approved private source, and verify the migration ledger and
+     configuration completeness without exposing values. Then restart/enable
+     and verify the same candidate (no image or source substitution), with
+     the expected deployments ready and no synthetic integration data left.
+     Any task-scoped private configuration capture must be securely handled
+     and removed after verified restoration; do not retain snapshots as
+     routine recovery aids. Only after this reconstruction and verification
+     may the deployed loopback gate and deployed smoke run.
+     If restoration cannot be completed and verified, keep non-production
+     consumers stopped and report the blocker; do not proceed to the gate,
+     smoke, push, or PR.
    - **Disposable-stack Playwright suite** — the implemented E2E coverage
      (`tests/e2e/README.md`). It exercises the committed candidate's
      production build (per the candidate-source rule in step 5) against a

@@ -64,10 +64,15 @@ brings up, in order:
 
 ## Boundaries and safety
 
-- The tests never touch a real application database: the only database they
-  can reach is the throwaway container the run itself created, and it is
-  destroyed with the run. The suite's own data is synthetic (generated
-  `e2e-*` strings; seeded response patterns and completed past turns).
+- The Playwright suite never touches an application database: its only
+  database is the throwaway container the E2E run itself created, and the
+  supervisor removes that container with the run. This is separate from the
+  destructive worker integration phase documented in
+  [`../integration/README.md`](../integration/README.md), which is authorized
+  only against the positively verified non-production application database
+  under exclusive maintenance and complete reconstruction. The Playwright
+  suite's own data is synthetic (generated `e2e-*` strings; seeded response
+  patterns and completed past turns).
 - No live model calls and no production access; the only provider is the
   local fake. Unimplemented capabilities (image generation, uploads, voice,
   real Keycloak MFA) are not claimed or exercised anywhere.
