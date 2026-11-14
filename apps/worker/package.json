@@ -6,13 +6,16 @@
   "description": "First worker slice: durable grouped conversation work on PostgreSQL, with OpenRouter response-pattern decisions preceding chat generation.",
   "scripts": {
     "start": "node --experimental-strip-types src/main.ts",
+    "migrate": "node --experimental-strip-types src/migrate.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "@companion/openrouter": "workspace:*",
-    "@companion/postgres": "workspace:*"
+    "@companion/postgres": "workspace:*",
+    "luxon": "^3.7.2"
   },
   "devDependencies": {
+    "@types/luxon": "^3.7.6",
     "@types/node": "^22"
   },
   "engines": {

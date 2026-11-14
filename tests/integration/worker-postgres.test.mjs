@@ -26,7 +26,9 @@ import {
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
-import { engagementMigrations } from "../../apps/worker/src/engagement/migrations.ts";
+import { relationshipMigrations } from "../../apps/worker/src/relationship/migrations.ts";
+import { routineMigrations } from "../../apps/worker/src/routine/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import {
   CLAIM_ADVISORY_LOCK_KEY,
   createConversationStore,
@@ -46,6 +48,82 @@ const DATABASE_URL = process.env.WORKER_TEST_DATABASE_URL;
 const hasDatabase =
   typeof DATABASE_URL === "string" && DATABASE_URL.length > 0;
 
+/**
+ * Migration-upgrade fixtures live in a uniquely named schema, never public.
+ * The schema is created and dropped by the supplied application role; the
+ * connection's search_path contains only this fixture schema. Cleanup checks
+ * ownership before using CASCADE, so it cannot remove unrelated objects.
+ */
+async function createIsolatedMigrationFixture(ownerPool, databaseUrl, prefix) {
+  if (!/^[a-z][a-z0-9_]*$/.test(prefix)) {
+    throw new Error(`invalid isolated-schema prefix: ${prefix}`);
+  }
+  const schema = `${prefix}_${randomUUID().replaceAll("-", "")}`;
+  let created = false;
+  let fixturePool;
+  try {
+    await ownerPool.query(`CREATE SCHEMA "${schema}"`);
+    created = true;
+    const connection = new URL(databaseUrl);
+    connection.searchParams.set("options", `-csearch_path=${schema}`);
+    fixturePool = createPostgresPool({ connectionString: connection.toString() });
+    const path = await fixturePool.query(
+      "SELECT current_schema() AS schema, array_to_json(current_schemas(false)) AS schemas",
+    );
+    assert.equal(path.rows[0].schema, schema);
+    assert.deepEqual(path.rows[0].schemas, [schema]);
+
+    const ownership = await ownerPool.query(
+      `SELECT pg_get_userbyid(nspowner) AS owner, current_user AS role
+       FROM pg_namespace WHERE nspname = $1`,
+      [schema],
+    );
+    assert.equal(ownership.rows[0]?.owner, ownership.rows[0]?.role);
+
+    return {
+      schema,
+      pool: fixturePool,
+      async dispose() {
+        await closePostgresPool(fixturePool);
+        const owner = await ownerPool.query(
+          `SELECT pg_get_userbyid(nspowner) AS owner, current_user AS role
+           FROM pg_namespace WHERE nspname = $1`,
+          [schema],
+        );
+        if (owner.rows.length !== 1 || owner.rows[0].owner !== owner.rows[0].role) {
+          throw new Error(`refusing to drop non-owned migration fixture schema ${schema}`);
+        }
+        await ownerPool.query(`DROP SCHEMA "${schema}" CASCADE`);
+      },
+    };
+  } catch (error) {
+    if (fixturePool !== undefined) await closePostgresPool(fixturePool);
+    if (created) {
+      const owner = await ownerPool.query(
+        `SELECT pg_get_userbyid(nspowner) AS owner, current_user AS role
+         FROM pg_namespace WHERE nspname = $1`,
+        [schema],
+      );
+      if (owner.rows.length === 1 && owner.rows[0].owner === owner.rows[0].role) {
+        await ownerPool.query(`DROP SCHEMA "${schema}" CASCADE`);
+      }
+    }
+    throw error;
+  }
+}
+
+async function readVectorExtensionFingerprint(db) {
+  const result = await db.query(
+    `SELECT e.oid::text AS oid, e.extname, e.extversion,
+            n.nspname AS schema, pg_get_userbyid(e.extowner) AS owner,
+            e.extconfig::text AS config, e.extcondition::text AS condition
+     FROM pg_extension e
+     JOIN pg_namespace n ON n.oid = e.extnamespace
+     WHERE e.extname = 'vector'`,
+  );
+  return result.rows;
+}
+
 describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }, () => {
   /** @type {import("pg").Pool} */
   let pool;
@@ -57,7 +135,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     // Fresh application against the provided non-production database; the
     // worker applies the conversation and memory domain migrations together
     // (see main.ts), so every test below assumes both domain schemas exist.
-    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations, ...articleMigrations]);
+    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations, ...articleMigrations, ...temporalMigrations]);
     // The chat identity is required runtime configuration (like
     // response_pattern): provision a generic fixture row so engine cycles
     // can run. It is configuration, not per-test data, so the beforeEach
@@ -96,6 +174,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       ...conversationMigrations,
       ...memoryMigrations,
       ...articleMigrations,
+      ...temporalMigrations,
     ]);
     assert.deepEqual(second.applied, []);
     // Ids are feature-owned labels, not a global sequence: the composition
@@ -112,6 +191,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       "0007_article_work",
       "0008_article_share_and_evidence",
       "0009_article_observation_claim",
+      "0016_authoritative_temporal_context",
+      "0017_trace_attempt_temporal_context",
     ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
@@ -127,17 +208,51 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         "conversation_turn",
         "response_pattern",
       ],
-    );  });
+    );
+  });
+
+  it("isolates migration upgrade fixtures and preserves vector extension installation", async () => {
+    const vectorBefore = await readVectorExtensionFingerprint(pool);
+    const publicLedgerBefore = await pool.query(
+      "SELECT id FROM companion_schema_migration ORDER BY id",
+    );
+    assert.equal(vectorBefore.length, 1, "the verified test database must contain pgvector");
+    assert.deepEqual(
+      { schema: vectorBefore[0].schema, owner: vectorBefore[0].owner },
+      { schema: "public", owner: "postgres" },
+      "pgvector's existing installation location and owner are part of the fixture invariant",
+    );
+
+    const fixture = await createIsolatedMigrationFixture(pool, DATABASE_URL, "extension_isolation");
+    try {
+      await runMigrations(fixture.pool, conversationMigrations.slice(0, 1));
+      const fixtureExtensions = await fixture.pool.query(
+        `SELECT e.extname FROM pg_extension e
+         JOIN pg_namespace n ON n.oid = e.extnamespace
+         WHERE n.nspname = $1`,
+        [fixture.schema],
+      );
+      assert.deepEqual(fixtureExtensions.rows, [], "migration fixtures must not install extensions");
+    } finally {
+      await fixture.dispose();
+    }
+
+    assert.deepEqual(
+      await readVectorExtensionFingerprint(pool),
+      vectorBefore,
+      "isolated migration fixture creation and cleanup must leave vector metadata unchanged",
+    );
+    assert.deepEqual(
+      (await pool.query("SELECT id FROM companion_schema_migration ORDER BY id")).rows,
+      publicLedgerBefore.rows,
+      "isolated migrations must not alter the public application migration ledger",
+    );
+  });
 
   it("backfills thread order by first-user seq despite inverted turn timestamps, with defined legacy notice placement", async () => {
-    const schema = `thread_order_upgrade_${randomUUID().replaceAll("-", "")}`;
-    await pool.query(`CREATE SCHEMA "${schema}"`);
-    let upgradePool;
+    const fixture = await createIsolatedMigrationFixture(pool, DATABASE_URL, "thread_order_upgrade");
+    const upgradePool = fixture.pool;
     try {
-      const connection = new URL(DATABASE_URL);
-      connection.searchParams.set("options", `-csearch_path=${schema}`);
-      upgradePool = createPostgresPool({ connectionString: connection.toString() });
-      assert.equal((await upgradePool.query("SELECT current_schema() AS schema")).rows[0].schema, schema);
       await runMigrations(upgradePool, conversationMigrations.slice(0, -1));
 
       const firstTurn = randomUUID();
@@ -171,11 +286,11 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       assert.deepEqual(orderedTurns.rows.map((row) => row.id), [firstTurn, secondTurn],
         "legacy turns retain first-user-seq order even when created_at is inverted");
 
-      const store = createConversationStore(upgradePool);
-      await store.appendUserMessage({ content: "current u3" });
-      const current = await store.claimNextTurn({ owner: "legacy-order-check", leaseSeconds: 60 });
+      const isolatedStore = createConversationStore(upgradePool);
+      await isolatedStore.appendUserMessage({ content: "current u3" });
+      const current = await isolatedStore.claimNextTurn({ owner: "legacy-order-check", leaseSeconds: 60 });
       assert.equal(current.kind, "claimed");
-      const context = await store.getThreadContext({ turnId: current.work.turn.id, limit: 20 });
+      const context = await isolatedStore.getThreadContext({ turnId: current.work.turn.id, limit: 20 });
       assert.deepEqual(context.map((message) => message.content), [
         "legacy u1",
         "legacy r1",
@@ -184,37 +299,34 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         "legacy r2",
       ], "legacy standalone notices use the documented prior-turn-by-first-user-seq placement");
     } finally {
-      if (upgradePool !== undefined) await closePostgresPool(upgradePool);
-      await pool.query(`DROP SCHEMA "${schema}" CASCADE`);
+      await fixture.dispose();
     }
   });
 
   it("upgrades a populated pre-timing schema with honest provenance and no invented client time", async () => {
-    // The upgrade path a deployment that predates the timing columns takes:
-    // rebuild the exact 0001-only schema, populate legacy rows, then apply
-    // the real 0005 migration over the populated table. The full schema is
-    // restored afterwards for the remaining tests.
-    await pool.query("DROP SCHEMA public CASCADE");
-    await pool.query("CREATE SCHEMA public");
+    // Build the historical schema in a run-owned search_path. Nothing in
+    // public is dropped or recreated; only this fixture schema is cleaned up.
+    const fixture = await createIsolatedMigrationFixture(pool, DATABASE_URL, "pre_timing_upgrade");
+    const upgradePool = fixture.pool;
     try {
       const legacy = conversationMigrations.find((m) => m.id === "0001_conversation_work");
       const timing = conversationMigrations.find((m) => m.id === "0005_message_timing");
       assert.ok(legacy && timing);
-      await pool.query(legacy.sql);
+      await upgradePool.query(legacy.sql);
       const legacyCreated = new Date("2026-01-01T10:00:00.000Z");
-      await pool.query(
+      await upgradePool.query(
         `INSERT INTO conversation_message (role, content, client_key, created_at)
          VALUES ('user', 'legacy message', 'legacy-1', $1),
                 ('assistant', 'legacy reply', NULL, $1)`,
         [legacyCreated],
       );
-      await pool.query(timing.sql);
+      await upgradePool.query(timing.sql);
 
       // Honest backfill from each row's own recorded history: the server
       // receive time and effective time are the row's server insert instant
       // (`created_at` — same clock, same statement), the status is `absent`,
       // and NO original client time is invented.
-      const rows = await pool.query(
+      const rows = await upgradePool.query(
         `SELECT client_sent_at, effective_at, time_source, client_time_status,
                 server_received_at, created_at
          FROM conversation_message ORDER BY seq`,
@@ -227,24 +339,24 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         assert.equal(row.server_received_at.getTime(), row.created_at.getTime());
         assert.equal(row.effective_at.getTime(), row.created_at.getTime());
       }
-      const nulls = await pool.query(
+      const nulls = await upgradePool.query(
         `SELECT count(*)::int AS n FROM conversation_message
          WHERE server_received_at IS NULL OR effective_at IS NULL
             OR time_source IS NULL OR client_time_status IS NULL`,
       );
       assert.equal(nulls.rows[0].n, 0);
-      const nullability = await pool.query(
+      const nullability = await upgradePool.query(
         `SELECT is_nullable FROM information_schema.columns
-         WHERE table_schema = 'public' AND table_name = 'conversation_message'
+         WHERE table_schema = $1 AND table_name = 'conversation_message'
            AND column_name = 'server_received_at'`,
+        [fixture.schema],
       );
       assert.equal(nullability.rows[0].is_nullable, "NO",
         "server_received_at must be NOT NULL after the backfill");
 
-      // The store's message mapping reads upgraded history without failing
-      // (the regression this test pins: mapMessage renders the provenance
-      // fields of every row, including legacy ones).
-      const upgradedStore = createConversationStore(pool);
+      // The store's message mapping reads the migrated legacy history without
+      // relying on or mutating the public application schema.
+      const upgradedStore = createConversationStore(upgradePool);
       const page = await upgradedStore.getThreadPage({ limit: 10 });
       assert.equal(page.messages.length, 2);
       for (const message of page.messages) {
@@ -255,21 +367,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         assert.equal(message.effectiveAt, message.createdAt);
       }
     } finally {
-      // Restore the full schema (all domains) for the remaining tests.
-      await pool.query("DROP SCHEMA public CASCADE");
-      await pool.query("CREATE SCHEMA public");
-      await runMigrations(pool, [
-        ...conversationMigrations,
-        ...memoryMigrations,
-        ...articleMigrations,
-        ...engagementMigrations,
-      ]);
-      await pool.query(
-        `INSERT INTO chat_identity (id, content, revision)
-         VALUES ('identity', 'Integration fixture identity: generic test text.', 1)
-         ON CONFLICT (id) DO UPDATE SET
-           content = EXCLUDED.content, revision = EXCLUDED.revision`,
-      );
+      await fixture.dispose();
     }
   });
 
@@ -2410,21 +2508,22 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
   it("preserves a legacy pre-tracing turn and its decision JSONB through the tracing migration", async () => {
     // Roll the database back to its pre-tracing shape: drop the tracing
     // tables and their migration bookkeeping rows, keep the domain tables.
-    // The chat-identity migration (0004) ALTERs the tracing tables, so it is
-    // rolled back and re-applied together with 0002 — the same order the
-    // conversation domain's migration array supplies.
+    // The chat-identity migration (0004) and the article, relationship, and
+    // routine chunk migrations also alter trace tables, so re-apply them in
+    // the same order as the worker's domain migration composition.
     await pool.query(
       `DROP TABLE IF EXISTS
          trace_attempt_chat_choice, trace_attempt_chat_message, trace_attempt_chat,
          trace_attempt_decision_probability, trace_attempt_decision,
          trace_attempt_pattern, trace_attempt_context, trace_attempt,
-         chat_identity CASCADE`,
+         chat_identity`,
     );
     await pool.query(`DROP INDEX IF EXISTS article_share_turn_reaction_idx`);
     await pool.query(
       `DELETE FROM companion_schema_migration
        WHERE id IN ('0002_conversation_tracing', '0004_chat_identity',
-                    '0008_article_share_and_evidence')`,
+                    '0008_article_share_and_evidence', '0011_relationship_chat_chunk',
+                     '0013_routine_chat_chunk', '0017_trace_attempt_temporal_context')`,
     );
 
     // A legacy turn exactly as pre-tracing code wrote it.
@@ -2444,22 +2543,31 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       [legacyTurnId],
     );
 
-    // The tracing migrations apply cleanly over the legacy data. The article
-    // migration set is re-applied with them: 0008 owns the trace-decision
-    // uniqueness AND the article trace-kind/chunk constraint widenings this
-    // suite's later engine tests rely on (per-question trace rows; the
-    // article chunk classification), and re-running it over the recreated
-    // tracing tables restores that shape — the article composition belongs to
-    // the same array main.ts applies.
+    // Re-apply every migration that owns the recreated trace tables or adds
+    // a system-message chunk classification, in the worker composition order.
     const applied = await runMigrations(pool, [
       ...conversationMigrations,
       ...articleMigrations,
+      ...relationshipMigrations,
+      ...routineMigrations,
+      ...temporalMigrations,
     ]);
     assert.deepEqual(applied.applied, [
       "0002_conversation_tracing",
       "0004_chat_identity",
       "0008_article_share_and_evidence",
+      "0011_relationship_chat_chunk",
+      "0013_routine_chat_chunk",
+      "0017_trace_attempt_temporal_context",
     ]);
+    const chunkConstraint = await pool.query(
+      `SELECT pg_get_constraintdef(oid) AS definition
+       FROM pg_constraint
+       WHERE conrelid = 'trace_attempt_chat_message'::regclass
+         AND conname = 'trace_attempt_chat_message_chunk_check'`,
+    );
+    assert.match(chunkConstraint.rows[0].definition, /relationship/);
+    assert.match(chunkConstraint.rows[0].definition, /routine/);
 
     // The legacy row is untouched: the decision JSONB is exactly as inserted,
     // and no attempt rows were fabricated for it.

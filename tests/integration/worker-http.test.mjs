@@ -18,6 +18,7 @@ import assert from "node:assert/strict";
 
 import { closePostgresPool, createPostgresPool, runMigrations } from "../../libraries/postgres/src/index.ts";
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { createApiServer } from "../../apps/worker/src/api/server.ts";
 import { processTurnWork } from "../../apps/worker/src/work/processor.ts";
@@ -53,7 +54,7 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
   before(async () => {
     pool = createPostgresPool({ connectionString: DATABASE_URL });
     store = createConversationStore(pool);
-    await runMigrations(pool, conversationMigrations);
+    await runMigrations(pool, [...conversationMigrations, ...temporalMigrations]);
     // The chat identity is required runtime configuration: provision a
     // generic fixture row for the engine cycle below (configuration, not
     // per-test data, so the truncate leaves it in place).

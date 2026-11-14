@@ -55,6 +55,7 @@ import type {
   DecisionRequestTracePayload,
   DecisionSelectionTrace,
   ResponsePattern,
+  TraceTemporalContext,
   TurnWork,
 } from "../conversation/types.ts";
 import {
@@ -64,6 +65,7 @@ import {
 } from "./decision.ts";
 import { buildChatPrompt } from "./chat.ts";
 import type { MemoryChatContext } from "../memory/types.ts";
+import { buildTemporalContext, type TemporalSettings } from "../temporal/context.ts";
 import {
   ARTICLE_SHARE_QUESTION_ID,
   buildArticleShareContextForPrompt,
@@ -90,6 +92,8 @@ import {
 export interface TurnProcessorDeps {
   readonly decisionModel: string;
   readonly chatModel: string;
+  /** Injectable wall-clock source for deterministic attempt-context tests. */
+  readonly now?: () => Date;
   /** Perform the Decisions call; resolves with the raw response body. */
   readonly callDecisions: (request: DecisionsRequest) => Promise<unknown>;
   /** Perform the chat call; resolves with the raw response body. */
@@ -104,6 +108,8 @@ export interface TurnProcessorDeps {
   readonly loadIdentity: () => Promise<ChatIdentity>;
   /** Prior-turn context for this turn, oldest first. */
   readonly loadContext: (turnId: string) => Promise<readonly ConversationMessage[]>;
+  /** Startup-captured private settings; absent means explicitly unconfigured. */
+  readonly temporalSettings?: TemporalSettings;
   readonly temperature?: number;
   readonly maxTokens?: number;
   /**
@@ -155,6 +161,7 @@ export interface TurnProcessorDeps {
   readonly loadMemoryContext?: (input: {
     readonly turnId: string;
     readonly userText: string;
+    readonly referenceTime: Date;
   }) => Promise<MemoryChatContext | null>;
   /**
    * Loads the per-turn article-memory share candidates (cooldown-eligible
@@ -179,9 +186,9 @@ export interface TurnProcessorDeps {
     readonly reactionId: string;
   }) => Promise<void>;
   /** Optional database-configured relationship context; failures degrade to no context. */
-  readonly loadRelationshipContext?: (turnId: string) => Promise<string | null>;
+  readonly loadRelationshipContext?: (turnId: string, referenceTime: Date) => Promise<string | null>;
   /** Optional configured scheduled/applied routine state; failures degrade to no context. */
-  readonly loadRoutineContext?: (turnId: string) => Promise<string | null>;
+  readonly loadRoutineContext?: (turnId: string, referenceTime: Date) => Promise<string | null>;
   /** Learns only from the just-completed new turn; failures never fail chat. */
   readonly extractRelationshipAnswers?: (input: {
     readonly turnId: string;
@@ -270,6 +277,9 @@ export async function processTurnWork(
   work: TurnWork,
   deps: TurnProcessorDeps,
 ): Promise<TurnOutcome> {
+  // One attempt-scoped instant keeps temporal prose, recall windows, and
+  // behavior-day consumers on the same side of any local midnight boundary.
+  const attemptReferenceTime = deps.now?.() ?? new Date();
   const history = await deps.loadContext(work.turn.id);
   const patterns = await deps.loadPatterns();
   // The identity is required configuration. It is loaded fail-closed before
@@ -313,6 +323,7 @@ export async function processTurnWork(
         const loaded = await deps.loadMemoryContext({
           turnId: work.turn.id,
           userText,
+          referenceTime: attemptReferenceTime,
         });
         profilesChunk = loaded?.profileSection ?? null;
         temporalChunk = loaded?.temporalContext ?? null;
@@ -550,7 +561,7 @@ export async function processTurnWork(
   let relationshipChunk: string | null = null;
   if (deps.loadRelationshipContext !== undefined) {
     try {
-      relationshipChunk = await deps.loadRelationshipContext(work.turn.id);
+      relationshipChunk = await deps.loadRelationshipContext(work.turn.id, attemptReferenceTime);
     } catch {
       console.warn(
         `[RELATIONSHIP] context load failed for turn ${work.turn.id}; continuing without relationship context`,
@@ -565,13 +576,33 @@ export async function processTurnWork(
   let routineChunk: string | null = null;
   if (deps.loadRoutineContext !== undefined) {
     try {
-      routineChunk = await deps.loadRoutineContext(work.turn.id);
+      routineChunk = await deps.loadRoutineContext(work.turn.id, attemptReferenceTime);
     } catch {
       console.warn(
         `[ROUTINE] context load failed for turn ${work.turn.id}; continuing without routine context`,
       );
     }
   }
+
+  const temporal = deps.temporalSettings === undefined
+    ? undefined
+    : buildTemporalContext(attemptReferenceTime, deps.temporalSettings);
+  const temporalTrace: TraceTemporalContext | undefined = temporal === undefined
+    ? undefined
+    : {
+        asOf: temporal.asOf.toISOString(),
+        timezone: temporal.timezone,
+        localDate: temporal.localDate,
+        localTime: temporal.localTime,
+        season: temporal.season,
+        occasionKeys: temporal.occasionKeys,
+        occasionContext: temporal.occasionContext,
+      };
+  const fullTemporalChunk = temporal === undefined
+    ? temporalChunk
+    : temporalChunk === null
+      ? temporal.promptText
+      : `${temporal.promptText}\n\nRecent temporal memory:\n${temporalChunk}`;
 
   // The assembled prompt is the single source of truth for the wire request
   // and its trace metadata: chunk classification and source linkage are
@@ -583,7 +614,7 @@ export async function processTurnWork(
     identity: identity.content,
     guidance: selected !== undefined ? selected.responseGuidance : null,
     ...(profilesChunk !== null ? { profiles: profilesChunk } : {}),
-    ...(temporalChunk !== null ? { temporal: temporalChunk } : {}),
+    temporal: fullTemporalChunk,
     ...(recallChunk !== null ? { recall: recallChunk } : {}),
     ...(articleChunk !== null ? { article: articleChunk } : {}),
     ...(relationshipChunk !== null ? { relationship: relationshipChunk } : {}),
@@ -603,6 +634,7 @@ export async function processTurnWork(
       messageSources,
       messageChunks,
       identityRevision: identity.revision,
+      temporalContext: temporalTrace,
     });
   }
 

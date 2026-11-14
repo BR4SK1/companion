@@ -12,17 +12,19 @@
   },
   "dependencies": {
     "@emotion/cache": "11.14.0",
-    "openid-client": "^6.8.8",
     "@emotion/react": "11.14.0",
     "@emotion/styled": "11.14.0",
     "@mui/icons-material": "9.5.0",
     "@mui/material": "9.5.0",
     "@mui/material-nextjs": "9.5.0",
+    "luxon": "^3.7.2",
     "next": "16.4.3",
+    "openid-client": "^6.8.8",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
   "devDependencies": {
+    "@types/luxon": "^3.7.6",
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",

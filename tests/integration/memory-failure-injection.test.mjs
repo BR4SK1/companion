@@ -24,6 +24,7 @@ import { conversationMigrations } from "../../apps/worker/src/conversation/migra
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { loadMemoryConfig } from "../../apps/worker/src/memory/config.ts";
 import { ingestTurns } from "../../apps/worker/src/memory/ingest.ts";
 import { runScheduledConsolidation } from "../../apps/worker/src/memory/consolidation.ts";
@@ -376,6 +377,7 @@ describe("memory durability under failure injection (PostgreSQL)", { skip: !hasD
       ...conversationMigrations,
       ...memoryMigrations,
       ...articleMigrations,
+      ...temporalMigrations,
     ]);
   });
 
@@ -393,6 +395,9 @@ describe("memory durability under failure injection (PostgreSQL)", { skip: !hasD
     await pool.query(SUBJECTS_SQL);
     await pool.query(PROMPTS_SQL);
     await pool.query(BEHAVIOR_SQL);
+    await pool.query(
+      `UPDATE companion_time_settings SET timezone = 'America/New_York' WHERE id = true`,
+    );
   });
 
   it("a retraction that lands between planning and applying is skipped, never reactivated, and does not block unrelated items", async () => {

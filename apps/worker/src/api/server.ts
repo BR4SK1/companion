@@ -82,6 +82,8 @@ export interface ApiServerDeps {
   readonly token: string;
   readonly host: string;
   readonly port: number;
+  /** Startup-captured configured local timezone; null is explicitly unconfigured. */
+  readonly timezone?: string | null;
   readonly log?: (message: string) => void;
   /**
    * Readiness check (dependency usability, e.g. a database ping). Liveness
@@ -499,6 +501,7 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       ]);
       writeJson(response, 200, {
         messages: page.messages,
+        timezone: deps.timezone ?? null,
         status: {
           queued: status.queuedUserMessages,
           generating: status.generating,

@@ -124,6 +124,44 @@ describe("relationship familiarity semantics", () => {
     );
   });
 
+  it("uses the worker startup timezone snapshot instead of rereading the singleton", async () => {
+    const calls = [];
+    const pool = {
+      query: async (sql, values = []) => {
+        const text = String(sql);
+        calls.push({ text, values });
+        if (text.includes("FROM relationship_settings")) {
+          return { rows: [{
+            relationship_type: "synthetic type",
+            timezone: values[0] ?? "UTC",
+            day_start_hour: 4,
+            tier_movement_enabled: false,
+            tier_up_min_days: null,
+            tier_up_min_active_streak: null,
+            tier_down_missed_streak: null,
+            answer_extraction_prompt: "Synthetic extraction instruction.",
+            clarification_guidance: "Synthetic clarification guidance.",
+          }] };
+        }
+        if (text.includes("FROM relationship_tier")) {
+          return { rows: [{
+            id: "tier-0", tier_key: "tier-a", position: 0, minimum_familiarity: "0",
+            label: "A", prompt: "Prompt A", behavioral_guidance: "Guidance A",
+          }] };
+        }
+        return { rows: [{
+          id: "question-0", question_key: "question-a", type_key: "kind-a",
+          interpretation_guidance: "Type guidance", tier_id: "tier-0", tier_position: 0,
+          question_text: "Question?", position: 0,
+        }] };
+      },
+    };
+    const loaded = await loadRelationshipConfiguration(pool, "Australia/Sydney");
+    assert.equal(loaded.behaviorTime.timezone, "Australia/Sydney");
+    assert.deepEqual(calls[0].values, ["Australia/Sydney"]);
+    assert.doesNotMatch(calls[0].text, /companion_time_settings/);
+  });
+
   it("uses the existing behavioral timezone/day-start semantics for streaks", () => {
     const stats = relationshipDayStreaks({
       now: new Date("2026-01-10T03:59:00.000Z"),

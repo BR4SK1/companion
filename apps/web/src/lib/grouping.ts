@@ -6,7 +6,7 @@
  * exposed processing segments (apps/web/AGENTS.md).
  */
 
-import { isDifferentUtcDay } from "./time.ts";
+import { isDifferentLocalDay } from "./time.ts";
 import type { Message, MessageCluster, ThreadItem } from "./messages";
 
 /** Consecutive messages from the same role within this window group into one cluster. */
@@ -24,14 +24,14 @@ function parseIso(value: string): number {
 
 /**
  * Split a flat message list into render units: consecutive same-role messages
- * cluster together unless a large time gap separates them; a UTC day change
- * additionally emits a {@link TimeDivider} and starts a new cluster (for
- * either role). Divider labels are then unique per calendar day, so the
+ * cluster together unless a large time gap separates them; a configured local
+ * day change additionally emits a {@link TimeDivider} and starts a new cluster
+ * (for either role). Divider labels are then unique per calendar day, so the
  * thread never shows two identical full-date dividers.
  *
  * Message order is preserved and no message is dropped or reordered.
  */
-export function groupThread(messages: readonly Message[]): ThreadItem[] {
+export function groupThread(messages: readonly Message[], timezone: string | null): ThreadItem[] {
   const items: ThreadItem[] = [];
   let cluster: Message[] | undefined;
   let previous: Message | undefined;
@@ -43,7 +43,7 @@ export function groupThread(messages: readonly Message[]): ThreadItem[] {
     const at = parseIso(message.sentAt);
     const gap = previous ? (at - previousAt) / MINUTE_MS : 0;
 
-    if (previous && isDifferentUtcDay(previous.sentAt, message.sentAt)) {
+    if (previous && isDifferentLocalDay(previous.sentAt, message.sentAt, timezone)) {
       items.push({ kind: "divider", at: message.sentAt });
       cluster = undefined;
     }

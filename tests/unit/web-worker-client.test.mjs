@@ -22,6 +22,7 @@ function jsonResponse(status, body) {
 
 function snapshotBody(overrides = {}) {
   return {
+    timezone: "America/New_York",
     messages: [
       {
         id: "m1",
@@ -79,6 +80,16 @@ describe("BFF worker client: thread pages", () => {
     assert.equal(request.init.headers.authorization, `Bearer ${TOKEN}`);
   });
 
+  it("maps a legacy worker response with no timezone to explicit UTC/unconfigured state", async () => {
+    const body = snapshotBody();
+    delete body.timezone;
+    const client = makeClient(() => jsonResponse(200, body), []);
+    const result = await client.getThread(100);
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+    assert.equal(result.snapshot.timezone, null);
+  });
+
   it("appends the validated before cursor to the page query", async () => {
     const requests = [];
     const client = makeClient(() => jsonResponse(200, snapshotBody()), requests);
@@ -103,6 +114,8 @@ describe("BFF worker client: thread pages", () => {
     };
     const bad = [
       "not an object",
+      { ...snapshotBody(), timezone: "Not/AZone" },
+      { ...snapshotBody(), timezone: 17 },
       { messages: [goodMessage], status: fullStatus },
       { messages: [goodMessage], status: fullStatus, page: { oldestSeq: 0, hasMore: false } },
       { messages: [goodMessage], status: fullStatus, page: { oldestSeq: 1, hasMore: "yes" } },

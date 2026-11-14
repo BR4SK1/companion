@@ -23,6 +23,7 @@
  */
 
 import type { MessageRole } from "./messages";
+import { isValidInstant } from "./time.ts";
 
 /** One live message as delivered by the BFF thread pages. */
 export interface ThreadMessage {
@@ -249,16 +250,19 @@ export function parseThreadSnapshotResponse(
   messages: readonly ThreadMessage[];
   status: ThreadStatus;
   page: ThreadPage;
+  timezone: string | null;
 } | null {
   if (typeof raw !== "object" || raw === null) {
     return null;
   }
   const record = raw as Record<string, unknown>;
   const rawMessages = record.messages;
+  const timezone = record.timezone;
   const rawStatus = record.status;
   const rawPage = record.page;
   if (
     !Array.isArray(rawMessages) ||
+    !(timezone === null || (typeof timezone === "string" && timezone.length > 0)) ||
     typeof rawStatus !== "object" ||
     rawStatus === null ||
     typeof rawPage !== "object" ||
@@ -303,7 +307,8 @@ export function parseThreadSnapshotResponse(
       seq < 1 ||
       (role !== "user" && role !== "assistant") ||
       typeof text !== "string" ||
-      typeof sentAt !== "string"
+      typeof sentAt !== "string" ||
+      !isValidInstant(sentAt)
     ) {
       return null;
     }
@@ -313,6 +318,7 @@ export function parseThreadSnapshotResponse(
     messages,
     status: { queued, generating, highestAllocatedSeq, hasRecentFailure },
     page: { oldestSeq, hasMore, messages },
+    timezone,
   };
 }
 

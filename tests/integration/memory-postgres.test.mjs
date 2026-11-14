@@ -28,6 +28,7 @@ import { conversationMigrations } from "../../apps/worker/src/conversation/migra
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { loadMemoryConfig } from "../../apps/worker/src/memory/config.ts";
 import { loadMemoryConfiguration } from "../../apps/worker/src/memory/subjects.ts";
 import { ingestTurns } from "../../apps/worker/src/memory/ingest.ts";
@@ -247,6 +248,7 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       ...conversationMigrations,
       ...memoryMigrations,
       ...articleMigrations,
+      ...temporalMigrations,
     ]);
   });
 
@@ -264,6 +266,9 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     await pool.query(SUBJECTS_SQL);
     await pool.query(PROMPTS_SQL);
     await pool.query(BEHAVIOR_SQL);
+    await pool.query(
+      `UPDATE companion_time_settings SET timezone = 'America/New_York' WHERE id = true`,
+    );
   });
 
 
@@ -303,12 +308,12 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       /memory_behavior has no row/,
     );
     await pool.query(BEHAVIOR_SQL);
-    await pool.query(`UPDATE memory_behavior SET timezone = 'Not/AZone'`);
+    await pool.query(`UPDATE companion_time_settings SET timezone = 'Not/AZone' WHERE id = true`);
     await assert.rejects(
       () => loadMemoryConfiguration(pool, PROMPT_VERSIONS),
       /not a usable IANA timezone/,
     );
-    await pool.query(`UPDATE memory_behavior SET timezone = 'America/New_York'`);
+    await pool.query(`UPDATE companion_time_settings SET timezone = 'America/New_York' WHERE id = true`);
     const configuration = await loadMemoryConfiguration(pool, PROMPT_VERSIONS);
     assert.equal(configuration.userSubject.id, "user");
     assert.deepEqual(configuration.behavior, BEHAVIOR);

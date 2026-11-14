@@ -75,6 +75,7 @@ import type {
   TraceChatMessage,
   TraceContextMessage,
   TraceDecision,
+  TraceTemporalContext,
   TurnAttemptTrace,
   TurnTraceReport,
   TurnWork,
@@ -1269,6 +1270,30 @@ export function createConversationStore(
         "chat trace messageChunks must align with the request messages",
       );
     }
+    if (payload.temporalContext !== undefined) {
+      const temporal = payload.temporalContext;
+      await client.query(
+        `UPDATE trace_attempt
+         SET temporal_timezone = $2,
+             temporal_as_of = $3::timestamptz,
+             temporal_local_date = $4::date,
+             temporal_local_time = $5::time,
+             temporal_season = $6,
+             temporal_occasion_keys = $7::text[],
+             temporal_occasion_context = $8
+         WHERE id = $1`,
+        [
+          attemptId,
+          temporal.timezone,
+          temporal.asOf,
+          temporal.localDate,
+          temporal.localTime,
+          temporal.season,
+          temporal.occasionKeys,
+          temporal.occasionContext,
+        ],
+      );
+    }
     const chat = await client.query<{ id: string }>(
       `INSERT INTO trace_attempt_chat
          (attempt_id, state, request_model, temperature, max_tokens,
@@ -1714,6 +1739,13 @@ export function createConversationStore(
     finished_at: Date | null;
     outcome: string | null;
     snapshot_recorded_at: Date | null;
+    temporal_timezone: string | null;
+    temporal_as_of: Date | null;
+    temporal_local_date: string | null;
+    temporal_local_time: string | null;
+    temporal_season: TraceTemporalContext["season"];
+    temporal_occasion_keys: string[];
+    temporal_occasion_context: string | null;
   }
 
   interface DecisionRow {
@@ -1783,7 +1815,10 @@ export function createConversationStore(
         }
         const attemptsResult = await client.query<AttemptRow>(
           `SELECT id, attempt, lease_owner, claimed_at, finished_at, outcome,
-                  snapshot_recorded_at
+                  snapshot_recorded_at, temporal_timezone, temporal_as_of,
+                  temporal_local_date::text AS temporal_local_date,
+                  temporal_local_time, temporal_season,
+                  temporal_occasion_keys, temporal_occasion_context
            FROM trace_attempt WHERE turn_id = $1 ORDER BY attempt`,
           [params.turnId],
         );
@@ -1956,6 +1991,17 @@ export function createConversationStore(
             finishedAt: attemptRow.finished_at?.toISOString() ?? null,
             outcome: attemptRow.outcome as TurnAttemptTrace["outcome"],
             snapshotRecordedAt: attemptRow.snapshot_recorded_at?.toISOString() ?? null,
+            temporalContext: attemptRow.temporal_as_of === null
+              ? null
+              : {
+                  asOf: attemptRow.temporal_as_of.toISOString(),
+                  timezone: attemptRow.temporal_timezone,
+                  localDate: attemptRow.temporal_local_date,
+                  localTime: attemptRow.temporal_local_time,
+                  season: attemptRow.temporal_season,
+                  occasionKeys: attemptRow.temporal_occasion_keys,
+                  occasionContext: attemptRow.temporal_occasion_context,
+                },
             context: contextResult.rows.map((row) => ({
               position: row.position,
               messageId: row.message_id,

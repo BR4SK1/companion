@@ -90,6 +90,7 @@ export async function GET(request: NextRequest) {
   );
   if (result.ok) {
     return jsonOk({
+      timezone: result.snapshot.timezone,
       messages: result.snapshot.messages.map(toClientMessage),
       status: {
         queued: result.snapshot.queued,

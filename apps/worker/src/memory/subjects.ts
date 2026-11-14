@@ -1,8 +1,8 @@
 /**
  * Personal behavior configuration, loaded from the database.
  *
- * Subjects, persona prompt text, and the behavioral-day boundary are
- * deployment configuration, not code or repository content. The loader fails
+ * Subjects, persona prompt text, behavioral-day start hour, and the
+ * worker-wide timezone are deployment configuration, not code or repository content. The loader fails
  * closed: a missing subject, prompt, behavior row, or per-subject evidence
  * rule is an error, never a silently-degraded pipeline. (An entirely
  * unprovisioned deployment is handled one layer up: the worker starts and
@@ -38,11 +38,11 @@ interface PromptRow {
 }
 
 interface BehaviorRow {
-  timezone: string;
+  timezone: string | null;
   day_start_hour: number;
 }
 
-/** The behavioral-day boundary, provisioned in `memory_behavior`. */
+/** The memory behavioral-day start hour plus worker-wide timezone. */
 export interface MemoryBehaviorConfig {
   readonly timezone: string;
   readonly dayStartHour: number;
@@ -63,19 +63,29 @@ export interface MemoryConfiguration {
  *  (e.g. the review CLI). Fails closed when the row is missing or invalid. */
 export async function loadMemoryBehavior(
   pool: PostgresPool,
+  authoritativeTimezone?: string | null,
 ): Promise<MemoryBehaviorConfig> {
+  const timezoneExpression = authoritativeTimezone === undefined ? "t.timezone" : "$1::text";
+  const settingsJoin = authoritativeTimezone === undefined
+    ? "CROSS JOIN companion_time_settings t"
+    : "";
+  const settingsPredicate = authoritativeTimezone === undefined ? " AND t.id = true" : "";
   const behaviorResult = await pool.query<BehaviorRow>(
-    `SELECT timezone, day_start_hour FROM memory_behavior WHERE id = 'behavior'`,
+    `SELECT ${timezoneExpression} AS timezone, b.day_start_hour
+     FROM memory_behavior b
+     ${settingsJoin}
+     WHERE b.id = 'behavior'${settingsPredicate}`,
+    authoritativeTimezone === undefined ? [] : [authoritativeTimezone],
   );
   const behaviorRow = behaviorResult.rows[0];
   if (behaviorRow === undefined) {
     throw new MemoryConfigurationError(
-      "memory_behavior has no row; provision the behavioral-day boundary (timezone and day_start_hour)",
+      "memory_behavior has no row; provision its behavioral-day start hour and companion_time_settings.timezone",
     );
   }
-  if (!isValidTimezone(behaviorRow.timezone)) {
+  if (behaviorRow.timezone === null || !isValidTimezone(behaviorRow.timezone)) {
     throw new MemoryConfigurationError(
-      `memory_behavior timezone '${behaviorRow.timezone}' is not a usable IANA timezone`,
+      "companion_time_settings.timezone is not a usable IANA timezone",
     );
   }
   return { timezone: behaviorRow.timezone, dayStartHour: behaviorRow.day_start_hour };
@@ -84,6 +94,7 @@ export async function loadMemoryBehavior(
 export async function loadMemoryConfiguration(
   pool: PostgresPool,
   promptVersions: Readonly<Record<string, string>>,
+  authoritativeTimezone?: string | null,
 ): Promise<MemoryConfiguration> {
   const subjectsResult = await pool.query<SubjectRow>(
     `SELECT id, role, profile_enabled, source_label, profile_evidence_rule, position
@@ -116,7 +127,7 @@ export async function loadMemoryConfiguration(
     );
   }
 
-  const behavior = await loadMemoryBehavior(pool);
+  const behavior = await loadMemoryBehavior(pool, authoritativeTimezone);
 
   const kinds = Object.keys(promptVersions);
   const expectedVersions = kinds.map((kind) => promptVersions[kind]!);

@@ -194,6 +194,15 @@ export function renderAttempt(attempt: TurnAttemptTrace): readonly string[] {
   lines.push(`  finished: ${attempt.finishedAt ?? "(not finished)"}`);
   lines.push(`  outcome: ${outcome}`);
   lines.push(`  snapshot recorded: ${snapshot}`);
+  const temporal = attempt.temporalContext;
+  lines.push(
+    temporal === null || temporal === undefined
+      ? "  temporal context: (not recorded)"
+      : `  temporal context: ${temporal.localDate ?? "unspecified"} ${temporal.localTime ?? "unspecified"} (${temporal.timezone ?? "no timezone"}); season=${temporal.season ?? "unspecified"}; occasions=${temporal.occasionKeys.join(",") || "none"}`,
+  );
+  if (temporal?.occasionContext !== null && temporal?.occasionContext !== undefined) {
+    lines.push(`    occasion context: ${JSON.stringify(temporal.occasionContext)}`);
+  }
   lines.push(
     `  context snapshot (${attempt.context.length} message(s), in order):`,
   );

@@ -12,6 +12,7 @@ import { MessageImageThumb } from "./message-images";
 
 interface MessageClusterViewProps {
   cluster: MessageCluster;
+  timezone: string | null;
   /** True when this cluster contains the newest message of the thread. */
   isThreadEnd: boolean;
   onOpenImage: (image: MessageImage) => void;
@@ -107,6 +108,7 @@ function Bubble({
  */
 export function MessageClusterView({
   cluster,
+  timezone,
   isThreadEnd,
   onOpenImage,
 }: MessageClusterViewProps) {
@@ -160,7 +162,7 @@ export function MessageClusterView({
                   textAlign: isUser ? "right" : "left",
                 }}
               >
-                {formatClockTime(message.sentAt)}
+                {formatClockTime(message.sentAt, timezone)}
               </Typography>
             )}
           </Box>

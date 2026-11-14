@@ -1,56 +1,66 @@
+import { DateTime, IANAZone } from "luxon";
+
 /**
- * Pure time-label helpers for the thread UI.
- *
- * Preview simplification: fixture timestamps are UTC instants and all labels
- * and day keys are derived in UTC so the statically prerendered HTML and the
- * hydrated client always agree (no Today/Yesterday recomputation against the
- * wall clock, which would mismatch the prerender on later visits). Revisit
- * with a real clock and locale requirements when live data exists.
+ * Pure labels for message instants. The zone is supplied by the authenticated
+ * BFF from the worker's authoritative database setting; the browser's own zone
+ * is never consulted. If that setting is unavailable, fixed UTC labels are
+ * explicitly marked and no guessed local-day dividers are added.
  */
-
-const dayFormat = new Intl.DateTimeFormat("en-US", {
-  timeZone: "UTC",
-  month: "short",
-  day: "numeric",
-  year: "numeric",
-});
-
-const clockFormat = new Intl.DateTimeFormat("en-US", {
-  timeZone: "UTC",
-  hour: "2-digit",
-  minute: "2-digit",
-  hour12: false,
-});
-
-/** Calendar-day key (YYYY-MM-DD) for a millisecond instant, in UTC. */
-export function utcDayKey(instant: number): string {
-  return new Date(instant).toISOString().slice(0, 10);
+export function isValidTimezone(timezone: string): boolean {
+  return IANAZone.isValidZone(timezone);
 }
 
-/** True when two instants fall on different UTC calendar days. */
-export function isDifferentUtcDay(fromIso: string, toIso: string): boolean {
-  const from = Date.parse(fromIso);
-  const to = Date.parse(toIso);
-  if (Number.isNaN(from) || Number.isNaN(to)) {
-    throw new Error(`Invalid ISO timestamp: ${fromIso}, ${toIso}`);
-  }
-  return utcDayKey(from) !== utcDayKey(to);
+const EXPLICIT_OFFSET = /(?:Z|[+-]\d{2}:\d{2})$/i;
+
+export function isValidInstant(iso: string): boolean {
+  return EXPLICIT_OFFSET.test(iso) && DateTime.fromISO(iso, { setZone: true }).isValid;
 }
 
-/** Label for a time divider, e.g. "Oct 29, 2026". */
-export function formatDayLabel(iso: string): string {
-  const at = Date.parse(iso);
-  if (Number.isNaN(at)) {
-    throw new Error(`Invalid ISO timestamp: ${iso}`);
-  }
-  return dayFormat.format(at);
+function dateTime(iso: string, timezone: string | null): DateTime {
+  const instant = DateTime.fromISO(iso, { setZone: true });
+  if (!isValidInstant(iso) || !instant.isValid) throw new Error(`Invalid ISO timestamp: ${iso}`);
+  // The authenticated BFF validates the worker's IANA zone. A particular
+  // browser may nevertheless have an older ICU database; render explicitly in
+  // UTC rather than breaking the thread or consulting the browser's local zone.
+  if (timezone === null || !IANAZone.isValidZone(timezone)) return instant.toUTC();
+  return instant.setZone(timezone);
+}
+
+function supportsTimezone(timezone: string | null): boolean {
+  return timezone !== null && IANAZone.isValidZone(timezone);
+}
+
+export function timezoneOffsetLabel(shortName: string | null, numericOffset: string): string {
+  return shortName ?? `UTC${numericOffset}`;
+}
+
+/** Calendar-day key (YYYY-MM-DD) for a timestamp in the authoritative zone. */
+export function localDayKey(iso: string, timezone: string | null): string {
+  return dateTime(iso, timezone).toISODate()!;
+}
+
+/** True only when both instants have a configured zone and cross its local day. */
+export function isDifferentLocalDay(
+  fromIso: string,
+  toIso: string,
+  timezone: string | null,
+): boolean {
+  if (!supportsTimezone(timezone)) return false;
+  return localDayKey(fromIso, timezone) !== localDayKey(toIso, timezone);
+}
+
+/** Label for a day divider, e.g. "Oct 29, 2026". */
+export function formatDayLabel(iso: string, timezone: string | null): string {
+  const local = dateTime(iso, timezone);
+  return `${local.toFormat("LLL d, yyyy")}${supportsTimezone(timezone) ? "" : " (UTC)"}`;
 }
 
 /** Short clock label for an individual message, e.g. "14:05". */
-export function formatClockTime(iso: string): string {
-  const at = Date.parse(iso);
-  if (Number.isNaN(at)) {
-    throw new Error(`Invalid ISO timestamp: ${iso}`);
-  }
-  return clockFormat.format(at);
+export function formatClockTime(iso: string, timezone: string | null): string {
+  const local = dateTime(iso, timezone);
+  if (!supportsTimezone(timezone)) return `${local.toFormat("HH:mm")} UTC`;
+  const shortName = local.offsetNameShort;
+  // Some Intl/ICU builds expose a valid numeric offset but no localized short
+  // name. Never render the string "null" as a timezone abbreviation.
+  return `${local.toFormat("HH:mm")} ${timezoneOffsetLabel(shortName, local.toFormat("ZZ"))}`;
 }

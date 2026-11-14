@@ -129,18 +129,31 @@ export async function disablePatterns() {
 
 /**
  * Seed completed past turns (one user message and one assistant reply each)
- * directly as durable history, spread over three distinct UTC days. `seq` is
- * assigned explicitly and the identity sequence is advanced past the seeded
- * maximum so live ingestion continues after it without collision.
+ * directly as durable history, spread over three distinct local calendar days
+ * for the E2E stack's configured America/Los_Angeles zone. The 00:30 UTC
+ * timestamps fall on the preceding Pacific date, distinguishing local grouping
+ * from UTC grouping. `seq` is assigned explicitly and the identity sequence
+ * is advanced past the seeded maximum so live ingestion continues without collision.
  *
- * Three days (rather than two) give two UTC-day boundaries in the visible
- * thread: the day-divider rendering emits a divider at day changes only,
- * never before the first message, so a two-day seed would render exactly
- * one divider.
+ * Three days (rather than two) give three configured local dates and two
+ * visible boundaries: the day-divider rendering emits a divider at day
+ * changes only, never before the first message, so a two-date seed would
+ * render exactly one divider.
  *
  * These rows are completed history: they never trigger turns, so the fake
  * provider sees no traffic from them.
  */
+async function seededHistoryDayInstants() {
+  const output = await psql(`
+    SELECT to_char(min(created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+    FROM conversation_turn
+    WHERE id::text LIKE '00000000-%'
+    GROUP BY date_trunc('day', created_at AT TIME ZONE 'UTC')
+    ORDER BY 1;
+  `);
+  return output.trim().split("\n").filter(Boolean);
+}
+
 export async function seedHistory(turnCount) {
   if (!Number.isInteger(turnCount) || turnCount < 2) {
     throw new Error("turnCount must be an integer >= 2");
@@ -152,15 +165,15 @@ export async function seedHistory(turnCount) {
     "SELECT count(*) FROM conversation_turn WHERE id::text LIKE '00000000-%';",
   );
   if (Number(existing.trim()) === turnCount) {
-    return;
+    return seededHistoryDayInstants();
   }
   if (Number(existing.trim()) !== 0) {
     throw new Error(
       `unexpected pre-existing synthetic turns (${existing.trim()}), refusing to seed`,
     );
   }
-  // Each day group stays inside its own UTC day: minute offsets are
-  // relative to each group's start (10:00 UTC).
+  // Each date group uses 00:30 UTC (the preceding local date in Los Angeles);
+  // minute offsets keep the messages inside that same configured local day.
   const firstBreak = Math.ceil(turnCount / 3);
   const secondBreak = Math.ceil((2 * turnCount) / 3);
   const selects = [];
@@ -191,9 +204,9 @@ export async function seedHistory(turnCount) {
         s.id,
         'completed',
         (date_trunc('day', now() AT TIME ZONE 'UTC') - (s.day_offset * interval '1 day')) AT TIME ZONE 'UTC'
-          + interval '10 hours' + (s.minute_offset * interval '1 minute'),
+          + interval '30 minutes' + (s.minute_offset * interval '1 minute'),
         (date_trunc('day', now() AT TIME ZONE 'UTC') - (s.day_offset * interval '1 day')) AT TIME ZONE 'UTC'
-          + interval '10 hours' + (s.minute_offset * interval '1 minute') + interval '1 minute'
+          + interval '30 minutes' + (s.minute_offset * interval '1 minute') + interval '1 minute'
       FROM seed s
       RETURNING id, created_at
     ),
@@ -241,6 +254,7 @@ export async function seedHistory(turnCount) {
   if (match === null || Number(match[1]) !== turnCount) {
     throw new Error(`history seeding incomplete: ${output.trim()}`);
   }
+  return seededHistoryDayInstants();
 }
 
 export async function countMessages() {

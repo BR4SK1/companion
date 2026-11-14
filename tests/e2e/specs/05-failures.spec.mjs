@@ -123,7 +123,7 @@ test.describe("failed generation", () => {
     const failedIndex = contents.findIndex(
       (content) => typeof content === "string" && content.startsWith(failedTextPrefix),
     );
-    expect(failedIndex).toBeGreaterThan(0); // present in prior context (after the system guidance)
+    expect(failedIndex).toBeGreaterThan(0); // present in prior context after the system chunks
     // The failed message's own turn has no reply: the next entry after it in
     // conversation order is this turn's user message, not an assistant reply.
     expect(request.messages[failedIndex + 1].role).toBe("user");

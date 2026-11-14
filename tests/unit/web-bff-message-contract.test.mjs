@@ -41,6 +41,7 @@ function workerMessage(overrides = {}) {
 /** A worker thread snapshot body, worker-shaped. */
 function workerSnapshotBody(messages, overrides = {}) {
   return {
+    timezone: "America/New_York",
     messages,
     status: {
       queued: 0,
@@ -73,6 +74,7 @@ function clientResponding(status, body) {
 /** The GET /api/thread response payload, assembled exactly as the route does. */
 function threadRoutePayload(snapshot) {
   return {
+    timezone: snapshot.timezone,
     messages: snapshot.messages.map(toClientMessage),
     status: {
       queued: snapshot.queued,

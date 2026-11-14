@@ -131,6 +131,8 @@ function emptyResult(): MutableIngestionResult {
 
 export interface ArticleRuntimeDeps {
   readonly pool: PostgresPool;
+  /** Startup-captured authoritative timezone for evidence-day computations. */
+  readonly timezone?: string | null;
   /**
    * The LLM caller, bound per call to the model configured in
    * `article_behavior` (the article domain owns its model choice in the
@@ -713,6 +715,7 @@ export async function runIngestionAttempt(
   try {
     const outcome = await runArticleObservationConsolidation({
       pool,
+      timezone: deps.timezone,
       callLlm: deps.callLlm,
       log,
     });

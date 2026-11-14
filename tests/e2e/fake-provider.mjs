@@ -6,8 +6,8 @@
  * control API under `/__control/` that the tests use to script behavior
  * (success, HTTP 500, hang), to read the recorded requests so assertions
  * can verify what the worker actually sent (seeded response-pattern
- * options, response guidance as the leading system message, conversation
- * context order), and to observe in-flight capability calls for
+ * options, identity and temporal context before any selected response
+ * guidance, conversation context order), and to observe in-flight capability calls for
  * cross-test quiescence (`/__control/pending`).
  *
  * The provider is a deliberate fake: deterministic, no network egress, no

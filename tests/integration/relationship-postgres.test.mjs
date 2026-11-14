@@ -16,6 +16,7 @@ import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { engagementMigrations } from "../../apps/worker/src/engagement/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { relationshipMigrations } from "../../apps/worker/src/relationship/migrations.ts";
+import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { behavioralDay } from "../../apps/worker/src/memory/time.ts";
 import {
   createConversationStore,
@@ -36,6 +37,7 @@ const COMPOSED_MIGRATIONS = [
   ...engagementMigrations,
   ...articleMigrations,
   ...relationshipMigrations,
+  ...temporalMigrations,
 ];
 
 describe("relationship familiarity (PostgreSQL)", { skip: !hasDatabase }, () => {
@@ -46,6 +48,9 @@ describe("relationship familiarity (PostgreSQL)", { skip: !hasDatabase }, () => 
   before(async () => {
     pool = createPostgresPool({ connectionString: DATABASE_URL });
     await runMigrations(pool, COMPOSED_MIGRATIONS);
+    await pool.query(
+      `UPDATE companion_time_settings SET timezone = 'UTC' WHERE id = true`,
+    );
     await pool.query(
       `INSERT INTO relationship_settings
          (id, relationship_type, timezone, day_start_hour, tier_movement_enabled,
@@ -105,6 +110,9 @@ describe("relationship familiarity (PostgreSQL)", { skip: !hasDatabase }, () => 
     // Exercise configuration reset too: no answer content or conversation
     // history survives between tests.
     await pool.query(
+      `UPDATE companion_time_settings SET timezone = 'UTC' WHERE id = true`,
+    );
+    await pool.query(
       `UPDATE relationship_settings SET timezone = 'UTC', day_start_hour = 4,
        tier_movement_enabled = false, tier_up_min_days = NULL,
        tier_up_min_active_streak = NULL, tier_down_missed_streak = NULL
@@ -161,11 +169,14 @@ describe("relationship familiarity (PostgreSQL)", { skip: !hasDatabase }, () => 
       "PostgreSQL local-civil-date aggregation must match the existing ICU DST/day-boundary semantics",
     );
 
-    await pool.query(`UPDATE relationship_settings SET timezone = 'Invalid/Zone' WHERE id = true`);
+    await pool.query(`UPDATE companion_time_settings SET timezone = 'Invalid/Zone' WHERE id = true`);
     await assert.rejects(loadRelationshipConfiguration(pool), RelationshipConfigurationError);
   });
 
   it("summarizes first-recorded date, user-only dates, future activity, and persisted participant answers", async () => {
+    await pool.query(
+      `UPDATE companion_time_settings SET timezone = 'America/New_York' WHERE id = true`,
+    );
     await pool.query(
       `UPDATE relationship_settings SET timezone = 'America/New_York', day_start_hour = 4 WHERE id = true`,
     );

@@ -14,8 +14,10 @@
  *   per-subject evidence-attribution rule for the v1 profile sheet).
  * - `memory_prompt` — the persona-bearing system prompt text for each memory
  *   LLM task, keyed by kind and prompt version.
- * - `memory_behavior` — the behavioral-day boundary (timezone and local
- *   start hour) used by evidence counting, period keys, and cadence.
+ * - `memory_behavior` — the memory-specific local behavioral-day start hour
+ *   used by evidence counting, period keys, and cadence; its legacy timezone
+ *   column is retained but the worker-wide zone now comes from
+ *   `companion_time_settings`.
  */
 
 import type { Migration } from "@companion/postgres";
@@ -34,10 +36,11 @@ CREATE TABLE memory_subject (
   position integer NOT NULL CHECK (position >= 0)
 );
 
--- Personal behavior configuration: the behavioral-day boundary. Provisioned
--- privately per deployment as a single row; the memory configuration loader
--- fails closed when it is missing, and an unprovisioned deployment runs the
--- memory domain as a safe no-op instead of failing the worker.
+-- Memory-specific behavioral-day start hour. The legacy timezone column is
+-- retained during this cutover for historical/config compatibility; runtime
+-- consumers read the authoritative worker-wide timezone from
+-- companion_time_settings. Provisioned privately per deployment as a single
+-- row; the memory configuration loader fails closed when it is missing.
 CREATE TABLE memory_behavior (
   id text PRIMARY KEY CHECK (id = 'behavior'),
   timezone text NOT NULL,

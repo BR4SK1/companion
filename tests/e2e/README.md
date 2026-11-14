@@ -49,7 +49,12 @@ brings up, in order:
    loopback-only port, per-run random user/password, `--rm`).
 3. the **worker** (`apps/worker`) against that throwaway database and the
    fake provider (the provider URLs are configuration; no provider fallback
-   exists), with a per-run random service token.
+   exists), with a per-run random service token. The first start applies
+   migrations; the supervisor provisions a synthetic `America/Los_Angeles`
+   timezone only in this disposable database, then gracefully restarts the
+   worker before exposing the stack so its startup-captured setting is active
+   for the whole run. The history fixture uses 00:30 UTC instants to test
+   Pacific local-day dividers rather than accidentally testing UTC grouping.
 4. the **web production build** (`apps/web/server.mjs`) with the
    non-production-only loopback test gate explicitly enabled in
    `trusted-local` mode — the documented path for a run outside Kubernetes.
@@ -127,21 +132,23 @@ on the turn's own recorded request rather than on request counts:
    health/readiness endpoints.
 2. `02-history` — the bounded newest page, the "Load earlier messages"
    control and the bounded automatic backfill over seeded completed turns,
-   UTC day dividers (the seed spans three days, since a divider renders at
-   each UTC-day change), scroll anchoring while new messages arrive away
-   from the bottom, and jump-to-latest. The spec numbering is the execution
+   configured Los Angeles local-day dividers (three seeded dates produce two
+   divider boundaries), scroll anchoring while new messages arrive away from
+   the bottom, and jump-to-latest. The spec numbering is the execution
    order (files run alphabetically with one worker): the history seed must
    land before any spec sends live messages.
 3. `03-chat-decision` — composed message accepted, durably persisted, and
    answered through the real engine with the seeded response patterns
    (decision options and selection description verified from the provider's
-   recorded request; the selected pattern's response guidance verified as the
-   leading chat system message); persistence across reload; follow-up context
+   recorded request; chat assertions verify identity first, a separate
+   structural temporal-context chunk, and selected response guidance after
+   it); persistence across reload; follow-up context
    in conversation order; poll-driven updates of the open UI; the composing
    indicator; idempotent replay and conflicting-key 409 at the BFF; input
    bounds.
 4. `04-no-pattern` — with no enabled patterns the decision step is skipped
-   (no decision call) and chat runs without guidance.
+   (no decision call) and chat runs without pattern guidance while retaining
+   identity and temporal context.
 5. `05-failures` — a failed chat generation and a failed decision surfaced as
    sanitized notices with the message persisted and unanswered, conversation
    continuity with the failed message still in later context, connection-error
