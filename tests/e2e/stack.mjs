@@ -3,11 +3,12 @@
  * The end-to-end test stack supervisor: a run-owned, disposable, isolated
  * local stack for the Playwright suite.
  *
- * Components, all local and synthetic:
- * - a throwaway PostgreSQL in a dedicated Docker container (loopback-only
- *   port, random database user/password, `--rm` so nothing lingers);
+ * Components:
+ * - a throwaway pgvector-ready PostgreSQL in a dedicated Docker container
+ *   (loopback-only port, random database user/password, `--rm` so nothing lingers);
  * - the real worker (`apps/worker`) against that throwaway database with a
- *   fresh random service token, pointed at the local fake provider;
+ *   fresh random service token, the local fake provider, and the explicitly
+ *   configured internal embedding service;
  * - the real web app production build (`apps/web/server.mjs`) with the
  *   non-production-only loopback test gate enabled in explicit
  *   `trusted-local` mode (no Kubernetes indicators exist on a workstation).
@@ -15,7 +16,7 @@
  * Ownership and cleanup rules:
  * - The run records everything it creates (its own supervisor PID with the
  *   /proc start time, each child's PID with its /proc start time, and the
- *   container name) in `tests/e2e/.runs/<run-id>/state.json`.
+ *   container name) in the task-isolated `E2E_RUNS_DIR/<run-id>/state.json`.
  * - On normal exit, failure, SIGINT, or SIGTERM the supervisor tears its
  *   own stack down completely and removes the ownership record — but only
  *   if every recorded resource is verifiably gone. An incomplete teardown
@@ -479,6 +480,10 @@ function spawnManaged({ name, command, args, cwd, env, envStrip = [], runDir }) 
 // ---------------------------------------------------------------------------
 
 async function up() {
+  if (config.embeddingBaseUrl === null) {
+    fail("WORKER_MEMORY_EMBEDDING_BASE_URL must point to the approved internal embedding service");
+  }
+
   // Reconciliation must run BEFORE the port checks: a stale run's left-over
   // processes hold the ports, and a port check that hard-fails first would
   // make every later start impossible until someone cleaned up by hand.
@@ -724,6 +729,16 @@ async function up() {
       await sleep(500);
     }
     log("postgres ready (accepts queries)");
+    // The run-owned pgvector image supplies the extension files; enable the
+    // extension only in this disposable E2E database, never from app migrations.
+    const vectorExtension = await docker([
+      "exec", containerName,
+      "psql", "-U", dbUser, "-d", dbName,
+      "-v", "ON_ERROR_STOP=1", "-c", "CREATE EXTENSION IF NOT EXISTS vector",
+    ]);
+    if (vectorExtension.code !== 0) {
+      throw new Error("could not enable pgvector in the disposable E2E database");
+    }
 
     // 3. Worker (real application code) against the throwaway database and
     //    the fake provider; strict configuration, no fallbacks. The first
@@ -737,6 +752,7 @@ async function up() {
         cwd: config.workerDir,
         env: {
           WORKER_DATABASE_URL: `postgres://${dbUser}:${dbPassword}@${GATE_HOST}:${String(config.pgPort)}/${dbName}`,
+          WORKER_MEMORY_EMBEDDING_BASE_URL: config.embeddingBaseUrl,
           OPENROUTER_API_KEY: providerKey,
           WORKER_CHAT_MODEL: "e2e-fake-chat-model",
           WORKER_DECISION_MODEL: "e2e-fake-decision-model",

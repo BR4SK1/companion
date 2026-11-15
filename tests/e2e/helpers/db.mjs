@@ -9,7 +9,8 @@
  * The worker's own migrations create the schema (applied at worker startup);
  * these helpers only insert/adjust rows for the journeys under test:
  * response patterns (runtime configuration by design — no rows are seeded by
- * migrations) and, for the history journey, completed past turns.
+ * migrations), the exact migration-seeded prompt-module example, and, for the
+ * history journey, completed past turns.
  */
 
 import { spawn } from "node:child_process";

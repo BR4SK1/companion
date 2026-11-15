@@ -37,27 +37,6 @@ interface MessageRow {
   created_at: Date;
 }
 
-function compositeKeyOf(turnId: string): string {
-  return turnId;
-}
-
-/**
- * Strictly-after comparison on the composite (endAt, turnId) position. The
- * watermark is a high-water mark over a contiguous oldest-first walk, so a
- * turn is pending exactly when its position is greater than the watermark.
- */
-export function positionAfterWatermark(
-  endAt: Date,
-  turnId: string,
-  watermark: WatermarkPosition,
-): boolean {
-  const endAtTime = endAt.getTime();
-  if (endAtTime !== watermark.endAt.getTime()) {
-    return endAtTime > watermark.endAt.getTime();
-  }
-  return compositeKeyOf(turnId) > compositeKeyOf(watermark.turnId);
-}
-
 interface SelectOptions {
   readonly watermark: WatermarkPosition | null;
   readonly maxTurns: number;
@@ -116,9 +95,11 @@ function buildSourceTurns(
       sourceMessageIds: messages.map((message) => message.id),
     });
   }
-  return turns.sort((a, b) =>
-    a.startAt.getTime() - b.startAt.getTime() ||
-    a.turnKey.localeCompare(b.turnKey));
+  // Preserve the database's exact timestamp ordering. PostgreSQL timestamps
+  // carry microseconds, but the default node-postgres Date parser exposes only
+  // milliseconds; resorting these rows in JavaScript can reorder turns whose
+  // end times fall within the same millisecond.
+  return turns;
 }
 
 /**
@@ -134,12 +115,12 @@ export async function selectTurnsAfterWatermark(
   options: SelectOptions,
 ): Promise<SourceTurn[]> {
   const settledBefore = new Date(options.now.getTime() - options.settleMs);
-  // Fetch a bounded superset: the SQL limit applies before the composite
-  // watermark check, so over-fetch to keep the slice exact in the common case.
+  // Apply the composite watermark comparison in PostgreSQL, where the stored
+  // source timestamps retain their microsecond precision. The Date values
+  // returned to JavaScript are only millisecond-precise and cannot safely
+  // decide this ordering.
   const headers = await pool.query<TurnHeaderRow>(
-    `SELECT t.id, agg.start_at, agg.end_at, agg.user_count, agg.assistant_count
-     FROM conversation_turn t
-     JOIN (
+    `WITH turn_ends AS (
        SELECT turn_id,
               min(created_at) AS start_at,
               max(created_at) AS end_at,
@@ -147,20 +128,30 @@ export async function selectTurnsAfterWatermark(
               count(*) FILTER (WHERE role = 'assistant') AS assistant_count
        FROM conversation_message
        GROUP BY turn_id
-     ) agg ON agg.turn_id = t.id
+     ), watermark_position AS (
+       SELECT turn_id, end_at
+       FROM turn_ends
+       WHERE turn_id = $1::uuid
+     )
+     SELECT t.id, agg.start_at, agg.end_at, agg.user_count, agg.assistant_count
+     FROM conversation_turn t
+     JOIN turn_ends agg ON agg.turn_id = t.id
      WHERE t.status = 'completed'
-       AND ($1::timestamptz IS NULL OR agg.end_at >= $1::timestamptz)
+       AND (
+         $1::uuid IS NULL
+         OR EXISTS (
+           SELECT 1 FROM watermark_position watermark
+           WHERE (agg.end_at, t.id) > (watermark.end_at, watermark.turn_id)
+         )
+       )
      ORDER BY agg.end_at, t.id
      LIMIT $2`,
-    [options.watermark?.endAt ?? null, options.maxTurns * 4],
+    [options.watermark?.turnId ?? null, options.maxTurns * 4],
   );
 
   const candidates = headers.rows
     .filter((row) => Number(row.user_count) > 0 && Number(row.assistant_count) > 0)
     .filter((row) => row.end_at.getTime() <= settledBefore.getTime())
-    .filter((row) =>
-      options.watermark === undefined || options.watermark === null ||
-      positionAfterWatermark(row.end_at, row.id, options.watermark))
     .slice(0, options.maxTurns);
 
   if (candidates.length === 0) return [];
@@ -225,7 +216,8 @@ export async function selectLastCompletedTurns(
 
   const candidates = headers.rows
     .filter((row) => Number(row.user_count) > 0 && Number(row.assistant_count) > 0)
-    .slice(0, maxTurns);
+    .slice(0, maxTurns)
+    .reverse();
 
   if (candidates.length === 0) return [];
   const messagesByTurn = await loadMessagesForTurns(pool, candidates.map((row) => row.id));

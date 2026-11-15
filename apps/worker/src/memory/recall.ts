@@ -204,7 +204,24 @@ interface ObservationCandidateRow {
  * sanitized query text (see the chat integration: the first words of the
  * turn's user message).
  */
-export async function recallCanonical(
+export interface CanonicalRecallCandidate {
+  readonly item: CanonicalRecallItem;
+  readonly score: number;
+  readonly chars: number;
+  readonly rank: number;
+  readonly baselineIncluded: boolean;
+  readonly baselineResultRank: number | null;
+}
+
+export interface CanonicalRecallDetailed {
+  readonly response: CanonicalRecallResponse;
+  /** Exact normalized values used by the baseline, including API defaults. */
+  readonly normalizedInput: CanonicalRecallInput;
+  /** Bounded at the same per-kind SQL candidate limit as ordinary recall. */
+  readonly candidates: readonly CanonicalRecallCandidate[];
+}
+
+export async function recallCanonicalDetailed(
   pool: PostgresPool,
   config: MemoryConfig,
   input: {
@@ -214,7 +231,7 @@ export async function recallCanonical(
     maxChars?: number;
     timezone?: string;
   },
-): Promise<CanonicalRecallResponse> {
+): Promise<CanonicalRecallDetailed> {
   const startedAt = Date.now();
   const request = normalizeRecallInput(input);
   if (request.timezone !== undefined && !isValidTimezone(request.timezone)) {
@@ -451,7 +468,7 @@ export async function recallCanonical(
     if (candidate.item.type === "observation") observationCount += 1;
   }
 
-  return {
+  const response: CanonicalRecallResponse = {
     query: {
       referenceTime: request.referenceTime.toISOString(),
       emptyQueryFallback,
@@ -475,4 +492,33 @@ export async function recallCanonical(
       totalMs: Date.now() - startedAt,
     },
   };
+  const resultRanks = new Map(results.map((item, index) => [item.id, index + 1]));
+  const includedIds = new Set(resultRanks.keys());
+  return {
+    response,
+    normalizedInput: request,
+    candidates: scored.map((candidate, index) => ({
+      item: candidate.item,
+      score: candidate.score,
+      chars: candidate.chars,
+      rank: index + 1,
+      baselineIncluded: includedIds.has(candidate.item.id),
+      baselineResultRank: resultRanks.get(candidate.item.id) ?? null,
+    })),
+  };
+}
+
+/** Public recall remains the original keyword result; shadow consumers are separate. */
+export async function recallCanonical(
+  pool: PostgresPool,
+  config: MemoryConfig,
+  input: {
+    query: string;
+    referenceTime: Date;
+    limit?: number;
+    maxChars?: number;
+    timezone?: string;
+  },
+): Promise<CanonicalRecallResponse> {
+  return (await recallCanonicalDetailed(pool, config, input)).response;
 }

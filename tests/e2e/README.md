@@ -5,8 +5,9 @@
 Implemented Playwright coverage of user-visible behavior through the web/BFF
 boundary, exercising the real applications — the web production build with its
 BFF edge and loopback test-entry gate, and the real worker (private HTTP API,
-durable work, response-pattern decision, chat generation) — against a local
-fake OpenRouter provider and a disposable throwaway PostgreSQL.
+durable work, response-pattern decisions, chat generation) — against a local
+fake OpenRouter provider, a configured real embedding service, and a disposable
+throwaway PostgreSQL.
 
 The Playwright/E2E toolchain is pinned to Node.js **22.23.4** in
 [`.nvmrc`](.nvmrc) and in this package's `engines` field. Its test,
@@ -21,41 +22,63 @@ runtime:
 pnpm install                                      # installs the pinned Playwright
 pnpm --filter @companion/web build                # the suite serves the production build
 pnpm --filter @companion/e2e install:chromium     # installs the pinned browser build (Node 22.23.4)
-pnpm --filter @companion/e2e test                 # disposable-stack Playwright suite (Node 22.23.4)
+E2E_RUNS_DIR="$(mktemp -d)" pnpm --filter @companion/e2e test # isolated disposable-stack Playwright suite (Node 22.23.4)
 ```
+
+Give every stack, stack-operations, and deployed-smoke invocation a new
+`E2E_RUNS_DIR` outside the historical `tests/e2e/.runs` tree. Keep that
+run-owned directory until cleanup is verified; remove only that exact directory
+when no recovery marker or owned resource remains.
+
+The stack requires the existing `WORKER_MEMORY_EMBEDDING_BASE_URL` environment
+setting to identify the approved internal embedding service. Source it from
+private local infrastructure configuration; do not add its value to this
+README or any tracked fixture. For isolated maintenance/testing, set
+`E2E_RUNS_DIR` to a new task-owned directory so startup reconciliation and
+cleanup cannot inspect historical `.runs` entries.
 
 ### Request scope: full E2E versus local-only
 
 An unqualified request to "run E2E" means a **full E2E run**: this disposable
 local stack **plus** deployed non-production validation, which includes the
-[deployed smoke](#deployed-non-production-smoke-explicitly-acknowledged-real-billable-provider)
-and its real, billable provider calls. The command above runs only the
-fake-provider Playwright suite — it never includes the smoke, which runs only
-through its own documented command. A request explicitly scoped to local-only
-validation (for example "run the local e2e suite") covers exactly this
-fake-provider coverage and nothing deployed. The deployed smoke is also a
-valid request on its own, independent of a full E2E run.
+[guarded deployed smoke](#guarded-deployed-non-production-smoke), which may
+invoke external providers and incur charges. The command above runs only the
+local Playwright stack: chat/decision calls use a fake provider, while synthetic
+embedding requests use the configured embedding service. It
+never includes the deployed smoke, which runs only through its own documented
+command. A request explicitly scoped to local-only validation (for example
+"run the local e2e suite") covers exactly this local coverage and nothing
+deployed. The deployed smoke is also a valid request on its own, independent of
+a full E2E run.
 
 The stack supervisor (`stack.mjs`, started by Playwright as its web server)
-brings up, in order:
+uses these dependencies:
 
 1. a **fake provider** (`fake-provider.mjs`, in-process): the two OpenRouter
    endpoints the worker is configured to call, deterministic, with a control
    API the tests use to script behavior (success, HTTP 500, hang, latency)
    and to read recorded request bodies for assertions. It requires the
-   bearer credential the worker was configured with. No external network
-   calls are made and no live model is called anywhere.
-2. a **throwaway PostgreSQL** in a dedicated Docker container (pinned image,
-   loopback-only port, per-run random user/password, `--rm`).
-3. the **worker** (`apps/worker`) against that throwaway database and the
-   fake provider (the provider URLs are configuration; no provider fallback
-   exists), with a per-run random service token. The first start applies
-   migrations; the supervisor provisions a synthetic `America/Los_Angeles`
-   timezone only in this disposable database, then gracefully restarts the
-   worker before exposing the stack so its startup-captured setting is active
-   for the whole run. The history fixture uses 00:30 UTC instants to test
-   Pacific local-day dividers rather than accidentally testing UTC grouping.
-4. the **web production build** (`apps/web/server.mjs`) with the
+   bearer credential the worker was configured with. Chat and decision calls
+   remain fake-only.
+2. a **throwaway pgvector-ready PostgreSQL** in a dedicated Docker container
+   (pinned image, loopback-only port, per-run random user/password, `--rm`).
+   The supervisor enables the vector extension only in this disposable E2E
+   database; application migrations never install it.
+3. the **configured real embedding service**, supplied through the existing
+   `WORKER_MEMORY_EMBEDDING_BASE_URL` setting from approved private local
+   infrastructure configuration. The URL is not stored in source, run records,
+   or public documentation; the supervisor does not start, stop, or proxy that
+   service. Embedding requests use only synthetic E2E data.
+4. the **worker** (`apps/worker`) against that throwaway database, fake
+   provider, and real embedding service (all URLs are explicit configuration;
+   no provider fallback exists), with a per-run random service token. The
+   first start applies migrations; the supervisor provisions a synthetic
+   `America/Los_Angeles` timezone only in this disposable database, then
+   gracefully restarts the worker before exposing the stack so its
+   startup-captured setting is active for the whole run. The history fixture
+   uses 00:30 UTC instants to test Pacific local-day dividers rather than
+   accidentally testing UTC grouping.
+5. the **web production build** (`apps/web/server.mjs`) with the
    non-production-only loopback test gate explicitly enabled in
    `trusted-local` mode — the documented path for a run outside Kubernetes.
    The OIDC configuration values are synthetic placeholders that the test
@@ -66,19 +89,24 @@ brings up, in order:
 
 - The Playwright suite never touches an application database: its only
   database is the throwaway container the E2E run itself created, and the
-  supervisor removes that container with the run. This is separate from the
-  destructive worker integration phase documented in
-  [`../integration/README.md`](../integration/README.md), which is authorized
-  only against the positively verified non-production application database
-  under exclusive maintenance and complete reconstruction. The Playwright
-  suite's own data is synthetic (generated `e2e-*` strings; seeded response
-  patterns and completed past turns).
-- No live model calls and no production access; the only provider is the
-  local fake. Unimplemented capabilities (image generation, uploads, voice,
+  supervisor removes that container with the run. Its chat identity, timezone,
+  response patterns, and conversation rows are disposable synthetic fixtures;
+  they are not the maintained non-production personality or configuration.
+  Database-backed integration tools are separately restricted to verified
+  disposable targets; no destructive suite is authorized against an
+  application database. The Playwright suite's own scenario data is synthetic
+  (generated `e2e-*` strings, fixture response patterns, and completed past
+  turns).
+- The local fake remains the only chat/decision provider, and no production
+  access occurs. The configured embedding service is real and may run inference
+  on synthetic E2E data; it is an external dependency and is never managed by
+  the stack. Unimplemented capabilities (image generation, uploads, voice,
   real Keycloak MFA) are not claimed or exercised anywhere.
-- Ports default to `4620`–`4624` on `127.0.0.1` and are overridable via
-  `E2E_*` variables (see `helpers/config.mjs`). The supervisor refuses to
-  start when a configured port is already taken — it never hijacks one.
+- Application/database ports default to `4620`–`4624` on `127.0.0.1` and are
+  overridable via `E2E_*` variables (see `helpers/config.mjs`). The embedding
+  service uses its configured base URL and has no local test listener. The
+  supervisor refuses to start when a configured port is already taken — it
+  never hijacks one.
 - Secrets (worker token, session secrets, database password) are generated
   per run, kept in the supervisor's process environment only, and never
   logged, written to run records, or committed.
@@ -87,7 +115,7 @@ brings up, in order:
 
 Every run records what it created — its own supervisor PID with the `/proc`
 start time, each child PID with its start time, and the container name — in
-`.runs/<run-id>/state.json` (gitignored):
+`$E2E_RUNS_DIR/<run-id>/state.json` (gitignored):
 
 - On normal exit, failure, `SIGINT`, or `SIGTERM` (including Playwright's own
   teardown and a parent-death watch for a hard-killed runner) the supervisor
@@ -168,90 +196,87 @@ on the turn's own recorded request rather than on request counts:
    `/api` surface never intercepted (subresource fetches and top-level
    navigations alike), and HTTP error responses preserved. No messages are
    sent; no provider traffic occurs.
+Prompt-module applicability include/skip and isolated function behavior are
+covered in hermetic worker unit tests with injected decisions. The disposable
+browser suite does not enable or rewrite prompt-module definitions; behavior of
+the maintained provisioned modules is exercised only through deployed normal
+usage with the existing configuration intact.
 
-## Deployed non-production smoke (explicitly acknowledged; real billable provider)
+## Guarded deployed non-production smoke
 
-`deployed-dev-smoke.mjs` is deliberately separate from everything above: the
-Playwright suite runs against a disposable local stack and a fake provider,
-while this script drives the **actual running non-production deployment**
-through its loopback test-entry gate (`kubectl port-forward` to the pod-local
-gate listener — the gate is never exposed through a Service) and makes **one
-synthetic user message's worth of real, billable OpenRouter calls**.
+`deployed-dev-smoke.mjs` is deliberately separate from the local Playwright
+suite, which uses a disposable stack and fake chat/decision providers. The
+smoke drives the **actual running non-production deployment** through its
+loopback test-entry gate (`kubectl port-forward` to the pod-local gate listener
+— the gate is never exposed through a Service), submits a synthetic message,
+and may invoke configured external providers that incur charges.
 
-- It refuses to run without BOTH `E2E_DEPLOYED_SMOKE_ALLOWED=1` (acknowledges
-  the billable provider call and the non-production database write) and
-  `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` (the operator's explicit
-  acknowledgement that the dev stack is exclusively theirs for this run):
-  running it is always an explicitly acknowledged act. The owner expects
-  this smoke's billable real-provider calls whenever a full E2E run is
-  requested, and an explicitly requested standalone run of this smoke is
-  equally in scope — they validate the live provider configuration before
-  production — so no separate per-run approval is required merely because
-  the calls are billable, and no per-run re-approval is needed where the
-  owner's standing authorization applies (recorded 2026-11-01 in
-  [`../../.opencode/skills/ship-it/SKILL.md`](../../.opencode/skills/ship-it/SKILL.md),
-  covering this smoke's billable non-production provider calls and its
-  non-production database write and resting on the owner's affirmation that
-  the non-production environment and the accounts associated with this
-  project belong to the owner and are not shared). Both variables remain
-  required in every context, and nothing in the script's guards changes
-  with context.
-- Exclusivity is an operator assertion, NOT a system enforcement. The
-  system cannot prevent another user's message from being ingested before or
-  during the run, and the worker's chat request includes the thread's
-  visible history — **unrelated conversation can enter the provider
-  context**, and provider call costs and any replay behavior are NOT
-  hard-capped by the script (the one-call expectation is derived from
-  deployed configuration: with zero enabled patterns the decision call is
-  skipped, so one message means one chat call). Overlap is detected
-  conservatively: a pre-send state check aborts before anything is sent if
-  the thread changed since preflight, and post-send accounting flags any
-  unexpected message growth.
-- Read-only preflight before anything is sent, any doubt stops the run:
-  deployed image identity, the gate's `companion-np` non-production
-  attestation shape, gate enablement, a free local forward port, the
-  database's cleanup linkage (unique `client_key` index, one reply per turn),
-  thread quiescence (no queued user message, no in-flight turn), and zero
-  leftover `e2e-deployed-smoke-` rows.
-- Attribution and cleanup are exact and race-safe: the synthetic message's
-  unique marker content identifies the row (the web BFF assigns its own
-  opaque client_key, so attribution is by exact content equality). A still-
-  queued message is removed by a single atomic guarded delete
-  (`… AND turn_id IS NULL`) that can never delete a row the worker has
-  claimed or is claiming — if it affects no row the run re-probes and
-  decides again. A settled exclusive turn (reply, message, turn) is removed
-  in one transaction that locks the turn row `FOR UPDATE` and re-verifies
-  composition and status inside the transaction (a mismatch rolls back and
-  retains). A turn shared with unrelated traffic leaves everything but this
-  run's own message row (turn-scoped, id- and content-guarded), reported as
-  a residual. Any uncertain state — unreadable turn row, in-flight turn past
-  the bounded wait, shutdown during a wait, failed transaction verification —
-  RETAINS everything and reports. There is no broad database reset anywhere.
+- Run the smoke only within an explicitly requested and authorized delivery
+  workflow or on a standalone explicit request. It refuses to run without BOTH
+  `E2E_DEPLOYED_SMOKE_ALLOWED=1` (acknowledges the external provider use and
+  non-production write) and `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` (the
+  operator's assertion of exclusive access for that run). Both variables are
+  required in every context; they are safeguards, not a substitute for
+  authorization.
+- Exclusivity is an operator assertion, not a system enforcement. The script
+  performs a pre-send state check and post-send overlap accounting, but cannot
+  guarantee that no concurrent access occurs. External provider charges and
+  replay behavior depend on deployed configuration and are not hard-capped by
+  the script.
+- Read-only preflight before anything is sent verifies the deployed image,
+  the gate's non-production attestation/enablement, a free local forward port,
+  scenario linkage, provisioned-configuration fingerprint, thread quiescence,
+  and no unsettled prior smoke marker. Completed intentionally retained runs
+  are allowed; each new exact marker is checked before send. Memory ingest/recall and an embedding
+  endpoint must be configured with bounded convergence. Enabled relationship
+  questions, cursor initialization/catch-up, and runnable consolidation or
+  promotion are normal behavior, not readiness failures.
+- The synthetic marker is the user message content (the web BFF assigns its
+  own opaque `client_key`). The smoke verifies the linked completed turn,
+  persisted reply, refresh behavior, turn trace and provider request
+  boundaries, memory extraction/cache, semantic-shadow comparison metadata,
+  and chat-context chunk labels. Semantic-shadow query/candidate content is
+  never emitted or injected into the response context. The smoke does not
+  delete the conversation, traces, learned memory, relationship answers,
+  cursor/counters, or normal shared derived-state changes: this run is
+  intentional non-production history.
+- Configuration fingerprints are checked before send, after the reply, and
+  after background convergence. They cover provisioned identity, prompts,
+  modules, settings, and environment values without outputting their content;
+  learned conversation and derived state are intentionally outside that
+  invariant. Relationship-answer rows have no turn-level provenance in this
+  schema, so their aggregate count/update window is reported without claiming
+  exact row-to-turn attribution.
+- Thread quiescence and pre-send checks detect observed overlap but cannot
+  guarantee exclusivity. Unexpected overlap, failed turns, missing association,
+  failed semantic-shadow comparisons, configuration drift, or non-converged
+  background work remain failures with all generated data retained. Bounded
+  convergence waits stop after the configured timeout; they do not block
+  forever. Provider costs/replay are not hard-capped by the script.
 - Evidence is bounded and content-free: ids, seqs, counts, statuses, attempt
-  counts, timings, and a marker fingerprint — never message content (ours
-  or anyone else's), never the marker itself, never secrets (the database
-  credentials stay inside the worker pod's environment; cleanup runs there
-  via `kubectl exec` with parameterized queries only). All errors are
-  sanitized (step label + error kind + first line only, secrets redacted):
-  Playwright timeout errors would otherwise embed matched text and page
-  snapshots, so content-based locators are never used on the deployed UI —
-  DOM checks are structural (`[data-last-bubble]`) with Node-side
-  comparisons.
-- Signals: SIGINT/SIGTERM abort the journey gracefully and the awaited
-  cleanup still runs before the process exits non-zero; a second signal
-  exits immediately. SIGKILL cannot be handled — the ownership marker
-  persisted before the send (`.runs/deployed-smoke-last-marker.txt`) is the
-  recovery trail, and a failed/retained cleanup also writes an ownership
-  record (`.runs/deployed-smoke-ownership-<fingerprint>.json`).
-- Recovery is idempotent and verified, with no browser, no provider calls,
-  and no port-forward: an already-cleaned marker verifies as
-  nothing-to-clean. Cleanup and post-state verification run even when the
-  browser journey fails.
+  counts, timings, outcomes, and a marker fingerprint — never message or
+  relationship-answer content, the marker itself, or secrets (database
+  credentials stay inside the worker pod's environment). All errors are
+  sanitized (step label + error kind + first line only, secrets redacted).
+  The deployed UI is checked structurally (`[data-last-bubble]`) with
+  Node-side comparisons so matched text and page snapshots never enter errors.
+- SIGINT/SIGTERM abort the journey gracefully and retained-state verification
+  runs before the process exits non-zero; a second signal exits immediately.
+  SIGKILL cannot be handled — the ownership marker persisted before send
+  (`$E2E_RUNS_DIR/deployed-smoke-last-marker.txt`) is the recovery trail.
+- Legacy `--recover` is explicit-only for an interrupted or selected
+  historical marker. It may use the old narrow cleanup flow, but refuses a
+  record tagged `intentional-retention`; the ordinary smoke never invokes
+  recovery or any delete action. The local ownership
+  record and marker live under the task's unique `E2E_RUNS_DIR`; clean that
+  local task directory after retaining any needed evidence.
+
 
 Run (both variables required in every context — see the authorization note
 above):
 
 ```sh
+E2E_RUNS_DIR="$(mktemp -d)" \
 E2E_DEPLOYED_SMOKE_ALLOWED=1 E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1 \
   pnpm --filter @companion/e2e test:deployed-smoke
 ```
@@ -259,9 +284,11 @@ E2E_DEPLOYED_SMOKE_ALLOWED=1 E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1 \
 Recover an interrupted run's synthetic data (idempotent):
 
 ```sh
-E2E_DEPLOYED_SMOKE_ALLOWED=1 pnpm --filter @companion/e2e test:deployed-smoke -- --recover
+E2E_RUNS_DIR="<the-original-task-runs-directory>" E2E_DEPLOYED_SMOKE_ALLOWED=1 \
+  pnpm --filter @companion/e2e test:deployed-smoke -- --recover
 # or with an explicit marker (or a path to a marker/ownership file):
-E2E_DEPLOYED_SMOKE_ALLOWED=1 pnpm --filter @companion/e2e test:deployed-smoke -- --recover <marker>
+E2E_RUNS_DIR="<the-original-task-runs-directory>" E2E_DEPLOYED_SMOKE_ALLOWED=1 \
+  pnpm --filter @companion/e2e test:deployed-smoke -- --recover <marker>
 ```
 
 Regression tests for this smoke's core (decision state machine, output
@@ -274,18 +301,16 @@ pnpm --filter @companion/e2e test:smoke
 
 ## Limits and open questions
 
-- The suite exercises locally built source (the current working tree's
-  production build), not deployed immutable artifacts; binding results to an
-  exact deployed candidate remains an open deployment question.
-- End-to-end tests against a real deployed non-production candidate (through
-  `kubectl port-forward` to the loopback gate) are not automated here; the
-  same suite structure is intended to be reusable there.
+- The local suite exercises the committed candidate's locally built source,
+  not deployed immutable artifacts, and its fixture identity/settings are not
+  evidence about the maintained non-production personality. Deployed gate and
+  smoke checks separately verify the exact deployed candidate through normal
+  usage with the existing provisioned configuration.
 - Failed turns are terminal in this slice; retry policy, provider
   fallback behavior, and session-expiry journeys are not covered.
 - `stack-ops.test.mjs` drives real stacks (throwaway container, worker, web
   build) and is intentionally not part of the hermetic unit suite; like the
   Playwright suite it is local-only and never touches a deployed database.
-- The deployed-dev smoke's cleanup deletes its own rows, which leaves
-  permanent `seq` gaps in the dev thread; the client's gap handling treats
-  those like burned seqs (bounded probing, never a missed message) by
-  design, and dev conversations are disposable.
+- The deployed smoke deliberately adds synthetic conversation history and
+  retains its resulting conversation and normal learned state. No automatic
+  cleanup or broad database reset is part of the routine gate.

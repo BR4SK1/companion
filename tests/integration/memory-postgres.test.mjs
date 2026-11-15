@@ -27,11 +27,22 @@ import {
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
+import {
+  EMBEDDING_CODE_REVISION,
+  EMBEDDING_DIMENSIONS,
+  EMBEDDING_INPUT_VERSION,
+  EMBEDDING_MODEL,
+  EMBEDDING_MODEL_REVISION,
+  embeddingContentHash,
+  renderEmbeddingInput,
+  vectorLiteral,
+} from "../../apps/worker/src/memory/embeddings.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { loadMemoryConfig } from "../../apps/worker/src/memory/config.ts";
 import { loadMemoryConfiguration } from "../../apps/worker/src/memory/subjects.ts";
 import { ingestTurns } from "../../apps/worker/src/memory/ingest.ts";
+import { selectTurnsAfterWatermark } from "../../apps/worker/src/memory/source.ts";
 import { runScheduledConsolidation } from "../../apps/worker/src/memory/consolidation.ts";
 import {
   buildPromotionPlan,
@@ -85,7 +96,9 @@ const MEMORY_TABLES = [
   "memory_promotion", "memory_promotion_item", "memory_temporal_summary",
   "memory_temporal_summary_message", "memory_profile_summary",
   "memory_observation_profile", "memory_observation_profile_claim",
-  "memory_ingest_state", "memory_operation",
+  "memory_ingest_state", "memory_operation", "memory_operation_turn",
+  "memory_semantic_shadow_candidate", "memory_semantic_shadow_attempt",
+  "memory_semantic_embedding",
 ];
 
 const SUBJECTS_SQL = `
@@ -275,7 +288,11 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
   it("applies the memory migration idempotently with the domain tables present", async () => {
     const second = await runMigrations(pool, memoryMigrations);
     assert.deepEqual(second.applied, []);
-    assert.deepEqual(second.alreadyApplied, ["0003_memory_work"]);
+    assert.deepEqual(second.alreadyApplied, [
+      "0003_memory_work",
+      "0004_memory_semantic_shadow",
+      "0021_memory_operation_turn_attribution",
+    ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
        WHERE table_schema = 'public' AND table_name LIKE 'memory_%'
@@ -285,6 +302,90 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     for (const table of MEMORY_TABLES) {
       assert.ok(names.includes(table), `missing table ${table}`);
     }
+  });
+
+  it("keeps article operation kinds valid in the full memory/article migration composition", async () => {
+    for (const kind of ["article_ingestion", "article_memory_share"]) {
+      const id = await recordMemoryOperation(pool, {
+        kind,
+        outcome: "ok",
+        startedAt: new Date(),
+        finishedAt: new Date(),
+      });
+      assert.match(id ?? "", /^[0-9a-f-]{36}$/i);
+    }
+    const rows = await pool.query(
+      `SELECT kind FROM memory_operation WHERE kind IN ('article_ingestion', 'article_memory_share') ORDER BY kind`,
+    );
+    assert.deepEqual(rows.rows.map((row) => row.kind), ["article_ingestion", "article_memory_share"]);
+  });
+
+  it("attributes batch-level memory operations to every selected source turn", async () => {
+    const turnIds = [
+      "10000000-0000-4000-8000-000000000021",
+      "10000000-0000-4000-8000-000000000022",
+    ];
+    await pool.query(
+      `INSERT INTO conversation_turn (id, status, created_at, completed_at)
+       SELECT turn_id, 'completed', now(), now()
+       FROM unnest($1::uuid[]) AS selected(turn_id)`,
+      [turnIds],
+    );
+    const operationId = await recordMemoryOperation(pool, {
+      kind: "fact_extraction",
+      outcome: "ok",
+      startedAt: new Date(),
+      finishedAt: new Date(),
+      sourceTurnIds: turnIds,
+    });
+    assert.match(operationId ?? "", /^[0-9a-f-]{36}$/i);
+    const result = await pool.query(
+      `SELECT operation.turn_id, array_agg(source.turn_id ORDER BY source.turn_id) AS source_turn_ids
+       FROM memory_operation operation
+       JOIN memory_operation_turn source ON source.operation_id = operation.id
+       WHERE operation.id = $1
+       GROUP BY operation.id`,
+      [operationId],
+    );
+    assert.equal(result.rows[0].turn_id, null, "a batch operation is not falsely assigned to one turn");
+    assert.deepEqual(result.rows[0].source_turn_ids.sort(), turnIds.sort());
+  });
+
+  it("stores and compares typed 768-dimensional pgvector embeddings", async () => {
+    const turnId = "10000000-0000-4000-8000-000000000001";
+    const factKey = "semantic-pgvector-fixture";
+    await pool.query(
+      `INSERT INTO conversation_turn (id, status, created_at, completed_at)
+       VALUES ($1, 'completed', now(), now())`,
+      [turnId],
+    );
+    const fact = await pool.query(
+      `INSERT INTO memory_fact
+         (fact_key, turn_id, subject_id, kind, claim, topics, observed_at, explicitness,
+          evidence_basis, extraction_version, ingest_version)
+       VALUES ($1, $2, 'user', 'preference', 'synthetic vector fixture', '{}', now(),
+               'explicit', 'direct_statement', 'test', 'test')
+       RETURNING id, updated_at`,
+      [factKey, turnId],
+    );
+    const text = renderEmbeddingInput({ claim: "synthetic vector fixture" });
+    const vector = [1, ...Array(EMBEDDING_DIMENSIONS - 1).fill(0)];
+    await pool.query(
+      `INSERT INTO memory_semantic_embedding
+         (fact_id, source_content_hash, source_updated_at, input_version, model, model_revision,
+          model_code_revision, embedding)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector(768))`,
+      [fact.rows[0].id, embeddingContentHash(text), fact.rows[0].updated_at, EMBEDDING_INPUT_VERSION,
+        EMBEDDING_MODEL, EMBEDDING_MODEL_REVISION, EMBEDDING_CODE_REVISION, vectorLiteral(vector)],
+    );
+    const compared = await pool.query(
+      `SELECT (1 - (embedding <=> $1::vector(768)))::real AS similarity,
+              source_updated_at = $2 AS source_timestamp_matches
+       FROM memory_semantic_embedding WHERE fact_id = $3`,
+      [vectorLiteral(vector), fact.rows[0].updated_at, fact.rows[0].id],
+    );
+    assert.equal(compared.rows[0].similarity, 1);
+    assert.equal(compared.rows[0].source_timestamp_matches, true);
   });
 
   it("loads configuration fail-closed", async () => {
@@ -380,6 +481,100 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     );
     assert.equal(rerun.selectedTurns, 0);
     assert.equal(rerun.factsInserted, 0);
+    assert.equal(callLlm.calls.extraction, 1);
+  });
+
+  it("repairs a legacy millisecond-truncated cursor forward without moving its turn", async () => {
+    await enableIngest(pool);
+    const turnId = await seedTurn(store, "A synthetic retained cursor turn");
+    await pool.query(
+      `UPDATE conversation_message
+       SET created_at = '2026-11-01T00:00:00.000100Z'::timestamptz
+       WHERE turn_id = $1::uuid`,
+      [turnId],
+    );
+    await pool.query(
+      `UPDATE memory_ingest_state
+       SET watermark_turn_id = $1::uuid,
+           watermark_end_at = '2026-11-01T00:00:00.000000Z'::timestamptz
+       WHERE id = true`,
+      [turnId],
+    );
+
+    const callLlm = makeFakeLlm();
+    const summary = await ingestTurns(await ingestDeps(pool, callLlm), "reconciliation");
+    assert.equal(summary.selectedTurns, 0);
+    assert.equal(callLlm.calls.extraction, 0);
+    const cursor = await pool.query(
+      `SELECT state.watermark_turn_id = $1::uuid AS turn_matches,
+              state.watermark_end_at = (
+                SELECT max(message.created_at)
+                FROM conversation_message message
+                WHERE message.turn_id = $1::uuid
+              ) AS timestamp_matches
+       FROM memory_ingest_state state WHERE state.id = true`,
+      [turnId],
+    );
+    assert.equal(cursor.rows[0].turn_matches, true);
+    assert.equal(cursor.rows[0].timestamp_matches, true);
+  });
+
+  it("keeps the ingest cursor exact across PostgreSQL microseconds and same-millisecond turn ordering", async () => {
+    await enableIngest(pool);
+    const firstTurnId = await seedTurn(store, "A synthetic earlier source turn");
+    const secondTurnId = await seedTurn(store, "A synthetic later source turn");
+    const watermarkTurnId = [firstTurnId, secondTurnId].sort().at(-1);
+    const candidateTurnId = [firstTurnId, secondTurnId].find((id) => id !== watermarkTurnId);
+    assert.ok(watermarkTurnId);
+    assert.ok(candidateTurnId);
+
+    // Deliberately give the later source turn the lower UUID. Both precise
+    // timestamps truncate to the same JavaScript millisecond, so application-
+    // side Date comparison would incorrectly reject this turn by UUID order.
+    await pool.query(
+      `UPDATE conversation_message
+       SET created_at = CASE
+         WHEN turn_id = $1::uuid THEN '2026-11-01T00:00:00.000100Z'::timestamptz
+         WHEN turn_id = $2::uuid THEN '2026-11-01T00:00:00.000200Z'::timestamptz
+       END
+       WHERE turn_id = ANY($3::uuid[])`,
+      [watermarkTurnId, candidateTurnId, [firstTurnId, secondTurnId]],
+    );
+    await pool.query(
+      `UPDATE memory_ingest_state
+       SET watermark_turn_id = $1::uuid,
+           watermark_end_at = '2026-11-01T00:00:00.000100Z'::timestamptz
+       WHERE id = true`,
+      [watermarkTurnId],
+    );
+
+    const selected = await selectTurnsAfterWatermark(pool, {
+      watermark: { turnId: watermarkTurnId, endAt: new Date("2026-11-01T00:00:00.000Z") },
+      maxTurns: 10,
+      settleMs: 0,
+      now: new Date("2026-11-02T00:00:00.000Z"),
+    });
+    assert.deepEqual(selected.map((turn) => turn.turnId), [candidateTurnId]);
+
+    const callLlm = makeFakeLlm();
+    const summary = await ingestTurns(await ingestDeps(pool, callLlm), "reconciliation");
+    assert.deepEqual(summary.selectedTurnIds, [candidateTurnId]);
+    assert.equal(summary.factsInserted, 1);
+    const cursor = await pool.query(
+      `SELECT state.watermark_turn_id = $1::uuid AS turn_matches,
+              state.watermark_end_at = (
+                SELECT max(message.created_at)
+                FROM conversation_message message
+                WHERE message.turn_id = $1::uuid
+              ) AS timestamp_matches
+       FROM memory_ingest_state state WHERE state.id = true`,
+      [candidateTurnId],
+    );
+    assert.equal(cursor.rows[0].turn_matches, true);
+    assert.equal(cursor.rows[0].timestamp_matches, true);
+
+    const rerun = await ingestTurns(await ingestDeps(pool, callLlm), "reconciliation");
+    assert.equal(rerun.selectedTurns, 0);
     assert.equal(callLlm.calls.extraction, 1);
   });
 
@@ -856,6 +1051,15 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
        GROUP BY t.id ORDER BY end_at DESC LIMIT 1`,
     );
     assert.equal(state.rows[0].watermark_turn_id, newestTurn.rows[0].id);
+    const initializedCursor = await pool.query(
+      `SELECT state.watermark_end_at = (
+                SELECT max(message.created_at)
+                FROM conversation_message message
+                WHERE message.turn_id = state.watermark_turn_id
+              ) AS timestamp_matches
+       FROM memory_ingest_state state WHERE state.id = true`,
+    );
+    assert.equal(initializedCursor.rows[0].timestamp_matches, true);
     const facts = await pool.query(`SELECT count(*)::int AS n FROM memory_fact`);
     assert.equal(facts.rows[0].n, 0);
 

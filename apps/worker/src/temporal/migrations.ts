@@ -102,7 +102,15 @@ ALTER TABLE trace_attempt ADD CONSTRAINT trace_attempt_temporal_local_fields_sha
 );
 `;
 
+const COMPANION_TIME_DAY_START_HOUR = `
+ALTER TABLE companion_time_settings
+  ADD COLUMN day_start_hour smallint,
+  ADD CONSTRAINT companion_time_settings_day_start_hour_range
+    CHECK (day_start_hour IS NULL OR day_start_hour BETWEEN 0 AND 23);
+`;
+
 export const temporalMigrations: readonly Migration[] = [
   { id: "0016_authoritative_temporal_context", sql: AUTHORITATIVE_TIME_SETTINGS },
   { id: "0017_trace_attempt_temporal_context", sql: TRACE_ATTEMPT_TEMPORAL_CONTEXT },
+  { id: "0020_companion_time_day_start_hour", sql: COMPANION_TIME_DAY_START_HOUR },
 ];

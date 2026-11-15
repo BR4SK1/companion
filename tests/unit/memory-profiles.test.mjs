@@ -25,6 +25,7 @@ describe("memory configuration", () => {
     assert.equal(config.model, "z-ai/glm-5.3-flash");
     assert.equal(config.recallLimit, 8);
     assert.equal(config.recallMaxChars, 12_000);
+    assert.equal(config.embeddingBaseUrl, "http://127.0.0.1:5113");
   });
 
   it("preserves the source flag polarity when set", () => {

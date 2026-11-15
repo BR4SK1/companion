@@ -9,16 +9,15 @@
  *    appear in sanitized errors or evidence, including Playwright-shaped
  *    multi-line timeout errors that would otherwise embed matched text and
  *    page snapshots.
- * 2. Cleanup decision state machine: every uncertain state RETAINS (unreadable
- *    turn, in-flight past the wait, shutdown during the wait, guarded delete
- *    that affected no row while still reading unassigned, unrecognized turn
- *    status); only provably-owned rows are ever deleted.
+ * 2. Normal-use verification requires a completed, attributed, converged turn
+ *    and invariant provisioned configuration, and always records zero deletes;
+ *    legacy recovery cleanup remains covered only as explicit tooling.
  * 3. The queued-message delete-vs-claim race, executed against a disposable
  *    local PostgreSQL with the worker's real claim semantics (advisory lock →
  *    pending SELECT … FOR UPDATE → UPDATE … SET turn_id WHERE turn_id IS
  *    NULL) racing the smoke's exact guarded DELETE in both orders.
- * 4. Graceful signals: a stop request aborts journey loops and the awaited
- *    cleanup still runs before the process exits (second signal = hard exit);
+ * 4. Graceful signals: a stop request aborts journey loops and retained-state
+ *    verification still runs before the process exits (second signal = hard exit);
  *    at the process level via a fake `kubectl` shim, with the runner's REAL
  *    pod-side action script executed against the disposable database.
  * 5. Failure retention + idempotent verified recovery (`--recover`): seeded
@@ -41,19 +40,18 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { config } from "./helpers/config.mjs";
-import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
-import { engagementMigrations } from "../../apps/worker/src/engagement/migrations.ts";
+import { workerMigrations } from "../../apps/worker/src/migrations.ts";
 import { CLAIM_ADVISORY_LOCK_KEY } from "../../apps/worker/src/conversation/store.ts";
 import {
   POD_ACTION_SCRIPT_BODY,
   SMOKE_CLAIM_ADVISORY_LOCK_KEY,
   buildMarker,
-  buildOwnMessageDelete,
   buildPodActionScript,
   buildQueuedAtomicDelete,
   createShutdownController,
   fingerprint,
   planCleanupDecision,
+  planRetainedScenarioDecision,
   redactText,
   sanitizeError,
 } from "./deployed-smoke-lib.mjs";
@@ -76,9 +74,11 @@ function sleep(ms) {
 // ---------------------------------------------------------------------------
 
 /** The deployed schema, applied from the real migration set (no drift). */
-async function applyMigrations(client, migrationIds = conversationMigrations.map((migration) => migration.id)) {
-  const all = [...conversationMigrations, ...engagementMigrations];
-  const selected = all.filter((migration) => migrationIds.includes(migration.id));
+async function applyMigrations(client, migrationIds = workerMigrations.map((migration) => migration.id)) {
+  const selected = workerMigrations.filter((migration) => migrationIds.includes(migration.id));
+  if (selected.some((migration) => migration.id === "0004_memory_semantic_shadow")) {
+    await client.query("CREATE EXTENSION IF NOT EXISTS vector");
+  }
   for (const migration of selected) {
     await client.query(migration.sql);
   }
@@ -103,6 +103,19 @@ function procStarttime(pid) {
 const OWNER_LABEL = "companion.smoketest.owner";
 const OWNER_TOKEN = `${String(process.pid)}:${procStarttime(process.pid)}`;
 const CONTAINER_PREFIX = "companion-smoketest-pg-";
+const TEST_WORKER_ENV = Object.freeze({
+  WORKER_CHAT_MODEL: "test/chat-model",
+  WORKER_DECISION_MODEL: "test/decision-model",
+  WORKER_MEMORY_ENABLED: "true",
+  WORKER_MEMORY_INGEST_ENABLED: "true",
+  WORKER_MEMORY_AUTOPROMOTE_ENABLED: "false",
+  WORKER_MEMORY_RECALL_ENABLED: "true",
+  WORKER_MEMORY_EMBEDDING_BASE_URL: "http://embedding.test/v1",
+  WORKER_MEMORY_INGEST_SETTLE_MS: "1000",
+  WORKER_MEMORY_CHAT_TIMEOUT_MS: "1000",
+  WORKER_MEMORY_CONSOLIDATION_NEW_FACTS_THRESHOLD: "40",
+  WORKER_MEMORY_CONSOLIDATION_INTERVAL_MS: "86400000",
+});
 
 /**
  * Reconcile stale left-overs from crashed or killed earlier test processes
@@ -226,6 +239,52 @@ async function withDisposablePostgres(t, use, { migrationIds } = {}) {
          ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content`,
       );
     }
+    const memoryStateTable = await client.query(
+      "SELECT to_regclass('public.memory_ingest_state') IS NOT NULL AS present",
+    );
+    if (memoryStateTable.rows[0].present) {
+      const temporalFixture = await client.query(
+        `WITH zones(zone) AS (
+           SELECT unnest(ARRAY[
+             'UTC', 'Asia/Kolkata', 'Asia/Kathmandu', 'America/St_Johns',
+             'Pacific/Marquesas', 'Australia/Eucla', 'Pacific/Chatham'
+           ]::text[])
+         ), local AS (
+           SELECT zone, (now() AT TIME ZONE zone)::date AS local_date,
+                  ((extract(hour FROM now() AT TIME ZONE zone)::integer + 3) % 24) AS start_hour
+           FROM zones
+         ), days AS (
+           SELECT local.*, day::date AS boundary_date
+           FROM local CROSS JOIN LATERAL generate_series(
+             local_date::timestamp, (local_date + 2)::timestamp, interval '1 day'
+           ) AS day
+         ), boundaries AS (
+           SELECT days.zone, days.start_hour,
+                  make_timestamptz(extract(year FROM boundary_date)::int,
+                    extract(month FROM boundary_date)::int,
+                    extract(day FROM boundary_date)::int, hour, 0, 0, zone) AS boundary_at
+           FROM days CROSS JOIN LATERAL unnest(ARRAY[start_hour, 12, 17]::integer[]) AS hours(hour)
+         )
+         SELECT zone, start_hour
+         FROM boundaries
+         WHERE boundary_at > now()
+         GROUP BY zone, start_hour
+         HAVING min(boundary_at) > now() + interval '20 minutes'
+         ORDER BY zone LIMIT 1`,
+      );
+      assert.ok(temporalFixture.rows[0], "a safe synthetic temporal test window must be available");
+      await client.query(
+        `UPDATE companion_time_settings
+         SET timezone = $1, day_start_hour = $2
+         WHERE id = true`,
+        [temporalFixture.rows[0].zone, temporalFixture.rows[0].start_hour],
+      );
+      await client.query(
+        `INSERT INTO memory_ingest_state
+           (id, initialized_at, last_ingest_at, last_consolidated_at)
+         VALUES (true, now(), now(), now())`,
+      );
+    }
     await use({ client, databaseUrl });
   } finally {
     await client.end().catch(() => {});
@@ -302,6 +361,21 @@ async function seedCompletedTurn(client, marker, replyNote = "synthetic") {
     content: `fake reply for ${marker.slice(-6)} (${replyNote})`,
     turnId,
   });
+  const memoryState = await client.query(
+    "SELECT to_regclass('public.memory_ingest_state') IS NOT NULL AS present",
+  );
+  if (memoryState.rows[0].present) {
+    await client.query(
+      `UPDATE memory_ingest_state
+       SET initialized_at = coalesce(initialized_at, now()),
+           watermark_turn_id = $1,
+           watermark_end_at = (SELECT max(created_at) FROM conversation_message WHERE turn_id = $1),
+           last_ingest_at = now(),
+           last_consolidated_at = coalesce(last_consolidated_at, now())
+       WHERE id = true`,
+      [turnId],
+    );
+  }
   return { turnId, userId, replyId };
 }
 
@@ -351,6 +425,154 @@ async function seedTraceChainForTurn(client, { turnId, userId, replyId, contextS
     [chatId],
   );
   return { attemptId, decisionId, chatId };
+}
+
+async function seedMemoryConvergenceState(client, { turnId }) {
+  const cursor = await client.query(
+    "SELECT max(created_at) AS end_at FROM conversation_message WHERE turn_id = $1",
+    [turnId],
+  );
+  await client.query(
+    `UPDATE memory_ingest_state
+     SET initialized_at = coalesce(initialized_at, now()),
+         watermark_turn_id = $1, watermark_end_at = $2, last_ingest_at = now()
+     WHERE id = true`,
+    [turnId, cursor.rows[0].end_at],
+  );
+  const extraction = await client.query(
+    `INSERT INTO memory_operation (kind, outcome, started_at, finished_at, llm_calls)
+     VALUES ('fact_extraction', 'ok', now(), now(), 0) RETURNING id`,
+  );
+  await client.query(
+    "INSERT INTO memory_operation_turn (operation_id, turn_id) VALUES ($1, $2)",
+    [extraction.rows[0].id, turnId],
+  );
+  const recall = await client.query(
+    `INSERT INTO memory_operation (kind, turn_id, outcome, started_at, finished_at, llm_calls)
+     VALUES ('recall', $1, 'ok', now(), now(), 0) RETURNING id`,
+    [turnId],
+  );
+  await client.query(
+    `INSERT INTO memory_semantic_shadow_attempt
+       (turn_id, turn_attempt, recall_operation_id, source, outcome, skip_reason,
+        retrieval_mode, reference_time, query_fingerprint, input_version,
+        ranking_strategy_version, model, model_revision, model_code_revision,
+        baseline_candidate_count, semantic_only_candidate_count, result_limit,
+        max_chars, started_at, finished_at)
+     VALUES ($1, 1, $2, 'chat', 'skipped', 'non_comparable_baseline',
+        'keyword', now(), $3, 'test-input', 'test-ranking', 'test-model',
+        'test-revision', 'test-code', 0, 0, 1, 500, now(), now())`,
+    [turnId, recall.rows[0].id, "a".repeat(64)],
+  );
+  return { extractionOperationId: extraction.rows[0].id, recallOperationId: recall.rows[0].id };
+}
+
+async function seedMemoryArtifactsForTurn(client, { turnId, userId, trace }) {
+  await client.query(
+    `INSERT INTO memory_subject
+       (id, role, profile_enabled, source_label, profile_evidence_rule, position)
+     VALUES ('user', 'user', false, 'synthetic test subject', 'synthetic test rule', 0)
+     ON CONFLICT (id) DO NOTHING`,
+  );
+  const operation = await client.query(
+    `INSERT INTO memory_operation (kind, outcome, started_at, finished_at, llm_calls)
+     VALUES ('fact_extraction', 'ok', now(), now(), 1) RETURNING id`,
+  );
+  await client.query(
+    "INSERT INTO memory_operation_turn (operation_id, turn_id) VALUES ($1, $2)",
+    [operation.rows[0].id, turnId],
+  );
+  await client.query(
+    `INSERT INTO memory_turn_extraction
+       (turn_id, key_version, cache_key, source_fingerprint, generation_signature,
+        extraction_version, item_count, empty, payload_hash, producer)
+     VALUES ($1, 1, $2, 'synthetic-fingerprint', 'synthetic-generation',
+        'synthetic-extraction', 0, true, 'synthetic-payload-hash', 'test')`,
+    [turnId, `cache-${turnId}`],
+  );
+  const fact = await client.query(
+    `INSERT INTO memory_fact
+       (fact_key, turn_id, subject_id, kind, claim, observed_at, explicitness,
+        evidence_basis, extraction_version, ingest_version)
+     VALUES ($1, $2, 'user', 'fact', 'synthetic test fact', now(), 'supported',
+        'direct_statement', 'synthetic-extraction', 'synthetic-ingest')
+     RETURNING id`,
+    [`fact-${turnId}` , turnId],
+  );
+  await client.query(
+    "INSERT INTO memory_fact_source_message (fact_id, position, message_id) VALUES ($1, 0, $2)",
+    [fact.rows[0].id, userId],
+  );
+  await client.query(
+    `INSERT INTO memory_semantic_embedding
+       (fact_id, source_content_hash, source_updated_at, input_version, model,
+        model_revision, model_code_revision, embedding)
+     VALUES ($1, 'synthetic-hash', now(), 'test-input', 'test-model',
+        'test-revision', 'test-code', $2)`,
+    [fact.rows[0].id, `[${Array(768).fill(0).join(",")}]`],
+  );
+  const recall = await client.query(
+    `INSERT INTO memory_operation (kind, turn_id, outcome, started_at, finished_at, llm_calls)
+     VALUES ('recall', $1, 'ok', now(), now(), 0) RETURNING id`,
+    [turnId],
+  );
+  const shadow = await client.query(
+    `INSERT INTO memory_semantic_shadow_attempt
+       (turn_id, turn_attempt, recall_operation_id, source, outcome, skip_reason,
+        retrieval_mode, reference_time, query_fingerprint, input_version,
+        ranking_strategy_version, model, model_revision, model_code_revision,
+        baseline_candidate_count, semantic_only_candidate_count, result_limit,
+        max_chars, started_at, finished_at)
+     VALUES ($1, 1, $2, 'chat', 'skipped', 'non_comparable_baseline',
+        'keyword', now(), $3, 'test-input', 'test-ranking', 'test-model',
+        'test-revision', 'test-code', 1, 0, 1, 500, now(), now())
+     RETURNING id`,
+    [turnId, recall.rows[0].id, "b".repeat(64)],
+  );
+  await client.query(
+    `INSERT INTO memory_semantic_shadow_candidate
+       (attempt_id, arm, source_kind, source_id, fact_key, candidate_origin,
+        baseline_rank, arm_rank, budget_included, result_rank)
+     VALUES ($1, 'baseline', 'fact', $2, $2, 'keyword', 1, 1, true, 1)`,
+    [shadow.rows[0].id, `fact-${turnId}`],
+  );
+  await client.query(
+    `INSERT INTO memory_temporal_summary
+       (kind, period_key, timezone, start_at, end_at, content, message_count,
+        fingerprint, model, prompt_version, prompt_content_hash, generated_at, status)
+     VALUES ('day', $1, 'UTC', now() - interval '1 hour', now(),
+        'synthetic summary', 2, $2, 'test-model', 'test-prompt', 'test-hash', now(), 'complete')`,
+    [`synthetic-${turnId}`, `summary-${turnId}`],
+  );
+  const summary = await client.query(
+    "SELECT id FROM memory_temporal_summary WHERE period_key = $1",
+    [`synthetic-${turnId}`],
+  );
+  await client.query(
+    "INSERT INTO memory_temporal_summary_message (summary_id, position, message_id) VALUES ($1, 0, $2)",
+    [summary.rows[0].id, userId],
+  );
+  const moduleId = randomUUID();
+  await client.query(
+    `INSERT INTO trace_attempt_prompt_module
+       (attempt_id, module_id, module_key, position, decision_description,
+        function_hash, fallback_available, decision_state, selected, execution_state)
+     VALUES ($1, $2, 'synthetic_test', 0, 'synthetic module', $3, false,
+        'responded', true, 'succeeded')`,
+    [trace.attemptId, moduleId, "c".repeat(64)],
+  );
+  await client.query(
+    `INSERT INTO trace_attempt_prompt_module_probability
+       (attempt_id, module_id, option_id, value) VALUES ($1, $2, 'yes', 1)`,
+    [trace.attemptId, moduleId],
+  );
+  await client.query(
+    `INSERT INTO trace_attempt_prompt_module_chat_message
+       (attempt_id, module_id, chat_id, message_position)
+     VALUES ($1, $2, $3, 0)`,
+    [trace.attemptId, moduleId, trace.chatId],
+  );
+  return { operationId: operation.rows[0].id, factId: fact.rows[0].id };
 }
 
 /** Counts of trace rows for one turn (used to assert exact preservation). */
@@ -412,9 +634,13 @@ async function makeKubectlShim({ databaseUrl, gatePort }) {
   ));
   // Pod exec: run the REAL generated script (arriving on stdin) from the
   // postgres workspace directory, exactly like the pod's `sh -c` does.
+  const workerEnvironment = Object.entries(TEST_WORKER_ENV)
+    .map(([name, value]) => `export ${name}=${JSON.stringify(value)}`)
+    .join("\n");
   fs.writeFileSync(path.join(dir, "kubectl"), `#!/bin/sh
 if echo "$*" | grep -q "exec -i"; then
   export WORKER_DATABASE_URL="${databaseUrl}"
+  ${workerEnvironment}
   echo "exec" >> "${dir}/actions.log"
   cd "${libDir}" && exec node -
 fi
@@ -508,7 +734,38 @@ test("sanitizeError redacts secrets that appear on the first line and caps lengt
 });
 
 // ---------------------------------------------------------------------------
-// 2. Cleanup decision state machine (retain whenever uncertain)
+// 2. Normal-use retention verification (never deletes)
+// ---------------------------------------------------------------------------
+
+const validRetainedScenario = {
+  message: { id: "m1", turnId: "t1" },
+  turn: { id: "t1", status: "completed" },
+  composition: [{ role: "user", id: "m1" }, { role: "assistant", id: "r1" }],
+  ourUserMessageInTurn: true,
+  backgroundSettled: true,
+  configurationInvariant: true,
+};
+
+test("retained-scenario decision accepts normal learned-state activity without offering deletion", () => {
+  const decision = planRetainedScenarioDecision(validRetainedScenario);
+  assert.deepEqual(decision, {
+    mode: "retained-intentionally",
+    retained: true,
+    reason: "normal-use scenario and learned effects are preserved",
+  });
+  assert.equal("delete" in decision, false);
+});
+
+test("retained-scenario verification fails closed on missing association, convergence, or configuration", () => {
+  assert.equal(planRetainedScenarioDecision({ ...validRetainedScenario, message: null }).mode, "failed");
+  assert.equal(planRetainedScenarioDecision({ ...validRetainedScenario, ourUserMessageInTurn: false }).mode, "failed");
+  assert.equal(planRetainedScenarioDecision({ ...validRetainedScenario, backgroundSettled: false }).mode, "failed");
+  assert.equal(planRetainedScenarioDecision({ ...validRetainedScenario, configurationInvariant: false }).mode, "failed");
+  assert.equal(planRetainedScenarioDecision({ ...validRetainedScenario, turn: { id: "t1", status: "failed" } }).mode, "failed");
+});
+
+// ---------------------------------------------------------------------------
+// 3. Legacy explicit-recovery decision state machine (retain whenever uncertain)
 // ---------------------------------------------------------------------------
 
 test("planCleanupDecision: nothing persisted -> nothing-to-clean", () => {
@@ -583,7 +840,7 @@ test("planCleanupDecision: settled exclusive turn -> full-turn", () => {
   assert.equal(decision.retain, false);
 });
 
-test("planCleanupDecision: shared turn (second user message) -> only our own row", () => {
+test("planCleanupDecision: shared turn (second user message) -> retain the whole turn", () => {
   const decision = planCleanupDecision({
     message: { id: "m1", turnId: "t1" },
     turn: { status: "completed" },
@@ -594,18 +851,19 @@ test("planCleanupDecision: shared turn (second user message) -> only our own row
     ],
     ourUserMessageInTurn: true,
   });
-  assert.equal(decision.mode, "own-message-only");
-  assert.equal(decision.retain, false);
+  assert.equal(decision.mode, "retain");
+  assert.equal(decision.retain, true);
 });
 
-test("planCleanupDecision: content proof missing -> only our own row", () => {
+test("planCleanupDecision: content proof missing -> retain the whole turn", () => {
   const decision = planCleanupDecision({
     message: { id: "m1", turnId: "t1" },
     turn: { status: "completed" },
     composition: [{ role: "user", id: "m1" }, { role: "assistant", id: "r1" }],
     ourUserMessageInTurn: false,
   });
-  assert.equal(decision.mode, "own-message-only");
+  assert.equal(decision.mode, "retain");
+  assert.equal(decision.retain, true);
 });
 
 test("planCleanupDecision: unrecognized settled status -> RETAIN", () => {
@@ -629,23 +887,18 @@ test("the guarded delete carries the atomic turn_id IS NULL predicate", () => {
   assert.deepEqual(params, ["m1", MARKER]);
 });
 
-test("the own-message delete is turn-scoped", () => {
-  const { sql, params } = buildOwnMessageDelete("m1", MARKER, "t1");
-  assert.match(sql, /turn_id = \$3/);
-  assert.deepEqual(params, ["m1", MARKER, "t1"]);
-});
-
 test("the pod-side script embeds exactly the builder statements (no drift)", () => {
   assert.ok(POD_ACTION_SCRIPT_BODY.includes(buildQueuedAtomicDelete("m1", MARKER).sql));
-  assert.ok(POD_ACTION_SCRIPT_BODY.includes(buildOwnMessageDelete("m1", MARKER, "t1").sql));
 });
 
 test("generated pod scripts parse for every action and leak no marker into SQL", async (t) => {
   const actions = [
+    { action: "configuration-fingerprint" },
+    { action: "marker-check", marker: MARKER },
     { action: "preflight", smokePrefix: "e2e-deployed-smoke-" },
     { action: "probe", marker: MARKER },
+    { action: "retained-state", marker: MARKER, messageId: "m1", turnId: "t1", startedAt: "2026-11-15T12:00:00.000Z" },
     { action: "delete-queued", messageId: "m1", marker: MARKER },
-    { action: "delete-own-message", messageId: "m1", marker: MARKER, turnId: "t1" },
     { action: "delete-full-turn", turnId: "t1", messageId: "m1", marker: MARKER },
     { action: "post-state", smokePrefix: "e2e-deployed-smoke-" },
   ];
@@ -661,6 +914,63 @@ test("generated pod scripts parse for every action and leak no marker into SQL",
     const occurrences = script.split(MARKER).length - 1;
     assert.equal(occurrences, payload.marker === undefined ? 0 : 1, `marker leakage in ${payload.action}`);
   }
+});
+
+test("retained-state pod action reports conversation, trace, memory, and config evidence without changing rows", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    await seedTraceChainForTurn(db, seeded);
+    const beforeMessages = await db.query("SELECT count(*)::int AS n FROM conversation_message");
+    const beforeTurns = await db.query("SELECT count(*)::int AS n FROM conversation_turn");
+    const markerCheck = await runPodScript(databaseUrl, buildPodActionScript({
+      action: "marker-check",
+      marker,
+    }));
+    assert.equal(markerCheck.markerRows, 1);
+    const preflight = await runPodScript(databaseUrl, buildPodActionScript({
+      action: "preflight",
+      smokePrefix: "e2e-deployed-smoke-",
+    }));
+    assert.equal(preflight.leftoverSmokeRows, 1, "completed retained history is recognized but does not block future unique runs");
+    assert.equal(preflight.unsettledSmokeRows, 0);
+    const script = buildPodActionScript({
+      action: "retained-state",
+      marker,
+      messageId: seeded.userId,
+      turnId: seeded.turnId,
+      startedAt: new Date().toISOString(),
+    });
+    const result = await runPodScript(databaseUrl, script);
+    assert.equal(result.message.id, seeded.userId);
+    assert.equal(result.turn.id, seeded.turnId);
+    assert.equal(result.turn.status, "completed");
+    assert.equal(result.ourUserMessageInTurn, true);
+    assert.equal(result.composition.length, 2);
+    assert.equal(result.scenarioMarkerRows, 1);
+    assert.equal(result.scenarioTurnMessages, 2);
+    assert.equal(result.decisionRequests, 1);
+    assert.equal(result.chatRequests, 1);
+    assert.equal(result.providerRequestsObserved, 2);
+    assert.match(result.configurationFingerprint, /^[a-f0-9]{64}$/);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM conversation_message")).rows[0].n, beforeMessages.rows[0].n);
+    assert.equal((await db.query("SELECT count(*)::int AS n FROM conversation_turn")).rows[0].n, beforeTurns.rows[0].n);
+  });
+});
+
+test("configuration fingerprint tracks provisioned identity but excludes learned cursor state", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const configurationFingerprintKey = "e".repeat(64);
+    const fingerprint = async () => (await runPodScript(databaseUrl, buildPodActionScript({
+      action: "configuration-fingerprint",
+      configurationFingerprintKey,
+    }))).configurationFingerprint;
+    const emptyConfiguration = await fingerprint();
+    await db.query("UPDATE memory_ingest_state SET new_facts_since_consolidation = 12 WHERE id = true");
+    assert.equal(await fingerprint(), emptyConfiguration, "cursor/counter activity is learned state, not provisioned configuration");
+    await db.query("UPDATE chat_identity SET content = 'synthetic identity', revision = revision + 1 WHERE id = 'identity'");
+    assert.notEqual(await fingerprint(), emptyConfiguration, "provisioned identity changes the invariant fingerprint");
+  });
 });
 
 test("a hostile marker is safely embedded (injection check) and the script still parses", (t) => {
@@ -701,7 +1011,7 @@ test("shutdown controller: waitOrStop resolves while no stop is requested", asyn
   assert.equal(controller.requested, false);
 });
 
-test("shutdown controller: a loop aborts and the awaited cleanup still runs before exit", async () => {
+test("shutdown controller: a loop aborts and retained-state verification runs before exit", async () => {
   const handlers = {};
   let hardExits = 0;
   const controller = createShutdownController({
@@ -724,12 +1034,12 @@ test("shutdown controller: a loop aborts and the awaited cleanup still runs befo
       throw error;
     }
   })();
-  // The "cleanup" must run before the process would exit.
-  const cleanupState = { ran: false };
+  // Retained-state verification must run before the process would exit.
+  const verificationState = { ran: false };
   const finish = (async () => {
     await journeyLoop;
-    cleanupState.ran = true;
-    return cleanupState;
+    verificationState.ran = true;
+    return verificationState;
   })();
   assert.equal(controller.request("SIGTERM"), "graceful");
   const state = await finish;
@@ -1023,6 +1333,104 @@ test("full-turn deletion transaction: trace rows of the exclusive turn are delet
   });
 });
 
+test("full-turn deletion cleans only owned memory and prompt-module artifacts, preserving the ingest cursor", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    const trace = await seedTraceChainForTurn(db, seeded);
+    const memory = await seedMemoryArtifactsForTurn(db, { ...seeded, trace });
+    await db.query(
+      `UPDATE memory_ingest_state
+       SET initialized_at = now(), watermark_turn_id = $1,
+           watermark_end_at = (SELECT max(created_at) FROM conversation_message WHERE turn_id = $1),
+           new_facts_since_consolidation = 17
+       WHERE id = true`,
+      [seeded.turnId],
+    );
+
+    const result = await runPodScript(databaseUrl, buildPodActionScript({
+      action: "delete-full-turn", turnId: seeded.turnId, messageId: seeded.userId, marker,
+    }));
+    assert.equal(result.deleted, true, `cleanup should succeed: ${JSON.stringify(result)}`);
+    assert.equal(result.memory.refused, false);
+    assert.equal(result.memory.watermarkPreserved, true);
+    assert.equal(result.memory.deletedCounts.extractions, 1);
+    assert.equal(result.memory.deletedCounts.facts, 1);
+    assert.equal(result.memory.deletedCounts.exclusiveOperations, 1);
+    assert.equal(result.memory.deletedCounts.operationLinks, 0, "deleting the exclusive operation cascades its source link");
+    assert.equal(result.trace.deletedCounts.promptModules, 1);
+    assert.equal(result.trace.deletedCounts.promptModuleProbabilities, 1);
+    assert.equal(result.trace.deletedCounts.promptModuleChatMessages, 1);
+
+    const remaining = await db.query(
+      `SELECT
+         (SELECT count(*) FROM memory_fact WHERE id = $1) AS facts,
+         (SELECT count(*) FROM memory_semantic_embedding WHERE fact_id = $1) AS embeddings,
+         (SELECT count(*) FROM memory_semantic_shadow_attempt WHERE turn_id = $2) AS shadows,
+         (SELECT count(*) FROM memory_turn_extraction WHERE turn_id = $2) AS extractions,
+         (SELECT count(*) FROM memory_temporal_summary_message WHERE message_id = $3) AS summary_links,
+         (SELECT count(*) FROM trace_attempt_prompt_module WHERE attempt_id = $4) AS prompt_modules,
+         (SELECT watermark_turn_id FROM memory_ingest_state WHERE id = true) AS watermark_turn_id,
+         (SELECT new_facts_since_consolidation FROM memory_ingest_state WHERE id = true) AS new_facts_since_consolidation`,
+      [memory.factId, seeded.turnId, seeded.userId, trace.attemptId],
+    );
+    assert.equal(Number(remaining.rows[0].facts), 0);
+    assert.equal(Number(remaining.rows[0].embeddings), 0, "fact embeddings cascade with their owned source fact");
+    assert.equal(Number(remaining.rows[0].shadows), 0);
+    assert.equal(Number(remaining.rows[0].extractions), 0);
+    assert.equal(Number(remaining.rows[0].summary_links), 0);
+    assert.equal(Number(remaining.rows[0].prompt_modules), 0);
+    assert.equal(remaining.rows[0].watermark_turn_id, seeded.turnId, "the monotonic cursor must not be rewound");
+    assert.equal(Number(remaining.rows[0].new_facts_since_consolidation), 17, "ingest counters remain normal processing state");
+  }, { migrationIds: FULL_WORKER_SCHEMA_IDS });
+});
+
+test("full-turn deletion refuses mixed batch-operation provenance and rolls back all cleanup", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    const trace = await seedTraceChainForTurn(db, seeded);
+    const memory = await seedMemoryArtifactsForTurn(db, { ...seeded, trace });
+    const other = await seedCompletedTurn(db, buildMarker());
+    await db.query(
+      "INSERT INTO memory_operation_turn (operation_id, turn_id) VALUES ($1, $2)",
+      [memory.operationId, other.turnId],
+    );
+    const directOperation = await db.query(
+      `INSERT INTO memory_operation (kind, turn_id, outcome, started_at, finished_at, llm_calls)
+       VALUES ('recall', $1, 'ok', now(), now(), 0) RETURNING id`,
+      [seeded.turnId],
+    );
+    await db.query(
+      "INSERT INTO memory_operation_turn (operation_id, turn_id) VALUES ($1, $2)",
+      [directOperation.rows[0].id, other.turnId],
+    );
+    const result = await runPodScript(databaseUrl, buildPodActionScript({
+      action: "delete-full-turn", turnId: seeded.turnId, messageId: seeded.userId, marker,
+    }));
+    assert.equal(result.deleted, false);
+    assert.equal(result.reason, "shared-or-mixed-memory-dependency");
+    assert.equal(result.memory.sharedOperationRows, 2, "batch links and turn-owned operations with foreign links are both mixed provenance");
+    assert.equal(result.memory.refused, true);
+    const retained = await db.query(
+      `SELECT
+         (SELECT count(*) FROM conversation_message WHERE turn_id = $1) AS messages,
+         (SELECT count(*) FROM conversation_turn WHERE id = $1) AS turns,
+         (SELECT count(*) FROM trace_attempt WHERE turn_id = $1) AS traces,
+         (SELECT count(*) FROM memory_fact WHERE id = $2) AS facts,
+         (SELECT count(*) FROM memory_operation_turn WHERE operation_id = $3) AS operation_turns,
+         (SELECT count(*) FROM trace_attempt_prompt_module WHERE attempt_id = $4) AS prompt_modules`,
+      [seeded.turnId, memory.factId, memory.operationId, trace.attemptId],
+    );
+    assert.equal(Number(retained.rows[0].messages), 2);
+    assert.equal(Number(retained.rows[0].turns), 1);
+    assert.equal(Number(retained.rows[0].traces), 1, "the earlier trace phase must roll back too");
+    assert.equal(Number(retained.rows[0].facts), 1);
+    assert.equal(Number(retained.rows[0].operation_turns), 2);
+    assert.equal(Number(retained.rows[0].prompt_modules), 1);
+  }, { migrationIds: FULL_WORKER_SCHEMA_IDS });
+});
+
 test("full-turn deletion transaction: unrelated turns' messages and trace rows are preserved", async (t) => {
   await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
     const marker = buildMarker();
@@ -1058,10 +1466,7 @@ test("full-turn deletion transaction: unrelated turns' messages and trace rows a
 // their foreign keys, and without ever touching another row's assessment.
 // ---------------------------------------------------------------------------
 
-const FULL_ENGAGEMENT_SCHEMA_IDS = [
-  ...conversationMigrations.map((migration) => migration.id),
-  ...engagementMigrations.map((migration) => migration.id),
-];
+const FULL_WORKER_SCHEMA_IDS = workerMigrations.map((migration) => migration.id);
 
 test("queued-message cleanup removes the message's own engagement assessment", async (t) => {
   await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
@@ -1084,7 +1489,7 @@ test("queued-message cleanup removes the message's own engagement assessment", a
       [messageId],
     );
     assert.equal(messages.rows[0].n, 0);
-  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+  }, { migrationIds: FULL_WORKER_SCHEMA_IDS });
 });
 
 test("queued-message cleanup never touches a claimed message or its assessment", async (t) => {
@@ -1108,37 +1513,7 @@ test("queued-message cleanup never touches a claimed message or its assessment",
       [messageId],
     );
     assert.equal(assessments.rows[0].n, 1, "a claimed message's assessment must be preserved with it");
-  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
-});
-
-test("own-message cleanup removes that message's own engagement assessment", async (t) => {
-  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
-    const marker = buildMarker();
-    const seeded = await seedCompletedTurn(db, marker);
-    await seedAssessment(db, seeded.userId);
-
-    const payload = {
-      action: "delete-own-message",
-      messageId: seeded.userId,
-      marker,
-      turnId: seeded.turnId,
-    };
-    const result = await runPodScript(databaseUrl, buildPodActionScript(payload));
-    assert.equal(result.ok, true, `the pod action must succeed: ${result.error ?? ""}`);
-    assert.equal(result.rowCount, 1);
-    assert.equal(result.engagementDeleted, true);
-    const assessments = await db.query(
-      "SELECT count(*)::int AS n FROM engagement_message_assessment WHERE message_id = $1",
-      [seeded.userId],
-    );
-    assert.equal(assessments.rows[0].n, 0);
-    // The turn and its assistant reply (which carries no assessment) remain.
-    const reply = await db.query(
-      "SELECT count(*)::int AS n FROM conversation_message WHERE id = $1",
-      [seeded.replyId],
-    );
-    assert.equal(reply.rows[0].n, 1);
-  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+  }, { migrationIds: FULL_WORKER_SCHEMA_IDS });
 });
 
 test("full-turn cleanup removes the turn's engagement assessments exactly", async (t) => {
@@ -1165,7 +1540,7 @@ test("full-turn cleanup removes the turn's engagement assessments exactly", asyn
       [other.userId],
     );
     assert.equal(otherRemaining.rows[0].n, 1, "another turn's assessment must be preserved");
-  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+  }, { migrationIds: FULL_WORKER_SCHEMA_IDS });
 });
 
 test("cleanup paths skip the engagement phase entirely on a pre-engagement schema", async (t) => {
@@ -1248,7 +1623,7 @@ test("interleaving: a claim holding the lock first preserves the message AND its
     } finally {
       await claimer.end().catch(() => {});
     }
-  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+  }, { migrationIds: FULL_WORKER_SCHEMA_IDS });
 });
 
 test("interleaving: the locked cleanup wins and the claim never sees the row", async (t) => {
@@ -1280,7 +1655,7 @@ test("interleaving: the locked cleanup wins and the claim never sees the row", a
     } finally {
       await claimer.end().catch(() => {});
     }
-  }, { migrationIds: FULL_ENGAGEMENT_SCHEMA_IDS });
+  }, { migrationIds: FULL_WORKER_SCHEMA_IDS });
 });
 
 test("full-turn deletion transaction: a foreign trace reference refuses and rolls back everything", async (t) => {
@@ -1465,7 +1840,7 @@ test("trace attempt partial state: removing one trace record preserves the rest"
 async function runPodScript(databaseUrl, script) {
   const child = spawn(process.execPath, ["--input-type=module"], {
     cwd: path.join(repoRoot, "libraries", "postgres"),
-    env: { ...process.env, WORKER_DATABASE_URL: databaseUrl },
+    env: { ...process.env, ...TEST_WORKER_ENV, WORKER_DATABASE_URL: databaseUrl },
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stdout = "";
@@ -1483,6 +1858,24 @@ async function runPodScript(databaseUrl, script) {
   const out = JSON.parse(line.slice("SMOKE_JSON:".length));
   assert.equal(out.ok, true, `pod action failed: ${out.error ?? "unknown"}`);
   return out;
+}
+
+async function writeRecoveryOwnershipRecord({ databaseUrl, runsDir, marker }) {
+  const configurationFingerprintKey = "d".repeat(64);
+  const baseline = await runPodScript(databaseUrl, buildPodActionScript({
+    action: "preflight",
+    smokePrefix: "e2e-deployed-smoke-",
+    configurationFingerprintKey,
+  }));
+  assert.match(baseline.configurationFingerprint, /^[a-f0-9]{64}$/);
+  fs.writeFileSync(
+    path.join(runsDir, `deployed-smoke-ownership-${fingerprint(marker)}.json`),
+    JSON.stringify({
+      marker,
+      configurationFingerprint: baseline.configurationFingerprint,
+      configurationFingerprintKey,
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,6 +1905,7 @@ test("runner --recover: cleans a seeded queued message atomically, then is an id
     const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-runs-"));
     t.after(() => fs.rmSync(runsDir, { recursive: true, force: true }));
 
+    await writeRecoveryOwnershipRecord({ databaseUrl, runsDir, marker });
     const first = await spawnRunner(["--recover", marker], runnerEnv({ shimDir: shim.dir, gatePort, runsDir }));
     assert.equal(first.code, 0, `recover run failed: ${first.stderr}`);
     const evidence = parseEvidence(first.stdout);
@@ -1529,10 +1923,36 @@ test("runner --recover: cleans a seeded queued message atomically, then is an id
   });
 });
 
+test("runner --recover refuses to delete a normal run recorded as intentional history", async (t) => {
+  await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
+    const marker = buildMarker();
+    const seeded = await seedCompletedTurn(db, marker);
+    const gatePort = await freeTcpPort();
+    const shim = await makeKubectlShim({ databaseUrl, gatePort });
+    const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-runs-"));
+    t.after(() => fs.rmSync(runsDir, { recursive: true, force: true }));
+
+    await writeRecoveryOwnershipRecord({ databaseUrl, runsDir, marker });
+    const recordPath = path.join(runsDir, `deployed-smoke-ownership-${fingerprint(marker)}.json`);
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    record.mode = "intentional-retention";
+    fs.writeFileSync(recordPath, JSON.stringify(record));
+
+    const result = await spawnRunner(["--recover", marker], runnerEnv({ shimDir: shim.dir, gatePort, runsDir }));
+    assert.equal(result.code, 1);
+    assert.match(result.stderr, /intentional non-production history/);
+    const remaining = await db.query("SELECT count(*)::int AS n FROM conversation_message WHERE turn_id = $1", [seeded.turnId]);
+    assert.equal(remaining.rows[0].n, 2, "explicit legacy recovery must not erase a normal retained run");
+    assert.ok(!fs.existsSync(shim.actionsLog) || !fs.readFileSync(shim.actionsLog, "utf8").includes("delete-full-turn"));
+  });
+});
+
 test("runner --recover: cleans a seeded completed exclusive turn, leaves unrelated rows, idempotent", async (t) => {
   await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
     const marker = buildMarker();
     const seeded = await seedCompletedTurn(db, marker);
+    await seedTraceChainForTurn(db, seeded);
+    await seedMemoryConvergenceState(db, { turnId: seeded.turnId });
     // The unrelated turn models the owner's ordinary (non-synthetic)
     // conversation; the deployed preflight guarantees no OTHER smoke rows.
     const other = await seedCompletedTurn(db, randomUUID(), "unrelated owner conversation (synthetic)");
@@ -1541,6 +1961,7 @@ test("runner --recover: cleans a seeded completed exclusive turn, leaves unrelat
     const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-runs-"));
     t.after(() => fs.rmSync(runsDir, { recursive: true, force: true }));
 
+    await writeRecoveryOwnershipRecord({ databaseUrl, runsDir, marker });
     const first = await spawnRunner(["--recover", marker], runnerEnv({ shimDir: shim.dir, gatePort, runsDir }));
     assert.equal(first.code, 0, `recover run failed: ${first.stderr}`);
     const evidence = parseEvidence(first.stdout);
@@ -1571,21 +1992,22 @@ test("runner --recover: a shared turn retains the shared data and reports the re
     const runsDir = fs.mkdtempSync(path.join(os.tmpdir(), "smoke-runs-"));
     t.after(() => fs.rmSync(runsDir, { recursive: true, force: true }));
 
+    await writeRecoveryOwnershipRecord({ databaseUrl, runsDir, marker });
     const result = await spawnRunner(["--recover", marker], runnerEnv({ shimDir: shim.dir, gatePort, runsDir }));
     // A conservative cleanup is deliberate but must be VISIBLE: the run
     // exits non-zero and says exactly what was retained.
     assert.equal(result.code, 1, "a residual retention must be reported as a non-zero outcome");
-    assert.match(result.stderr, /conservative cleanup: the turn was not exclusive to this run/);
+    assert.match(result.stderr, /cleanup retained data: the turn is shared/);
     const evidence = parseEvidence(result.stdout);
-    assert.equal(evidence.cleanup.mode, "own-message-only");
-    assert.equal(evidence.cleanup.residualTurnId, seeded.turnId);
-    assert.equal(evidence.postState.smokeRows, 0, "our synthetic row is gone");
+    assert.equal(evidence.cleanup.mode, "retain");
+    assert.equal(evidence.cleanup.turnId, seeded.turnId);
+    assert.equal(evidence.postState.smokeRows, 1, "the synthetic row is retained with shared turn provenance");
     const residual = await db.query("SELECT count(*)::int AS n FROM conversation_message WHERE turn_id = $1", [seeded.turnId]);
-    assert.equal(residual.rows[0].n, 2, "the shared turn's other data (other user + reply) must be retained");
+    assert.equal(residual.rows[0].n, 3, "all of the shared turn's rows remain together");
   });
 });
 
-test("runner: SIGTERM during startup aborts gracefully and the awaited cleanup still runs", async (t) => {
+test("runner: SIGTERM during startup aborts gracefully and verifies retention without deletion", async (t) => {
   await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
     const gatePort = await freeTcpPort();
     const shim = await makeKubectlShim({ databaseUrl, gatePort });
@@ -1615,10 +2037,12 @@ test("runner: SIGTERM during startup aborts gracefully and the awaited cleanup s
     assert.equal(code, 1, "a graceful stop must exit non-zero");
     const evidence = parseEvidence(stdout);
     assert.equal(evidence.exclusivity.acknowledgedByOperator, true);
-    assert.equal(evidence.cleanup.mode, "nothing-to-clean", "nothing was sent, so nothing is cleaned");
-    assert.match(stderr, /STOPPED \(SIGTERM\) after awaited cleanup/);
+    assert.equal(evidence.retention.mode, "no-scenario-persisted", "setup stopped before a message arrived; no scenario data was deleted");
+    assert.match(stderr, /STOPPED \(SIGTERM\) after retained-state verification/);
     assert.ok(fs.existsSync(shim.actionsLog) && fs.readFileSync(shim.actionsLog, "utf8").includes("exec"),
-      "cleanup must have run (pod exec) after the signal");
+      "post-stop state verification must run (pod exec)");
+    assert.doesNotMatch(fs.readFileSync(shim.actionsLog, "utf8"), /delete-queued|delete-full-turn/,
+      "normal smoke never invokes historical deletion actions");
     assert.ok(!stdout.includes(marker) && !stderr.includes(marker), "the marker itself must never be printed");
   });
 });

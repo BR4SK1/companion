@@ -1,6 +1,6 @@
 ---
 name: ship-it
-description: Use when the user says "ship it" (or "ship this") — treat it as authorization to finish and publish only the current work as a pull request, including this repository's full delivery sequence up to that point: local verification gates, deploying the committed candidate to non-production, and integration/end-to-end testing — including the standing-authorized deployed non-production smoke — before the PR is created. Covers scope protection, check gates, branch/commit conventions, the manual non-production deployment, PR creation, and when to stop and ask instead of shipping. It does not authorize production deployment, merges, promotion, or unrelated changes.
+description: Use when the user says "ship it" (or "ship this") — treat it as authorization to finish and publish only the current work as a pull request, including this repository's full delivery sequence up to that point: local verification gates, deploying the committed candidate to non-production, and integration/end-to-end testing — including the guarded deployed non-production smoke — before the PR is created. Covers scope protection, check gates, branch/commit conventions, the manual non-production deployment, PR creation, and when to stop and ask instead of shipping. It does not authorize production deployment, merges, promotion, or unrelated changes.
 ---
 
 # Ship It
@@ -9,9 +9,11 @@ description: Use when the user says "ship it" (or "ship this") — treat it as a
 non-production environment, verify it there end to end, and publish it as a
 pull request. The authorization covers the current work and its publication
 path only — never merging, production deployment or promotion, or any
-unrelated change. The owner's standing authorization (recorded 2026-11-01)
-covers the deployed smoke's billable non-production provider calls within
-this flow; production stays out of scope. This repository has no remote CI
+unrelated change. The guarded deployed smoke may incur external provider
+charges and intentionally retains its synthetic non-production history; run it
+only when the requested workflow authorizes those effects. The script's flags
+are required safeguards, not a substitute for authorization. Production stays
+out of scope. This repository has no remote CI
 and no deployment automation: every check and the non-production install
 itself are performed locally (see `CONTRIBUTING.md` and `deploy/README.md`),
 nothing runs automatically on push, and a merge does not deploy. If anything
@@ -149,59 +151,29 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
    repository's sequence places integration and E2E after the non-production
    deployment; they run against the identified candidate before publication
    (`deploy/helm/environments/non-production/README.md`).
-   - **Worker integration suites** — when the worker, shared libraries, or
-     database schema changed, run `tests/integration` after the exact
-     candidate is deployed. These suites destructively clear/recreate schema
-     and synthetic configuration; under this ship-it workflow they use the
-     non-production application database via `WORKER_TEST_DATABASE_URL`, not
-     a separate throwaway database. This is an explicit non-production-only
-     exception; never use production credentials or target production.
-     Before any destructive statement, complete a read-only preflight:
-     positively verify the deployed release, candidate commit/tree/image, and
-     target server/database/role against the approved non-production-only
-     configuration; establish production separation from approved private
-     environment metadata without connecting to production; confirm required
-     database access/privileges and the candidate's full migration runner
-     route; and locate a complete owner-approved private restoration source
-     for every provisioned non-production runtime configuration. If the
-     identity, separation, route, privileges, or complete restoration source
-     cannot be established, stop before destruction.
-   - Serialize the maintenance window. Stop the non-production web and worker
-     deployments and every other consumer of the target database; prevent new
-     consumers from connecting and verify that no unidentified database
-     sessions remain. Run each integration suite in its own `node --test`
-     invocation, serially, with `WORKER_TEST_DATABASE_URL` sourced only from
-     the verified non-production credentials. Do not run recall evaluation or
-     any other tool as a substitute for these suites. Keep secrets and
-     configuration values out of command output and logs.
-   - After the suites, do not merely restart the worker: fully reconstruct a
-     clean schema using the deployed candidate's complete ordered migration
-     composition, restore all required non-production runtime configuration
-     from the approved private source, and verify the migration ledger and
-     configuration completeness without exposing values. Then restart/enable
-     and verify the same candidate (no image or source substitution), with
-     the expected deployments ready and no synthetic integration data left.
-     Any task-scoped private configuration capture must be securely handled
-     and removed after verified restoration; do not retain snapshots as
-     routine recovery aids. Only after this reconstruction and verification
-     may the deployed loopback gate and deployed smoke run.
-     If restoration cannot be completed and verified, keep non-production
-     consumers stopped and report the blocker; do not proceed to the gate,
-     smoke, push, or PR.
+   - **Focused database integration** — use a positively verified disposable
+     database (with pgvector enabled when the check requires it) for relevant
+     changed persistence behavior. Legacy suites may truncate domain tables,
+     synthesize runtime configuration, exercise destructive migration paths,
+     or inject failures; these remain explicit isolated-test tools, not
+     automatic publication gates. Never target any application database,
+     including non-production, with those suites. Do not stop deployed
+     consumers, reset schema/ledger, capture or restore runtime configuration,
+     or invoke the retired destructive ship-it procedure. If an appropriate
+     disposable fixture or extension is unavailable, report that gap instead
+     of substituting an application database.
    - **Disposable-stack Playwright suite** — the implemented E2E coverage
-     (`tests/e2e/README.md`). It exercises the committed candidate's
-     production build (per the candidate-source rule in step 5) against a
-     local fake provider and a run-owned throwaway PostgreSQL: no live model
-     calls, no real application database, run-owned cleanup. Prerequisites:
-     `pnpm install`, the pinned Playwright browser
-     (`pnpm exec playwright install chromium` from `tests/e2e`),
-     `pnpm --filter @companion/web build`, Docker, and free loopback ports
-     (defaults 4620–4624). Run `pnpm --filter @companion/e2e test` (or
-     `pnpm exec playwright test` from `tests/e2e`). When the E2E tooling
-     itself changed, also run its own suites: `pnpm --filter @companion/e2e
-     test:stack` and, for the deployed-smoke core, `pnpm --filter
-     @companion/e2e test:smoke`. Note the documented limit: the suite
-     exercises locally built source, not the deployed immutable artifacts.
+     (`tests/e2e/README.md`) exercises the committed candidate's local
+     production build against its run-owned throwaway PostgreSQL, fake
+     OpenRouter chat/decision provider, and configured real embedding service
+     using synthetic inputs. Set `E2E_RUNS_DIR` to a new unique task-owned
+     directory outside the historical `tests/e2e/.runs` tree for every
+     harness invocation; startup and cleanup must never inspect that shared
+     history. This stack uses a synthetic fixture identity and does not verify
+     the maintained personality. Prompt-module include/skip details are
+     covered by hermetic worker tests; do not enable generic modules as an E2E
+     configuration rewrite. Run local E2E and only the isolated tooling checks
+     needed to verify changed harness behavior.
    - **The deployed candidate through the loopback test-entry gate** — the
      documented E2E access to a non-production release (`apps/web/README.md`,
      `deploy/helm/environments/non-production/README.md`): `kubectl
@@ -210,46 +182,43 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
      tear it down when testing ends. At minimum verify the gate's
      unauthenticated → issuance → app flow and read-only thread access
      against the deployed release. Sending through the gate is real
-     conversation work and can incur provider charges; the owner's standing
-     authorization (2026-11-01) covers this flow's billable non-production
-     sends, and automated sends belong to the deployed smoke below, whose
-     attribution and cleanup machinery ad-hoc sends should not improvise
-     around. If the deployed release has the gate disabled, or the forward
+     conversation work and may incur provider charges; use the documented
+     guarded smoke for automated sends rather than improvising attribution or
+     cleanup. If the deployed release has the gate disabled, or the forward
      is blocked, stop and ask instead of improvising access.
-   - **The deployed smoke — a normal pre-PR gate under standing owner
-     authorization.** Run it whenever this flow deployed a candidate (it
-     inherits step 6's applicability rule):
+   - **The guarded deployed smoke.** Run it whenever this flow deployed a
+     candidate (it inherits step 6's applicability rule), provided the
+     requested workflow authorizes its external provider calls and retained
+     non-production write:
      `E2E_DEPLOYED_SMOKE_ALLOWED=1 E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1
      node tests/e2e/deployed-dev-smoke.mjs` (from the repository root). It
      drives the actual deployed candidate through its loopback test-entry
-     gate (the script performs its own port-forward) and sends one synthetic
-     message — real, billable provider calls and a non-production database
-     write — then removes its own data with race-safe, targeted cleanup.
-     The owner's standing authorization (recorded 2026-11-01) covers these
-     billable non-production provider calls within this flow, and the owner
-     has affirmed that the non-production environment and all accounts
-     associated with this project belong to the owner and are not shared
-     with anyone else; setting both variables here expresses that standing
-     authorization. The script's own guards remain fully in force — it
-     refuses to run without both variables, and exclusivity is still the
-     owner's assertion, not a system guarantee: nothing prevents another
-     process or person from reaching the dev stack concurrently, so never
-     claim concurrent access is impossible. The script detects overlap
-     conservatively and stays in control throughout: read-only preflight
-     stops before anything is sent on any doubt (deployed image identity,
-     gate attestation and enablement, a free forward port, cleanup linkage,
-     thread quiescence, no leftover smoke rows); a pre-send state check
-     aborts before any provider call if the thread changed since preflight;
-     post-send accounting flags unexpected growth, retains everything, and
-     reports it — including when the owner themselves is actively using the
-     dev thread, where the quiescence checks legitimately refuse. If the
-     script refuses, aborts, or reports overlap, anomalies, or retained
-     data, stop and report its evidence; never route around a guard. If a
-     run is interrupted, recover idempotently with the script's `--recover`
-     path (`E2E_DEPLOYED_SMOKE_ALLOWED=1 node
-     tests/e2e/deployed-dev-smoke.mjs --recover`). The one-call cost
-     expectation derives from deployed configuration and is not hard-capped
-     by the script.
+     gate (the script performs its own port-forward) and submits a synthetic
+     message. The flow may invoke configured external providers and incur
+     charges, and it writes to the non-production database. Its conversation,
+     traces, and normal learned effects are intentionally retained as
+     non-production history; only task-local files and the port-forward are
+     cleaned up. The script's own guards remain fully in force — it refuses
+     to run without both variables, and exclusivity is the operator's
+     assertion, not a system guarantee: nothing prevents another process or
+     person from reaching the environment concurrently, so never
+     claim concurrent access is impossible. Read-only preflight verifies the
+     deployed image identity, gate attestation and enablement, a free forward
+     port, scenario linkage, provisioned-configuration fingerprint, thread
+     quiescence, and no unsettled prior smoke rows. Completed intentionally
+     retained history is allowed, with a unique-marker check before each send.
+     Relationship questions, cursor initialization, and runnable consolidation
+     are normal behavior, not
+     preflight failures. A pre-send check aborts if the thread or provisioned
+     configuration changed since preflight. Post-send verification checks the
+     retained conversation, turn association, provider boundaries,
+     semantic-shadow evidence, learned-state metadata, and configuration
+     invariance. Unexpected overlap or a true scenario failure remains a
+     failure with evidence retained; expected intentional retention is a pass.
+     Never route around a guard. The legacy `--recover` cleanup is explicit-
+     only for interrupted or selected historical markers and never runs
+     automatically. Provider calls and retries depend on deployed configuration;
+     the script does not impose a hard cap on external-provider charges.
 8. **Run the pre-publication safety checks.** After verification and before
    pushing, re-review exactly what would be published: the outgoing diff
    against the intended base, and the checklist in
@@ -294,16 +263,12 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
   changes, new features, or fixes to unrelated issues — file or mention those
   instead of doing them here. Production approval is the owner's merge, and a
   merge deploys nothing: there is no deployment trigger or controller.
-- The deployed smoke runs under the owner's standing authorization recorded
-  in this skill (2026-11-01): within this flow, its billable non-production
-  provider calls and its non-production database write are authorized, and
-  the owner has affirmed that the non-production environment and all
-  accounts associated with this project belong to the owner and are not
-  shared with anyone else. Exclusivity remains an operator assertion, not a
-  system guarantee; do not assert that the system prevents concurrent access
-  to the dev stack. This standing authorization does not extend to
-  production: no production deployment, production provider calls, or
-  production writes.
+- Run the deployed smoke only when the current task explicitly authorizes its
+  external provider calls and retained non-production write. Its required guard
+  variables do not replace authorization. Exclusivity remains an operator
+  assertion, not a system guarantee; do not claim that the system prevents
+  concurrent access. No production deployment, provider calls, or writes are
+  authorized by this workflow.
 - No permission bypass: if a step requires access, approval, or a decision you
   do not have, stop and return the blocker to the user (or the coordinating
   primary agent, if delegated). Do not resolve it by assumption.

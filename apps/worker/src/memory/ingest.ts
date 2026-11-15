@@ -51,6 +51,8 @@ export type MemoryIngestReason = "turn-complete" | "reconciliation" | "manual";
 
 export interface IngestRunSummary {
   readonly selectedTurns: number;
+  /** Source turns selected by this pass, for metadata-only operation attribution. */
+  readonly selectedTurnIds: readonly string[];
   readonly extractedTurns: number;
   readonly oversizedTurnsSkipped: number;
   readonly factsWritten: number;
@@ -88,6 +90,7 @@ export async function ingestTurns(
   reason: MemoryIngestReason,
   now: Date = new Date(),
 ): Promise<IngestRunSummary> {
+  await reconcileIngestWatermarkTimestamp(deps.pool);
   let state = await getIngestState(deps.pool);
 
   // New-turn-only initial cursor: the first attempt after enablement marks
@@ -122,6 +125,7 @@ export async function ingestTurns(
 function emptySummary(reason: MemoryIngestReason): IngestRunSummary {
   return {
     selectedTurns: 0,
+    selectedTurnIds: [],
     extractedTurns: 0,
     oversizedTurnsSkipped: 0,
     factsWritten: 0,
@@ -132,6 +136,28 @@ function emptySummary(reason: MemoryIngestReason): IngestRunSummary {
     watermark: null,
     reason,
   };
+}
+
+/**
+ * Repair legacy cursors written through JavaScript Date values, whose
+ * millisecond precision could leave watermark_end_at fractionally behind the
+ * referenced turn. This is forward-only and retains the logical turn ID; the
+ * exact source timestamp is resolved in PostgreSQL.
+ */
+async function reconcileIngestWatermarkTimestamp(pool: PostgresPool): Promise<void> {
+  await pool.query(
+    `UPDATE memory_ingest_state state
+     SET watermark_end_at = source.end_at,
+         updated_at = now()
+     FROM (
+       SELECT turn_id, max(created_at) AS end_at
+       FROM conversation_message
+       GROUP BY turn_id
+     ) source
+     WHERE state.id = true
+       AND state.watermark_turn_id = source.turn_id
+       AND (state.watermark_end_at IS NULL OR state.watermark_end_at < source.end_at)`,
+  );
 }
 
 /**
@@ -150,7 +176,10 @@ async function initializeIngestCursor(
     `UPDATE memory_ingest_state
      SET initialized_at = now(),
          watermark_turn_id = $1,
-         watermark_end_at = $2,
+         watermark_end_at = COALESCE(
+           (SELECT max(created_at) FROM conversation_message WHERE turn_id = $1),
+           $2::timestamptz
+         ),
          last_ingest_at = now(),
          updated_at = now()
      WHERE id = true AND initialized_at IS NULL
@@ -188,6 +217,7 @@ async function ingestWithWatermark(
 
   const baseSummary: IngestRunSummary = {
     selectedTurns: selected.length,
+    selectedTurnIds: selected.map((turn) => turn.turnId),
     extractedTurns: 0,
     oversizedTurnsSkipped: 0,
     factsWritten: 0,

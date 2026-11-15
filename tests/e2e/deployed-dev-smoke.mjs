@@ -1,60 +1,44 @@
 #!/usr/bin/env node
 /**
- * Deployed non-production smoke test — one synthetic message through the
- * REAL deployed dev stack (real billable provider), with guaranteed targeted
- * cleanup of exactly its own data.
+ * Deployed non-production smoke test — a synthetic scenario through the
+ * running application, retaining its conversation and normal learned effects
+ * as intentional non-production history.
  *
- * This is deliberately NOT part of the Playwright suite and NOT part of the
- * local fake-provider stack: it drives the actual running non-production
- * deployment through its loopback test-entry gate (kubectl port-forward,
- * pod-local; the gate is never exposed through a Service), makes exactly one
- * synthetic user message's worth of provider calls against the REAL
- * (billable) OpenRouter, and then removes exactly the rows it created.
+ * This is deliberately NOT part of the local Playwright suite: it drives the
+ * actual non-production deployment through its loopback test-entry gate
+ * (kubectl port-forward; the gate is never exposed through a Service). The
+ * scenario may invoke configured external providers that incur charges. The
+ * conversation, traces, and learned state remain as non-production history.
  *
- * Authorization (both required, both explicit — the script refuses without
+ * Required runtime safeguards (both required — the script refuses without
  * them):
- * - `E2E_DEPLOYED_SMOKE_ALLOWED=1` authorizes the billable provider call and
- *   the non-production database write. Running this is never a byproduct of
- *   the ordinary suite.
- * - `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` is the OPERATOR'S explicit
- *   acknowledgement that this dev stack is in exclusively their use for the
- *   duration of the run. This is an assertion, NOT an enforcement: the
- *   system cannot prevent another user's message from being ingested before
- *   or during the run, and the worker's chat request includes the thread's
- *   visible history — so unrelated conversation can enter the provider
- *   context, and provider call costs and any replay behavior are not
- *   hard-capped by this script (the one-call expectation is derived from
- *   deployed configuration, not enforced). Overlap is detected
- *   conservatively: a pre-send state check aborts before anything is sent
- *   if the thread changed since preflight, and post-send composition checks
- *   make cleanup conservative when a turn was shared.
+ * - `E2E_DEPLOYED_SMOKE_ALLOWED=1` acknowledges external provider use and a
+ *   non-production database write. It does not itself grant authorization.
+ * - `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` records the operator's
+ *   assertion of exclusive access for this run. This is an assertion, NOT an
+ *   enforcement: the system cannot guarantee exclusivity. Provider usage and
+ *   replay behavior depend on deployed configuration and are not hard-capped.
+ *   Overlap checks fail closed before sending where possible and report later
+ *   anomalies without deleting conversation or learned state.
  *
- * Safety design (fail-closed, stop-before-send, preserve-when-uncertain):
- * - Read-only preflight of the deployment (images, gate attestation, gate
- *   enabled), the database schema's cleanup linkage, thread quiescence, and
- *   the absence of leftover synthetic rows. Any doubt stops the run BEFORE
- *   anything is sent; there is no broad database reset anywhere.
+ * Safety design (fail-closed, stop-before-send, retain intentional history):
+ * - Read-only preflight verifies the deployment (images, gate attestation,
+ *   enablement), scenario linkage, thread quiescence, configuration
+ *   fingerprint, and absence of unsettled prior smoke markers. It does not reject normal
+ *   relationship questions, a fresh ingest cursor, or runnable consolidation.
  * - Attribution is exact: the marker IS the synthetic message's content
- *   (the web BFF assigns its own opaque client_key); reply and turn derive
- *   only through that message's turn linkage, and the turn's composition is
- *   re-verified INSIDE the deletion transaction (turn row locked FOR UPDATE)
- *   so a concurrent mutation rolls back instead of over-deleting.
- * - The queued-message cleanup is a single atomic guarded delete
- *   (`… AND turn_id IS NULL`): against the worker's claim (`SELECT … FOR
- *   UPDATE` on pending rows, then `UPDATE … SET turn_id WHERE turn_id IS
- *   NULL`) it either deletes a still-unassigned row or deletes nothing and
- *   the run re-probes — it can never delete a row the worker has claimed or
- *   is claiming.
- * - Conservative cleanup: shared turn → only this run's own row (turn-
- *   scoped, id- and content-guarded); unreadable turn, timed-out wait,
- *   shutdown during a wait, transaction verification failure, or any
- *   uncertain state → RETAIN everything, persist an ownership record, and
- *   report; in-flight turns are waited out and never touched.
- * - SIGINT/SIGTERM are graceful: the journey aborts, the awaited cleanup
- *   still runs, and only then does the process exit non-zero. A second
- *   signal exits immediately. SIGKILL cannot be handled: the ownership
- *   marker persisted before the send (`.runs/deployed-smoke-last-marker.txt`)
- *   is the recovery trail — see `--recover`.
+ *   (the web BFF assigns its own opaque client_key); the reply and turn are
+ *   verified through that message's turn linkage and the conversation's
+ *   persisted composition before the scenario is reported as retained.
+ * - The thread is not transactionally exclusive: the operator acknowledges
+ *   exclusive use and a pre-send state check detects observed overlap. Any
+ *   unexpected overlap or scenario failure is reported accurately, and all
+ *   existing conversation/learned state remains untouched.
+ * - SIGINT/SIGTERM abort the journey and preserve any data that may have
+ *   reached the worker before the process exits non-zero. A second signal
+ *   exits immediately. SIGKILL cannot be handled: the ownership marker
+ *   persisted before send (`$E2E_RUNS_DIR/deployed-smoke-last-marker.txt`)
+ *   is the recovery trail for explicit historical recovery only.
  * - Output hygiene: the marker and any captured reply text are treated as
  *   secrets of this run. Evidence carries only ids, seqs, counts, statuses,
  *   attempt counts, timings, and a marker fingerprint — never message
@@ -65,13 +49,17 @@
  *   page snapshots) and redacts this run's secrets; the evidence block is
  *   redacted as a whole before printing.
  *
- * Recovery: `node deployed-dev-smoke.mjs --recover [marker-or-file]` runs
- * ONLY the idempotent, verified cleanup for a recorded marker (no browser,
- * no provider calls, no port-forward). It is safe to re-run: an already-
- * cleaned marker verifies as nothing-to-clean.
+ * Explicit historical recovery: `node deployed-dev-smoke.mjs --recover
+ * [marker]` may invoke legacy narrow deletion for an eligible
+ * historical marker whose task-owned record is not tagged intentional
+ * retention. The normal smoke path never invokes that cleanup machinery.
+ * Recovery makes no provider calls and does not open the browser or forward.
+ * It is safe to rerun for eligible historical cleanup records; normal
+ * retained-run records are refused.
  */
 
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import { connect as tcpConnect } from "node:net";
 import path from "node:path";
@@ -79,12 +67,15 @@ import process from "node:process";
 
 import { chromium } from "@playwright/test";
 
+import { resolveTaskRunsDir } from "./helpers/runs-dir.mjs";
+
 import {
   buildMarker,
   buildPodActionScript,
   createShutdownController,
   fingerprint,
   planCleanupDecision,
+  planRetainedScenarioDecision,
   redactText,
   sanitizeError,
 } from "./deployed-smoke-lib.mjs";
@@ -96,8 +87,10 @@ const REPLY_TIMEOUT_MS = 180_000;
 const SETTLE_TIMEOUT_MS = 90_000;
 /** Overridable for tests; the operator run default is 30s. */
 const GATE_WAIT_MS = Number(process.env.E2E_DEPLOYED_GATE_WAIT_MS ?? 30_000);
-const RUNS_DIR = process.env.E2E_RUNS_DIR ?? new URL("./.runs", import.meta.url).pathname;
+const RUNS_DIR = resolveTaskRunsDir();
 const LAST_MARKER_FILE = path.join(RUNS_DIR, "deployed-smoke-last-marker.txt");
+const BACKGROUND_CONVERGENCE_TIMEOUT_MS = 10 * 60_000;
+let configurationFingerprintKey = randomBytes(32).toString("hex");
 
 const evidence = {
   deployment: {},
@@ -112,7 +105,9 @@ const evidence = {
   },
   journey: {},
   provider: {},
-  cleanup: {},
+  memory: {},
+  retention: {},
+  cleanup: {}, // populated only by explicit historical recovery
   postState: {},
 };
 const failures = [];
@@ -122,6 +117,8 @@ const shutdown = createShutdownController();
 
 /** The marker of this run, set before the send (used by cleanup/recovery). */
 let sentMarker = null;
+let scenarioStartedAt = null;
+let baselineConfigurationFingerprint = null;
 
 function log(message) {
   process.stdout.write(`[deployed-smoke] ${redactText(secrets, message)}\n`);
@@ -187,7 +184,7 @@ async function kubectl(args, { input = undefined } = {}) {
  * results are content-free.
  */
 async function workerPodAction(payload) {
-  const script = buildPodActionScript(payload);
+  const script = buildPodActionScript({ ...payload, configurationFingerprintKey });
   const result = await runCaptured(
     "kubectl",
     ["exec", "-i", "-n", NAMESPACE, "deploy/companion-worker", "--",
@@ -315,22 +312,46 @@ async function preflight() {
     tablesOk: db.tablesOk,
     clientKeyIndexed: db.clientKeyIndexed,
     oneReplyPerTurn: db.oneReplyPerTurn,
-    leftoverSmokeRows: db.leftoverSmokeRows,
+    historicalSmokeRows: db.leftoverSmokeRows,
+    unsettledSmokeRows: db.unsettledSmokeRows,
     queuedUserMessages: db.queuedUserMessages,
     inFlightTurns: db.inFlightTurns,
     enabledPatterns: db.enabledPatterns,
+    enabledPromptModules: db.enabledPromptModules,
     identityProvisioned: db.identityProvisioned,
     baselineMessages: db.baselineMessages,
     baselineTurns: db.baselineTurns,
     newestMessageAgeMinutes: db.newestMessageAgeMinutes,
     highestAllocatedSeq: db.highestAllocatedSeq,
+    relationshipEnabledQuestions: db.relationshipEnabledQuestions,
+    memorySchemaPresent: db.memorySchemaPresent,
+    memoryEnabled: db.memoryEnabled,
+    memoryIngestEnabled: db.memoryIngestEnabled,
+    memoryRecallEnabled: db.memoryRecallEnabled,
+    memoryAutopromoteEnabled: db.memoryAutopromoteEnabled,
+    memoryEmbeddingConfigured: db.memoryEmbeddingConfigured,
+    memoryIngestCursorInitialized: db.memoryIngestCursorInitialized,
+    memoryIngestCursorCaughtUp: db.memoryIngestCursorCaughtUp,
+    memoryNewFactsSinceConsolidation: db.memoryNewFactsSinceConsolidation,
+    memoryConsolidationMayRun: db.memoryConsolidationMayRun,
+    memoryActiveConsolidationRuns: db.memoryActiveConsolidationRuns,
+    memoryUnrecordedPromotionRuns: db.memoryUnrecordedPromotionRuns,
+    memoryPendingPromotions: db.memoryPendingPromotions,
+    relationshipAnswerRows: db.relationshipAnswerRows,
+    enabledPromptModules: db.enabledPromptModules,
+    nextTemporalBoundaryMs: db.nextTemporalBoundaryMs,
   };
-  if (!db.tablesOk || !db.clientKeyIndexed || !db.oneReplyPerTurn) {
-    throw new Error("the deployed schema lacks the expected cleanup linkage (tables/client_key index/one reply per turn)");
+  baselineConfigurationFingerprint = db.configurationFingerprint;
+  evidence.preflight.configurationFingerprint = db.configurationFingerprint;
+  if (typeof db.configurationFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(db.configurationFingerprint)) {
+    throw new Error("configuration fingerprint is unavailable; refusing to send");
   }
-  if (db.leftoverSmokeRows !== 0) {
+  if (!db.tablesOk || !db.clientKeyIndexed || !db.oneReplyPerTurn) {
+    throw new Error("the deployed schema lacks expected conversation scenario linkage (tables/client_key index/one reply per turn)");
+  }
+  if (db.unsettledSmokeRows !== 0) {
     throw new Error(
-      `${String(db.leftoverSmokeRows)} pre-existing ${SMOKE_PREFIX}rows found — refusing to send (attribution would be ambiguous; use --recover)`,
+      `${String(db.unsettledSmokeRows)} prior smoke row(s) are still unassigned, unreadable, or in flight — refusing to send`,
     );
   }
   if (db.queuedUserMessages !== 0 || db.inFlightTurns !== 0) {
@@ -343,12 +364,41 @@ async function preflight() {
       "chat_identity is not provisioned in the deployed environment — a full turn cannot publish without the owner-authored identity; provision it and rerun",
     );
   }
-  evidence.provider.expectedCalls = db.enabledPatterns > 0 ? "decision + chat (2)" : "chat only (decision skipped: no enabled patterns)";
+  if (
+    db.memorySchemaPresent !== true ||
+    db.memoryEnabled !== true ||
+    db.memoryIngestEnabled !== true ||
+    db.memoryRecallEnabled !== true ||
+    db.memoryEmbeddingConfigured !== true ||
+    db.memoryIngestSettleMs + db.memoryChatTimeoutMs + 30_000 >= BACKGROUND_CONVERGENCE_TIMEOUT_MS
+  ) {
+    throw new Error(
+      "normal-use preflight requires enabled memory ingest/recall and a configured embedding endpoint with bounded convergence; refusing before send",
+    );
+  }
+  evidence.memory.expectedLearnedEffects = "retain the synthetic turn, trace, memory extraction/cache, semantic-shadow comparison, cursor/counters, and any ordinary relationship or shared derived-state updates";
+  evidence.relationship = {
+    enabledQuestions: db.relationshipEnabledQuestions,
+    answerRowsBefore: db.relationshipAnswerRows,
+    answersHaveTurnProvenance: false,
+    note: "relationship answers are ordinary learned state and are retained; the schema does not attribute answer rows to a turn",
+  };
+  evidence.provider.expectedCalls = {
+    chat: 1,
+    decisions: db.enabledPatterns > 0 ? 1 : 0,
+    promptModuleDecisions: db.enabledPromptModules > 0 ? 1 : 0,
+    relationshipExtraction: db.relationshipEnabledQuestions > 0 ? 1 : 0,
+    memoryExtraction: "recorded after completion",
+    note: "actual request-boundary counts are reported after the turn; retries may increase calls",
+  };
   log(
     `preflight OK: gate open (attestation ${evidence.preflight.gate.attestation}), ` +
     `db idle (newest message ${String(db.newestMessageAgeMinutes)} min old), ` +
     `baseline ${String(db.baselineMessages)} messages / ${String(db.baselineTurns)} turns, ` +
-    `expected provider calls: ${evidence.provider.expectedCalls}`,
+    `relationship questions=${String(db.relationshipEnabledQuestions)}, ` +
+    `memory cursor initialized=${String(db.memoryIngestCursorInitialized)}, ` +
+    `consolidation may run=${String(db.memoryConsolidationMayRun)}; ` +
+    "normal learned-state changes will be retained",
   );
 }
 
@@ -387,7 +437,7 @@ async function stopPortForward() {
 }
 
 // ---------------------------------------------------------------------------
-// The journey: one synthetic message, persisted reply, refresh
+// The journey: a synthetic scenario, persisted reply, and refresh
 //
 // Content hygiene: the DOM is verified with STRUCTURAL locators only
 // (`[data-last-bubble]` marks exactly the newest message's bubble); message
@@ -436,6 +486,19 @@ async function journey(gateOrigin, marker) {
     }
     evidence.exclusivity.preSendOverlapCheck = "passed";
     evidence.journey.baselineMessageCount = preThread.messages.length;
+    const preSendFingerprint = await step("pre-send configuration fingerprint", () =>
+      workerPodAction({ action: "configuration-fingerprint" }));
+    evidence.preflight.preSendConfigurationFingerprint = preSendFingerprint.configurationFingerprint;
+    if (preSendFingerprint.configurationFingerprint !== baselineConfigurationFingerprint) {
+      evidence.exclusivity.overlapDetected = true;
+      throw new Error("provisioned configuration changed between preflight and send; aborting before any provider call");
+    }
+    const markerCheck = await step("pre-send unique marker check", () =>
+      workerPodAction({ action: "marker-check", marker }));
+    if (markerCheck.markerRows !== 0) {
+      evidence.exclusivity.overlapDetected = true;
+      throw new Error("the generated scenario marker already exists; aborting before any provider call");
+    }
 
     const lastBubble = logConsole.locator("[data-last-bubble]");
 
@@ -474,7 +537,7 @@ async function journey(gateOrigin, marker) {
       if (Date.now() > replyDeadline) {
         throw new Error(
           `no reply arrived within ${String(REPLY_TIMEOUT_MS / 1000)}s ` +
-          `(user message ${userMessage === null ? "not yet" : "seen"}; the turn may have failed — cleanup still runs)`,
+          `(user message ${userMessage === null ? "not yet" : "seen"}; the scenario remains for post-run verification)`,
         );
       }
       await shutdown.waitOrStop(1500);
@@ -498,6 +561,13 @@ async function journey(gateOrigin, marker) {
     });
     evidence.journey.replyVisibleInUi = true;
 
+    const duringFingerprint = await step("post-reply configuration fingerprint", () =>
+      workerPodAction({ action: "configuration-fingerprint" }));
+    evidence.preflight.postReplyConfigurationFingerprint = duringFingerprint.configurationFingerprint;
+    if (duringFingerprint.configurationFingerprint !== baselineConfigurationFingerprint) {
+      failures.push("configuration-invariance check failed during the journey: provisioned configuration changed; all scenario history remains retained");
+    }
+
     // Post-send overlap accounting: exactly our message + its reply may have
     // appeared; anything else is an overlap anomaly (retained, reported).
     const afterThread = await step("post-reply thread read", async () =>
@@ -507,7 +577,7 @@ async function journey(gateOrigin, marker) {
     const ourCount = afterThread.messages.filter((message) => message.text === marker).length;
     if (ourCount !== 1 || afterThread.messages.length !== evidence.journey.baselineMessageCount + 2) {
       evidence.exclusivity.overlapDetected = true;
-      failures.push("overlap anomaly: the thread gained unexpected messages during the run; cleanup stays conservative and nothing unrelated is deleted");
+      failures.push("overlap anomaly: the thread gained unexpected messages during the run; all observed conversation and learned state remains retained");
     }
 
     // Persistence across a refresh.
@@ -526,8 +596,7 @@ async function journey(gateOrigin, marker) {
 }
 
 // ---------------------------------------------------------------------------
-// Targeted cleanup (decision logic in deployed-smoke-lib.mjs; all SQL is
-// parameterized pod-side; uncertainty always retains)
+// Legacy explicit recovery cleanup (normal smoke never calls this path)
 // ---------------------------------------------------------------------------
 
 async function persistOwnershipRecord(mode, detail) {
@@ -538,6 +607,8 @@ async function persistOwnershipRecord(mode, detail) {
       markerFingerprint: fingerprint(marker),
       mode,
       detail,
+      configurationFingerprint: baselineConfigurationFingerprint,
+      configurationFingerprintKey,
       at: new Date().toISOString(),
       recoverWith: `E2E_DEPLOYED_SMOKE_ALLOWED=1 node ${path.basename(import.meta.url)} --recover`,
     };
@@ -548,8 +619,10 @@ async function persistOwnershipRecord(mode, detail) {
       `${JSON.stringify({ ...record, marker }, null, 2)}\n`,
     );
     log(`ownership record persisted for recovery: ${record.markerFingerprint} (${mode})`);
+    return true;
   } catch {
-    // best effort; the evidence block still records the decision
+    // The caller must not send unless this recovery record can be persisted.
+    return false;
   }
 }
 
@@ -575,8 +648,63 @@ async function waitForTurnSettle() {
   }
 }
 
+async function waitForMemoryBackgroundQuiescence(turnId) {
+  const deadline = Date.now() + BACKGROUND_CONVERGENCE_TIMEOUT_MS;
+  for (;;) {
+    const status = await workerPodAction({ action: "background-status", turnId });
+    evidence.memory.background = {
+      turnStatus: status.turn?.status ?? null,
+      traceAttempts: status.traceAttempts,
+      semanticShadowAttempts: status.semanticShadowAttempts,
+      semanticShadowFailures: status.semanticShadowFailures,
+      recallOperations: status.recallOperations,
+      factExtractionOperations: status.factExtractionOperations,
+      extractionCacheRows: status.extractionCacheRows,
+      memoryProviderCalls: status.memoryProviderCalls,
+      ingestCursorPassed: status.ingestCursorPassed,
+      runTurns: status.runTurns,
+      mixedRuns: status.mixedRuns,
+      sharedOperationRows: status.sharedOperationRows,
+      activeRuns: status.activeRuns,
+      unrecordedRunPromotions: status.unrecordedRunPromotions,
+      pendingPromotions: status.pendingPromotions,
+      appliedPromotionItems: status.appliedPromotionItems,
+      pendingFactEmbeddings: status.pendingFactEmbeddings,
+      temporalReferences: status.temporalReferences,
+    };
+    const turnSettled = status.turn?.status === "completed" || status.turn?.status === "failed";
+    const shadowSettled = status.semanticShadowAttempts >= status.recallOperations &&
+      status.recallOperations >= status.traceAttempts;
+    const ingestionSettled = status.turn?.status !== "completed" || (
+      status.ingestCursorPassed === true &&
+      (status.factExtractionOperations > 0 || status.extractionCacheRows > 0)
+    );
+    const derivedSettled = status.pendingFactEmbeddings === 0 &&
+      status.activeRuns === 0 && status.unrecordedRunPromotions === 0 &&
+      status.pendingPromotions === 0;
+    if (turnSettled && shadowSettled && ingestionSettled && derivedSettled) {
+      if (status.semanticShadowFailures > 0) {
+        failures.push("semantic shadow comparison failed for the synthetic turn; all resulting evidence remains retained");
+      }
+      if (
+        status.mixedRuns > 0 ||
+        status.sharedOperationRows > 0 ||
+        status.appliedPromotionItems > 0
+      ) {
+        return { settled: true, unsafeDerivedState: true };
+      }
+      return { settled: true, unsafeDerivedState: false };
+    }
+    if (Date.now() >= deadline || shutdown.requested) {
+      return { settled: false, unsafeDerivedState: false };
+    }
+    await shutdown.waitOrStop(2_000).catch(() => undefined);
+  }
+}
+
 async function cleanupPhase() {
   const marker = sentMarker;
+  let backgroundWaitedTurnId = null;
   if (marker === null) {
     evidence.cleanup = { mode: "nothing-to-clean", reason: "no marker was ever generated (failure before the send)" };
     return;
@@ -589,6 +717,26 @@ async function cleanupPhase() {
       composition: probe.composition ?? null,
       ourUserMessageInTurn: probe.ourUserMessageInTurn === true,
     });
+    if (
+      decision.mode === "full-turn" &&
+      probe.turn !== undefined &&
+      probe.turn !== null &&
+      (probe.turn.status === "completed" || probe.turn.status === "failed") &&
+      backgroundWaitedTurnId !== probe.turn.id
+    ) {
+      const background = await waitForMemoryBackgroundQuiescence(probe.turn.id);
+      if (!background.settled || background.unsafeDerivedState) {
+        const reason = !background.settled
+          ? "bounded memory/semantic background convergence did not settle; scenario and shared state were retained"
+          : "scenario processing mixed with other turns or applied shared promotion artifacts; nothing was deleted";
+        evidence.cleanup = { mode: "retain", reason, turnId: probe.turn.id };
+        failures.push(`cleanup retained data: ${reason}`);
+        await persistOwnershipRecord("retain", reason);
+        return;
+      }
+      backgroundWaitedTurnId = probe.turn.id;
+      continue;
+    }
     if (decision.mode === "nothing-to-clean") {
       evidence.cleanup = { mode: "nothing-to-clean", reason: decision.reason ?? "the synthetic message never persisted" };
       log("nothing to clean: the synthetic message never reached the database");
@@ -650,28 +798,6 @@ async function cleanupPhase() {
       await persistOwnershipRecord("retain", reason);
       return;
     }
-    if (decision.mode === "own-message-only") {
-      const result = await workerPodAction({
-        action: "delete-own-message", messageId: probe.message.id, marker, turnId: probe.turn.id,
-      });
-      evidence.provider.turnComposition = probe.composition === null ? null : {
-        messages: probe.composition.length,
-        userMessages: probe.composition.filter((entry) => entry.role === "user").length,
-        exclusiveToThisRun: false,
-      };
-      if (result.rowCount === 1) {
-        evidence.cleanup = {
-          mode: "own-message-only",
-          deletedMessageCount: 1,
-          preCleanupTotals: { messages: probe.totalMessages, turns: probe.totalTurns },
-          reason: "the turn was shared with unrelated traffic; only this run's own message row was removed (residual retained and reported)",
-          residualTurnId: probe.turn.id,
-        };
-        failures.push("conservative cleanup: the turn was not exclusive to this run; only this run's message row was removed (residual reported)");
-        return;
-      }
-      continue; // rowCount 0: re-probe and re-decide.
-    }
     // retain
     evidence.cleanup = { mode: "retain", reason: decision.reason, turnId: probe.turn?.id ?? null };
     failures.push(`cleanup retained data: ${decision.reason}`);
@@ -684,6 +810,152 @@ async function cleanupPhase() {
   await persistOwnershipRecord("retain", reason);
 }
 
+async function verifyRetainedScenario() {
+  if (sentMarker === null) {
+    evidence.retention = { mode: "no-scenario-to-retain", reason: "no marker was generated before setup failed" };
+    return;
+  }
+
+  let probe = await workerPodAction({ action: "probe", marker: sentMarker });
+  if (probe.message === null || probe.message.turnId === null || probe.turn === null || probe.turn === undefined) {
+    const reason = probe.message === null
+      ? "the synthetic message did not persist"
+      : "the synthetic message is not yet associated with a readable turn";
+    const finalFingerprint = await workerPodAction({ action: "configuration-fingerprint" });
+    evidence.postState.configurationFingerprint = finalFingerprint.configurationFingerprint;
+    evidence.retention = {
+      mode: probe.message === null ? "no-scenario-persisted" : "retained-unverified",
+      retainedIntentionally: true,
+      reason,
+      rowsDeleted: 0,
+    };
+    if (evidence.journey.userMessageAcceptedInUi === true || probe.message !== null) {
+      failures.push(`retained-scenario verification failed: ${reason}; nothing was deleted`);
+    }
+    if (finalFingerprint.configurationFingerprint !== baselineConfigurationFingerprint) {
+      failures.push("configuration-invariance check failed after the journey: provisioned configuration changed or was unavailable");
+    }
+    await persistOwnershipRecord(probe.message === null ? "no-scenario-persisted" : "retained-unverified", reason);
+    return;
+  }
+
+  if (probe.turn.status === "in_flight") {
+    const settled = await waitForTurnSettle();
+    if (settled) {
+      probe = await workerPodAction({ action: "probe", marker: sentMarker });
+    }
+  }
+
+  let background = { settled: false, unsafeDerivedState: false };
+  if (probe.turn !== null && probe.turn !== undefined) {
+    background = await waitForMemoryBackgroundQuiescence(probe.turn.id);
+  }
+  const state = probe.message === null || probe.turn === null || probe.turn === undefined
+    ? null
+    : await workerPodAction({
+      action: "retained-state",
+      marker: sentMarker,
+      messageId: probe.message.id,
+      turnId: probe.turn.id,
+      startedAt: scenarioStartedAt ?? new Date().toISOString(),
+    });
+
+  if (state !== null) {
+    evidence.journey.persistedAssociation = {
+      userMessageId: state.message?.id ?? null,
+      userMessageSeq: state.message?.seq ?? null,
+      turnId: state.turn?.id ?? null,
+      turnStatus: state.turn?.status ?? null,
+      composition: state.composition?.map((entry) => ({ id: entry.id, role: entry.role })) ?? [],
+      markerAssociationVerified: state.ourUserMessageInTurn === true,
+      retainedTurnMessageCount: state.scenarioTurnMessages,
+      retainedMarkerRows: state.scenarioMarkerRows,
+    };
+    evidence.provider = {
+      ...evidence.provider,
+      requestBoundaries: {
+        totalObservedOrPathDerived: state.providerRequestsObserved,
+        responsePatternDecisions: { requests: state.decisionRequests, responses: state.decisionResponses },
+        chat: { requests: state.chatRequests, responses: state.chatResponses },
+        promptModuleDecisions: state.promptModuleDecisionRequests,
+        memoryFactExtraction: state.memoryProviderCalls,
+        relationshipExtraction: {
+          callsDerivedFromEnabledQuestionsAndCompletedChat: state.relationshipExtractionProviderCalls,
+          enabledQuestions: state.relationshipEnabledQuestions,
+          independentlyTraced: false,
+        },
+        semanticShadowEmbeddingCalls: "served by the configured embedding service",
+      },
+      turn: { id: state.turn?.id ?? null, status: state.turn?.status ?? null },
+    };
+    evidence.memory.scenario = {
+      factRows: state.memoryFacts,
+      semanticShadowAttempts: state.semanticShadowAttempts,
+      semanticShadowOutcomes: state.semanticShadowOutcomes,
+      semanticOnlyCandidates: state.semanticOnlyCandidates,
+      candidateCountsByArm: state.shadowCandidateCountsByArm,
+      chatContextChunks: state.chatContextChunks,
+      semanticShadowContextMessages: state.semanticShadowContextMessages,
+      sharedDerivedStateObserved: background.unsafeDerivedState,
+      note: "semantic-shadow comparisons are retained; source query text and candidate content are not emitted",
+    };
+    evidence.relationship.answerRowsAfter = state.relationshipAnswerCount;
+    evidence.relationship.answersUpdatedSinceScenarioStart = state.relationshipAnswersUpdatedSinceStart;
+    evidence.postState = {
+      messages: state.messages,
+      turns: state.turns,
+      configurationFingerprint: state.configurationFingerprint,
+      scenarioMarkerRows: state.scenarioMarkerRows,
+      scenarioTurnMessages: state.scenarioTurnMessages,
+    };
+  }
+
+  const configurationInvariant = state !== null &&
+    state.configurationFingerprint === baselineConfigurationFingerprint &&
+    evidence.preflight.preSendConfigurationFingerprint === baselineConfigurationFingerprint &&
+    evidence.preflight.postReplyConfigurationFingerprint === baselineConfigurationFingerprint;
+  const decision = planRetainedScenarioDecision({
+    message: state?.message ?? probe.message,
+    turn: state?.turn ?? probe.turn,
+    composition: state?.composition ?? probe.composition,
+    ourUserMessageInTurn: state?.ourUserMessageInTurn ?? probe.ourUserMessageInTurn,
+    backgroundSettled: background.settled,
+    configurationInvariant,
+  });
+  evidence.retention = {
+    mode: decision.mode,
+    retainedIntentionally: true,
+    reason: decision.reason,
+    turnId: state?.turn?.id ?? probe.turn?.id ?? null,
+    messageId: state?.message?.id ?? probe.message?.id ?? null,
+    sharedDerivedStateObserved: background.unsafeDerivedState,
+    rowsDeleted: 0,
+  };
+  if (decision.mode !== "retained-intentionally") {
+    failures.push(`retained-scenario verification failed: ${decision.reason}; all scenario and learned state remains retained`);
+  }
+  if (state !== null && state.scenarioMarkerRows !== 1) {
+    failures.push(`retained-scenario evidence mismatch: expected one uniquely marked user message, found ${String(state.scenarioMarkerRows)}`);
+  }
+  if (state !== null && (state.chatRequests < 1 || state.chatResponses < 1)) {
+    failures.push("retained-scenario trace is missing the real chat request/response boundary");
+  }
+  if (state !== null && state.semanticShadowContextMessages !== 0) {
+    failures.push("semantic-shadow-labeled content appeared in chat context; scenario remains retained for review");
+  }
+  if (state !== null && !evidence.exclusivity.overlapDetected) {
+    if (state.messages !== evidence.preflight.database.baselineMessages + 2) {
+      failures.push(`post-state message count mismatch: expected baseline plus the retained user/reply pair, found ${String(state.messages)}`);
+    }
+    if (state.turns !== evidence.preflight.database.baselineTurns + 1) {
+      failures.push(`post-state turn count mismatch: expected baseline plus the retained turn, found ${String(state.turns)}`);
+    }
+  }
+  if (!(await persistOwnershipRecord("intentional-retention", "verified normal-use conversation and learned effects intentionally remain in non-production history"))) {
+    failures.push("could not update the local ownership record after the scenario; deployed scenario history remains retained");
+  }
+}
+
 async function verifyPostState() {
   const post = await workerPodAction({ action: "post-state", smokePrefix: SMOKE_PREFIX });
   evidence.postState = {
@@ -692,7 +964,15 @@ async function verifyPostState() {
     turns: post.turns,
     queuedUserMessages: post.queuedUserMessages,
     inFlightTurns: post.inFlightTurns,
+    configurationFingerprint: post.configurationFingerprint,
   };
+  if (
+    baselineConfigurationFingerprint === null ||
+    post.configurationFingerprint !== baselineConfigurationFingerprint
+  ) {
+    failures.push("configuration-invariance check failed: provisioned configuration fingerprint changed or was unavailable");
+    await persistOwnershipRecord("configuration-drift", "configuration fingerprint mismatch or unavailable");
+  }
   if (post.smokeRows !== 0) {
     failures.push(`post-state check failed: ${String(post.smokeRows)} synthetic row(s) remain`);
     await persistOwnershipRecord("post-state-residue", `${String(post.smokeRows)} synthetic row(s) remain`);
@@ -727,6 +1007,25 @@ async function recover(marker) {
   if (!marker.startsWith(SMOKE_PREFIX)) {
     fail("refusing to recover: the marker does not have the e2e-deployed-smoke- prefix");
   }
+  const recordPath = path.join(RUNS_DIR, `deployed-smoke-ownership-${fingerprint(marker)}.json`);
+  let record;
+  try {
+    record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  } catch {
+    throw new Error("refusing recovery without a verified task-owned configuration fingerprint record");
+  }
+  if (record.mode === "intentional-retention") {
+    throw new Error("refusing recovery: this smoke recorded the scenario as intentional non-production history");
+  }
+  if (
+    record.marker !== marker ||
+    !/^[a-f0-9]{64}$/.test(record.configurationFingerprint ?? "") ||
+    !/^[a-f0-9]{64}$/.test(record.configurationFingerprintKey ?? "")
+  ) {
+    throw new Error("refusing recovery without a verified task-owned configuration fingerprint record");
+  }
+  baselineConfigurationFingerprint = record.configurationFingerprint;
+  configurationFingerprintKey = record.configurationFingerprintKey;
   sentMarker = marker;
   secrets.push(marker);
   evidence.recovery = { markerFingerprint: fingerprint(marker) };
@@ -763,8 +1062,8 @@ function readPersistedMarker() {
 
 if (process.env.E2E_DEPLOYED_SMOKE_ALLOWED !== "1") {
   fail(
-    "refusing to run: this smoke makes a real billable provider call against the deployed non-production stack. " +
-    "Set E2E_DEPLOYED_SMOKE_ALLOWED=1 to authorize it explicitly.",
+    "refusing to run: external provider use and a retained non-production write require the guarded smoke. " +
+    "Set E2E_DEPLOYED_SMOKE_ALLOWED=1 to acknowledge these effects; authorization is still required.",
   );
 }
 const args = parseArgs(process.argv.slice(2));
@@ -782,10 +1081,9 @@ if (args.mode === "recover") {
 } else {
   if (process.env.E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS !== "1") {
     fail(
-      "refusing to run: exclusive dev access must be acknowledged by the operator " +
-      "(E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1). This is an assertion the dev stack is exclusively yours for " +
-      "this run — the system cannot enforce it, unrelated conversation can enter the provider context, and " +
-      "provider call costs/replay are not hard-capped.",
+      "refusing to run: exclusive access must be asserted by the operator " +
+      "(E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1). This records an assertion only; " +
+      "the system cannot enforce exclusivity, and provider usage/replay are not hard-capped.",
     );
   }
   evidence.exclusivity.acknowledgedByOperator = true;
@@ -801,32 +1099,36 @@ if (args.mode === "recover") {
       fs.mkdirSync(RUNS_DIR, { recursive: true });
       fs.writeFileSync(LAST_MARKER_FILE, `${marker}\n`);
     } catch {
-      // best effort; the ownership trail also exists in the evidence block
+      throw new Error("could not persist the task-owned recovery marker; refusing to send");
+    }
+    if (!(await persistOwnershipRecord("prepared", "recovery marker persisted before synthetic send"))) {
+      throw new Error("could not persist the task-owned recovery record; refusing to send");
     }
     const baseline = {
       messages: evidence.preflight.database.baselineMessages,
       turns: evidence.preflight.database.baselineTurns,
     };
     let journeyError = null;
+    scenarioStartedAt = new Date().toISOString();
     try {
       await startPortForward(podName);
       await journey(gateOrigin, marker);
     } catch (error) {
       if (error?.name === "StopRequested") {
-        journeyError = `graceful stop (${shutdown.signal}): the journey was aborted and the awaited cleanup ran`;
+        journeyError = `graceful stop (${shutdown.signal}): the journey was aborted and retained-state verification ran`;
         log(journeyError);
       } else {
         journeyError = error instanceof Error ? error.message : String(error);
         failures.push(`journey: ${journeyError}`);
       }
     }
-    // From here on, cleanup runs no matter what the journey did: the send
-    // may already have reached the worker and the provider. A stop request
-    // that arrives during cleanup retains data instead of deleting mid-way.
-    await cleanupPhase();
-    await verifyPostState();
+    // From here on, verification runs no matter what the journey did: the
+    // send may already have reached the worker and provider. Normal operation
+    // never invokes the historical deletion path; scenario and learned state
+    // are deliberately retained even when verification reports a failure.
+    await verifyRetainedScenario();
     if (journeyError !== null && !journeyError.startsWith("graceful stop")) {
-      log(`journey failed (cleanup still ran and is verified above): ${journeyError}`);
+      log(`journey failed (scenario retained; post-state verification ran): ${journeyError}`);
     }
   } catch (error) {
     failures.push(`preflight/setup: ${error instanceof Error ? error.message : String(error)}`);
@@ -841,7 +1143,7 @@ if (args.mode === "recover") {
 process.stdout.write(`\n[deployed-smoke] EVIDENCE ${redactText(secrets, JSON.stringify(evidence, null, 2))}\n`);
 
 if (shutdown.requested) {
-  process.stderr.write(`[deployed-smoke] STOPPED (${shutdown.signal}) after awaited cleanup; re-run with --recover if anything was retained\n`);
+  process.stderr.write(`[deployed-smoke] STOPPED (${shutdown.signal}) after retained-state verification; scenario data was not deleted\n`);
 }
 if (failures.length > 0) {
   process.stderr.write(
@@ -852,4 +1154,4 @@ if (failures.length > 0) {
 if (shutdown.requested) {
   process.exit(1);
 }
-log("SMOKE PASSED (send -> persisted reply -> UI/refresh verified; synthetic data cleaned and post-state verified)");
+log("SMOKE PASSED (send -> persisted reply -> UI/refresh verified; synthetic conversation and learned effects intentionally retained)");
