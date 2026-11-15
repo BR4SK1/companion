@@ -41,10 +41,10 @@ cleanup cannot inspect historical `.runs` entries.
 
 An unqualified request to "run E2E" means a **full E2E run**: this disposable
 local stack **plus** deployed non-production validation, which includes the
-[deployed smoke](#deployed-non-production-smoke-explicitly-acknowledged-real-billable-provider)
-and its real, billable provider calls. The command above runs only the local
-Playwright stack: OpenRouter chat/decision calls use a fake provider, while
-synthetic embedding requests use the configured real embedding service. It
+[guarded deployed smoke](#guarded-deployed-non-production-smoke), which may
+invoke external providers and incur charges. The command above runs only the
+local Playwright stack: chat/decision calls use a fake provider, while synthetic
+embedding requests use the configured embedding service. It
 never includes the deployed smoke, which runs only through its own documented
 command. A request explicitly scoped to local-only validation (for example
 "run the local e2e suite") covers exactly this local coverage and nothing
@@ -202,45 +202,27 @@ browser suite does not enable or rewrite prompt-module definitions; behavior of
 the maintained provisioned modules is exercised only through deployed normal
 usage with the existing configuration intact.
 
-## Deployed non-production smoke (explicitly acknowledged; real billable provider)
+## Guarded deployed non-production smoke
 
-`deployed-dev-smoke.mjs` is deliberately separate from everything above: the
-Playwright suite runs against a disposable local stack and a fake provider,
-while this script drives the **actual running non-production deployment**
-through its loopback test-entry gate (`kubectl port-forward` to the pod-local
-gate listener — the gate is never exposed through a Service) and makes **one
-synthetic user message's worth of real, billable OpenRouter calls**.
+`deployed-dev-smoke.mjs` is deliberately separate from the local Playwright
+suite, which uses a disposable stack and fake chat/decision providers. The
+smoke drives the **actual running non-production deployment** through its
+loopback test-entry gate (`kubectl port-forward` to the pod-local gate listener
+— the gate is never exposed through a Service), submits a synthetic message,
+and may invoke configured external providers that incur charges.
 
-- It refuses to run without BOTH `E2E_DEPLOYED_SMOKE_ALLOWED=1` (acknowledges
-  the billable provider call and the non-production database write) and
-  `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` (the operator's explicit
-  acknowledgement that the dev stack is exclusively theirs for this run):
-  running it is always an explicitly acknowledged act. The owner expects
-  this smoke's billable real-provider calls whenever a full E2E run is
-  requested, and an explicitly requested standalone run of this smoke is
-  equally in scope — they validate the live provider configuration before
-  production — so no separate per-run approval is required merely because
-  the calls are billable, and no per-run re-approval is needed where the
-  owner's standing authorization applies (recorded 2026-11-01 in
-  [`../../.opencode/skills/ship-it/SKILL.md`](../../.opencode/skills/ship-it/SKILL.md),
-  covering this smoke's billable non-production provider calls and its
-  non-production database write and resting on the owner's affirmation that
-  the non-production environment and the accounts associated with this
-  project belong to the owner and are not shared). Both variables remain
-  required in every context, and nothing in the script's guards changes
-  with context.
-- Exclusivity is an operator assertion, NOT a system enforcement. The
-  system cannot prevent another user's message from being ingested before or
-  during the run, and the worker's chat request includes the thread's
-  visible history — **unrelated conversation can enter the provider
-  context**, and provider call costs and any replay behavior are NOT
-  hard-capped by the script. The realized request-boundary count depends on
-  enabled response patterns/modules, relationship extraction, memory
-  extraction, and any worker retry; the script reports recorded boundaries and
-  the relationship call inferred from enabled questions. Overlap is detected
-  conservatively: a pre-send state check aborts before anything is sent if
-  the thread changed since preflight, and post-send accounting flags any
-  unexpected message growth.
+- Run the smoke only within an explicitly requested and authorized delivery
+  workflow or on a standalone explicit request. It refuses to run without BOTH
+  `E2E_DEPLOYED_SMOKE_ALLOWED=1` (acknowledges the external provider use and
+  non-production write) and `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` (the
+  operator's assertion of exclusive access for that run). Both variables are
+  required in every context; they are safeguards, not a substitute for
+  authorization.
+- Exclusivity is an operator assertion, not a system enforcement. The script
+  performs a pre-send state check and post-send overlap accounting, but cannot
+  guarantee that no concurrent access occurs. External provider charges and
+  replay behavior depend on deployed configuration and are not hard-capped by
+  the script.
 - Read-only preflight before anything is sent verifies the deployed image,
   the gate's non-production attestation/enablement, a free local forward port,
   scenario linkage, provisioned-configuration fingerprint, thread quiescence,
@@ -329,7 +311,6 @@ pnpm --filter @companion/e2e test:smoke
 - `stack-ops.test.mjs` drives real stacks (throwaway container, worker, web
   build) and is intentionally not part of the hermetic unit suite; like the
   Playwright suite it is local-only and never touches a deployed database.
-- The deployed smoke deliberately adds one synthetic user message and keeps
-  its resulting non-production conversation and normal learned state. The
-  owner has accepted this as test history; no automatic cleanup or broad
-  database reset is part of the routine gate.
+- The deployed smoke deliberately adds synthetic conversation history and
+  retains its resulting conversation and normal learned state. No automatic
+  cleanup or broad database reset is part of the routine gate.

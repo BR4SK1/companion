@@ -1,34 +1,25 @@
 #!/usr/bin/env node
 /**
- * Deployed non-production smoke test — one synthetic message through the
- * REAL deployed dev stack (real billable provider), retaining its conversation
- * and normal learned effects as intentional non-production history.
+ * Deployed non-production smoke test — a synthetic scenario through the
+ * running application, retaining its conversation and normal learned effects
+ * as intentional non-production history.
  *
- * This is deliberately NOT part of the Playwright suite and NOT part of the
- * local fake-provider stack: it drives the actual running non-production
- * deployment through its loopback test-entry gate (kubectl port-forward,
- * pod-local; the gate is never exposed through a Service), and makes exactly
- * one synthetic user message's worth of provider calls against the REAL
- * (billable) OpenRouter. The synthetic conversation, traces, and learned state
- * remain as intentional non-production history.
+ * This is deliberately NOT part of the local Playwright suite: it drives the
+ * actual non-production deployment through its loopback test-entry gate
+ * (kubectl port-forward; the gate is never exposed through a Service). The
+ * scenario may invoke configured external providers that incur charges. The
+ * conversation, traces, and learned state remain as non-production history.
  *
- * Authorization (both required, both explicit — the script refuses without
+ * Required runtime safeguards (both required — the script refuses without
  * them):
- * - `E2E_DEPLOYED_SMOKE_ALLOWED=1` authorizes the billable provider call and
- *   the non-production database write. Running this is never a byproduct of
- *   the ordinary suite.
- * - `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` is the OPERATOR'S explicit
- *   acknowledgement that this dev stack is in exclusively their use for the
- *   duration of the run. This is an assertion, NOT an enforcement: the
- *   system cannot prevent another user's message from being ingested before
- *   or during the run, and the worker's chat request includes the thread's
- *   visible history — so unrelated conversation can enter the provider
- *   context, and provider call costs and any replay behavior are not
- *   hard-capped by this script (the one-call expectation is derived from
- *   deployed configuration, not enforced). Overlap is detected
- *   conservatively: a pre-send state check aborts before anything is sent
- *   if the thread changed since preflight; any later overlap is reported
- *   without deleting any conversation or learned state.
+ * - `E2E_DEPLOYED_SMOKE_ALLOWED=1` acknowledges external provider use and a
+ *   non-production database write. It does not itself grant authorization.
+ * - `E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1` records the operator's
+ *   assertion of exclusive access for this run. This is an assertion, NOT an
+ *   enforcement: the system cannot guarantee exclusivity. Provider usage and
+ *   replay behavior depend on deployed configuration and are not hard-capped.
+ *   Overlap checks fail closed before sending where possible and report later
+ *   anomalies without deleting conversation or learned state.
  *
  * Safety design (fail-closed, stop-before-send, retain intentional history):
  * - Read-only preflight verifies the deployment (images, gate attestation,
@@ -446,7 +437,7 @@ async function stopPortForward() {
 }
 
 // ---------------------------------------------------------------------------
-// The journey: one synthetic message, persisted reply, refresh
+// The journey: a synthetic scenario, persisted reply, and refresh
 //
 // Content hygiene: the DOM is verified with STRUCTURAL locators only
 // (`[data-last-bubble]` marks exactly the newest message's bubble); message
@@ -893,7 +884,7 @@ async function verifyRetainedScenario() {
           enabledQuestions: state.relationshipEnabledQuestions,
           independentlyTraced: false,
         },
-        semanticShadowEmbeddingCalls: "served by the configured embedding endpoint; not OpenRouter calls",
+        semanticShadowEmbeddingCalls: "served by the configured embedding service",
       },
       turn: { id: state.turn?.id ?? null, status: state.turn?.status ?? null },
     };
@@ -1071,8 +1062,8 @@ function readPersistedMarker() {
 
 if (process.env.E2E_DEPLOYED_SMOKE_ALLOWED !== "1") {
   fail(
-    "refusing to run: this smoke makes a real billable provider call against the deployed non-production stack. " +
-    "Set E2E_DEPLOYED_SMOKE_ALLOWED=1 to authorize it explicitly.",
+    "refusing to run: external provider use and a retained non-production write require the guarded smoke. " +
+    "Set E2E_DEPLOYED_SMOKE_ALLOWED=1 to acknowledge these effects; authorization is still required.",
   );
 }
 const args = parseArgs(process.argv.slice(2));
@@ -1090,10 +1081,9 @@ if (args.mode === "recover") {
 } else {
   if (process.env.E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS !== "1") {
     fail(
-      "refusing to run: exclusive dev access must be acknowledged by the operator " +
-      "(E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1). This is an assertion the dev stack is exclusively yours for " +
-      "this run — the system cannot enforce it, unrelated conversation can enter the provider context, and " +
-      "provider call costs/replay are not hard-capped.",
+      "refusing to run: exclusive access must be asserted by the operator " +
+      "(E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1). This records an assertion only; " +
+      "the system cannot enforce exclusivity, and provider usage/replay are not hard-capped.",
     );
   }
   evidence.exclusivity.acknowledgedByOperator = true;

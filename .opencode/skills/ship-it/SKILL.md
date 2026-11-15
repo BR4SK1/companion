@@ -1,6 +1,6 @@
 ---
 name: ship-it
-description: Use when the user says "ship it" (or "ship this") — treat it as authorization to finish and publish only the current work as a pull request, including this repository's full delivery sequence up to that point: local verification gates, deploying the committed candidate to non-production, and integration/end-to-end testing — including the standing-authorized deployed non-production smoke — before the PR is created. Covers scope protection, check gates, branch/commit conventions, the manual non-production deployment, PR creation, and when to stop and ask instead of shipping. It does not authorize production deployment, merges, promotion, or unrelated changes.
+description: Use when the user says "ship it" (or "ship this") — treat it as authorization to finish and publish only the current work as a pull request, including this repository's full delivery sequence up to that point: local verification gates, deploying the committed candidate to non-production, and integration/end-to-end testing — including the guarded deployed non-production smoke — before the PR is created. Covers scope protection, check gates, branch/commit conventions, the manual non-production deployment, PR creation, and when to stop and ask instead of shipping. It does not authorize production deployment, merges, promotion, or unrelated changes.
 ---
 
 # Ship It
@@ -9,9 +9,11 @@ description: Use when the user says "ship it" (or "ship this") — treat it as a
 non-production environment, verify it there end to end, and publish it as a
 pull request. The authorization covers the current work and its publication
 path only — never merging, production deployment or promotion, or any
-unrelated change. The owner's standing authorization (recorded 2026-11-01)
-covers the deployed smoke's billable non-production provider calls within
-this flow; production stays out of scope. This repository has no remote CI
+unrelated change. The guarded deployed smoke may incur external provider
+charges and intentionally retains its synthetic non-production history; run it
+only when the requested workflow authorizes those effects. The script's flags
+are required safeguards, not a substitute for authorization. Production stays
+out of scope. This repository has no remote CI
 and no deployment automation: every check and the non-production install
 itself are performed locally (see `CONTRIBUTING.md` and `deploy/README.md`),
 nothing runs automatically on push, and a merge does not deploy. If anything
@@ -180,32 +182,26 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
      tear it down when testing ends. At minimum verify the gate's
      unauthenticated → issuance → app flow and read-only thread access
      against the deployed release. Sending through the gate is real
-     conversation work and can incur provider charges; the owner's standing
-     authorization (2026-11-01) covers this flow's billable non-production
-     sends, and automated sends belong to the deployed smoke below, whose
-     attribution and cleanup machinery ad-hoc sends should not improvise
-     around. If the deployed release has the gate disabled, or the forward
+     conversation work and may incur provider charges; use the documented
+     guarded smoke for automated sends rather than improvising attribution or
+     cleanup. If the deployed release has the gate disabled, or the forward
      is blocked, stop and ask instead of improvising access.
-   - **The deployed smoke — a normal pre-PR gate under standing owner
-     authorization.** Run it whenever this flow deployed a candidate (it
-     inherits step 6's applicability rule):
+   - **The guarded deployed smoke.** Run it whenever this flow deployed a
+     candidate (it inherits step 6's applicability rule), provided the
+     requested workflow authorizes its external provider calls and retained
+     non-production write:
      `E2E_DEPLOYED_SMOKE_ALLOWED=1 E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1
      node tests/e2e/deployed-dev-smoke.mjs` (from the repository root). It
      drives the actual deployed candidate through its loopback test-entry
-     gate (the script performs its own port-forward) and sends one synthetic
-     message — real, billable provider calls and a non-production database
-     write. Its conversation, traces, and normal learned effects are
-     intentionally retained as non-production history; only task-local files
-     and the port-forward are cleaned up.
-     The owner's standing authorization (recorded 2026-11-01) covers these
-     billable non-production provider calls within this flow, and the owner
-     has affirmed that the non-production environment and all accounts
-     associated with this project belong to the owner and are not shared
-     with anyone else; setting both variables here expresses that standing
-     authorization. The script's own guards remain fully in force — it
-     refuses to run without both variables, and exclusivity is still the
-     owner's assertion, not a system guarantee: nothing prevents another
-     process or person from reaching the dev stack concurrently, so never
+     gate (the script performs its own port-forward) and submits a synthetic
+     message. The flow may invoke configured external providers and incur
+     charges, and it writes to the non-production database. Its conversation,
+     traces, and normal learned effects are intentionally retained as
+     non-production history; only task-local files and the port-forward are
+     cleaned up. The script's own guards remain fully in force — it refuses
+     to run without both variables, and exclusivity is the operator's
+     assertion, not a system guarantee: nothing prevents another process or
+     person from reaching the environment concurrently, so never
      claim concurrent access is impossible. Read-only preflight verifies the
      deployed image identity, gate attestation and enablement, a free forward
      port, scenario linkage, provisioned-configuration fingerprint, thread
@@ -221,8 +217,8 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
      failure with evidence retained; expected intentional retention is a pass.
      Never route around a guard. The legacy `--recover` cleanup is explicit-
      only for interrupted or selected historical markers and never runs
-     automatically. The one-call cost expectation derives from deployed
-     configuration and is not hard-capped by the script.
+     automatically. Provider calls and retries depend on deployed configuration;
+     the script does not impose a hard cap on external-provider charges.
 8. **Run the pre-publication safety checks.** After verification and before
    pushing, re-review exactly what would be published: the outgoing diff
    against the intended base, and the checklist in
@@ -267,16 +263,12 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
   changes, new features, or fixes to unrelated issues — file or mention those
   instead of doing them here. Production approval is the owner's merge, and a
   merge deploys nothing: there is no deployment trigger or controller.
-- The deployed smoke runs under the owner's standing authorization recorded
-  in this skill (2026-11-01): within this flow, its billable non-production
-  provider calls and its non-production database write are authorized, and
-  the owner has affirmed that the non-production environment and all
-  accounts associated with this project belong to the owner and are not
-  shared with anyone else. Exclusivity remains an operator assertion, not a
-  system guarantee; do not assert that the system prevents concurrent access
-  to the dev stack. This standing authorization does not extend to
-  production: no production deployment, production provider calls, or
-  production writes.
+- Run the deployed smoke only when the current task explicitly authorizes its
+  external provider calls and retained non-production write. Its required guard
+  variables do not replace authorization. Exclusivity remains an operator
+  assertion, not a system guarantee; do not claim that the system prevents
+  concurrent access. No production deployment, provider calls, or writes are
+  authorized by this workflow.
 - No permission bypass: if a step requires access, approval, or a decision you
   do not have, stop and return the blocker to the user (or the coordinating
   primary agent, if delegated). Do not resolve it by assumption.
