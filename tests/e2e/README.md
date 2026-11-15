@@ -234,57 +234,67 @@ synthetic user message's worth of real, billable OpenRouter calls**.
   during the run, and the worker's chat request includes the thread's
   visible history — **unrelated conversation can enter the provider
   context**, and provider call costs and any replay behavior are NOT
-  hard-capped by the script (the one-call expectation is derived from
-  deployed configuration: with zero enabled patterns the decision call is
-  skipped, so one message means one chat call). Overlap is detected
+  hard-capped by the script. The realized request-boundary count depends on
+  enabled response patterns/modules, relationship extraction, memory
+  extraction, and any worker retry; the script reports recorded boundaries and
+  the relationship call inferred from enabled questions. Overlap is detected
   conservatively: a pre-send state check aborts before anything is sent if
   the thread changed since preflight, and post-send accounting flags any
   unexpected message growth.
-- Read-only preflight before anything is sent, any doubt stops the run:
-  deployed image identity, the gate's `companion-np` non-production
-  attestation shape, gate enablement, a free local forward port, the
-  database's cleanup linkage (unique `client_key` index, one reply per turn),
-  thread quiescence (no queued user message, no in-flight turn), and zero
-  leftover `e2e-deployed-smoke-` rows.
-- Attribution and cleanup are exact and race-safe: the synthetic message's
-  unique marker content identifies the row (the web BFF assigns its own
-  opaque client_key, so attribution is by exact content equality). A still-
-  queued message is removed by a single atomic guarded delete
-  (`… AND turn_id IS NULL`) that can never delete a row the worker has
-  claimed or is claiming — if it affects no row the run re-probes and
-  decides again. A settled exclusive turn (reply, message, turn) is removed
-  in one transaction that locks the turn row `FOR UPDATE` and re-verifies
-  composition and status inside the transaction (a mismatch rolls back and
-  retains). A turn shared with unrelated traffic leaves everything but this
-  run's own message row (turn-scoped, id- and content-guarded), reported as
-  a residual. Any uncertain state — unreadable turn row, in-flight turn past
-  the bounded wait, shutdown during a wait, failed transaction verification —
-  RETAINS everything and reports. There is no broad database reset anywhere.
+- Read-only preflight before anything is sent verifies the deployed image,
+  the gate's non-production attestation/enablement, a free local forward port,
+  scenario linkage, provisioned-configuration fingerprint, thread quiescence,
+  and no unsettled prior smoke marker. Completed intentionally retained runs
+  are allowed; each new exact marker is checked before send. Memory ingest/recall and an embedding
+  endpoint must be configured with bounded convergence. Enabled relationship
+  questions, cursor initialization/catch-up, and runnable consolidation or
+  promotion are normal behavior, not readiness failures.
+- The synthetic marker is the user message content (the web BFF assigns its
+  own opaque `client_key`). The smoke verifies the linked completed turn,
+  persisted reply, refresh behavior, turn trace and provider request
+  boundaries, memory extraction/cache, semantic-shadow comparison metadata,
+  and chat-context chunk labels. Semantic-shadow query/candidate content is
+  never emitted or injected into the response context. The smoke does not
+  delete the conversation, traces, learned memory, relationship answers,
+  cursor/counters, or normal shared derived-state changes: this run is
+  intentional non-production history.
+- Configuration fingerprints are checked before send, after the reply, and
+  after background convergence. They cover provisioned identity, prompts,
+  modules, settings, and environment values without outputting their content;
+  learned conversation and derived state are intentionally outside that
+  invariant. Relationship-answer rows have no turn-level provenance in this
+  schema, so their aggregate count/update window is reported without claiming
+  exact row-to-turn attribution.
+- Thread quiescence and pre-send checks detect observed overlap but cannot
+  guarantee exclusivity. Unexpected overlap, failed turns, missing association,
+  failed semantic-shadow comparisons, configuration drift, or non-converged
+  background work remain failures with all generated data retained. Bounded
+  convergence waits stop after the configured timeout; they do not block
+  forever. Provider costs/replay are not hard-capped by the script.
 - Evidence is bounded and content-free: ids, seqs, counts, statuses, attempt
-  counts, timings, and a marker fingerprint — never message content (ours
-  or anyone else's), never the marker itself, never secrets (the database
-  credentials stay inside the worker pod's environment; cleanup runs there
-  via `kubectl exec` with parameterized queries only). All errors are
-  sanitized (step label + error kind + first line only, secrets redacted):
-  Playwright timeout errors would otherwise embed matched text and page
-  snapshots, so content-based locators are never used on the deployed UI —
-  DOM checks are structural (`[data-last-bubble]`) with Node-side
-  comparisons.
-- Signals: SIGINT/SIGTERM abort the journey gracefully and the awaited
-  cleanup still runs before the process exits non-zero; a second signal
-  exits immediately. SIGKILL cannot be handled — the ownership marker
-  persisted before the send (`.runs/deployed-smoke-last-marker.txt`) is the
-  recovery trail, and a failed/retained cleanup also writes an ownership
-  record (`.runs/deployed-smoke-ownership-<fingerprint>.json`).
-- Recovery is idempotent and verified, with no browser, no provider calls,
-  and no port-forward: an already-cleaned marker verifies as
-  nothing-to-clean. Cleanup and post-state verification run even when the
-  browser journey fails.
+  counts, timings, outcomes, and a marker fingerprint — never message or
+  relationship-answer content, the marker itself, or secrets (database
+  credentials stay inside the worker pod's environment). All errors are
+  sanitized (step label + error kind + first line only, secrets redacted).
+  The deployed UI is checked structurally (`[data-last-bubble]`) with
+  Node-side comparisons so matched text and page snapshots never enter errors.
+- SIGINT/SIGTERM abort the journey gracefully and retained-state verification
+  runs before the process exits non-zero; a second signal exits immediately.
+  SIGKILL cannot be handled — the ownership marker persisted before send
+  (`$E2E_RUNS_DIR/deployed-smoke-last-marker.txt`) is the recovery trail.
+- Legacy `--recover` is explicit-only for an interrupted or selected
+  historical marker. It may use the old narrow cleanup flow, but refuses a
+  record tagged `intentional-retention`; the ordinary smoke never invokes
+  recovery or any delete action. The local ownership
+  record and marker live under the task's unique `E2E_RUNS_DIR`; clean that
+  local task directory after retaining any needed evidence.
+
 
 Run (both variables required in every context — see the authorization note
 above):
 
 ```sh
+E2E_RUNS_DIR="$(mktemp -d)" \
 E2E_DEPLOYED_SMOKE_ALLOWED=1 E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1 \
   pnpm --filter @companion/e2e test:deployed-smoke
 ```
@@ -292,9 +302,11 @@ E2E_DEPLOYED_SMOKE_ALLOWED=1 E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS=1 \
 Recover an interrupted run's synthetic data (idempotent):
 
 ```sh
-E2E_DEPLOYED_SMOKE_ALLOWED=1 pnpm --filter @companion/e2e test:deployed-smoke -- --recover
+E2E_RUNS_DIR="<the-original-task-runs-directory>" E2E_DEPLOYED_SMOKE_ALLOWED=1 \
+  pnpm --filter @companion/e2e test:deployed-smoke -- --recover
 # or with an explicit marker (or a path to a marker/ownership file):
-E2E_DEPLOYED_SMOKE_ALLOWED=1 pnpm --filter @companion/e2e test:deployed-smoke -- --recover <marker>
+E2E_RUNS_DIR="<the-original-task-runs-directory>" E2E_DEPLOYED_SMOKE_ALLOWED=1 \
+  pnpm --filter @companion/e2e test:deployed-smoke -- --recover <marker>
 ```
 
 Regression tests for this smoke's core (decision state machine, output
@@ -307,18 +319,17 @@ pnpm --filter @companion/e2e test:smoke
 
 ## Limits and open questions
 
-- The suite exercises locally built source (the current working tree's
-  production build), not deployed immutable artifacts; binding results to an
-  exact deployed candidate remains an open deployment question.
-- End-to-end tests against a real deployed non-production candidate (through
-  `kubectl port-forward` to the loopback gate) are not automated here; the
-  same suite structure is intended to be reusable there.
+- The local suite exercises the committed candidate's locally built source,
+  not deployed immutable artifacts, and its fixture identity/settings are not
+  evidence about the maintained non-production personality. Deployed gate and
+  smoke checks separately verify the exact deployed candidate through normal
+  usage with the existing provisioned configuration.
 - Failed turns are terminal in this slice; retry policy, provider
   fallback behavior, and session-expiry journeys are not covered.
 - `stack-ops.test.mjs` drives real stacks (throwaway container, worker, web
   build) and is intentionally not part of the hermetic unit suite; like the
   Playwright suite it is local-only and never touches a deployed database.
-- The deployed-dev smoke's cleanup deletes its own rows, which leaves
-  permanent `seq` gaps in the dev thread; the client's gap handling treats
-  those like burned seqs (bounded probing, never a missed message) by
-  design, and dev conversations are disposable.
+- The deployed smoke deliberately adds one synthetic user message and keeps
+  its resulting non-production conversation and normal learned state. The
+  owner has accepted this as test history; no automatic cleanup or broad
+  database reset is part of the routine gate.

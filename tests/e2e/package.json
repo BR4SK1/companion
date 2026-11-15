@@ -2,7 +2,7 @@
   "name": "@companion/e2e",
   "version": "0.0.0",
   "private": true,
-  "description": "Playwright end-to-end suite for the Companion web/BFF/worker slice. Runs only against a disposable, run-owned local test stack with a throwaway pgvector-ready PostgreSQL, a local fake chat/decision provider, and a configured real embedding service; never against a real application database or live chat/decision provider."
+  "description": "Playwright end-to-end suite for the Companion web/BFF/worker slice. Runs only against a disposable, run-owned local test stack with a throwaway pgvector-ready PostgreSQL, a local fake chat/decision provider, and a configured real embedding service; never against a real application database or live chat/decision provider.",
   "type": "module",
   "scripts": {
     "test": "node ./check-node-version.mjs && playwright test",

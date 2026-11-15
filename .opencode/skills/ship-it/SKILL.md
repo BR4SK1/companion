@@ -149,59 +149,29 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
    repository's sequence places integration and E2E after the non-production
    deployment; they run against the identified candidate before publication
    (`deploy/helm/environments/non-production/README.md`).
-   - **Worker integration suites** — when the worker, shared libraries, or
-     database schema changed, run `tests/integration` after the exact
-     candidate is deployed. These suites destructively clear/recreate schema
-     and synthetic configuration; under this ship-it workflow they use the
-     non-production application database via `WORKER_TEST_DATABASE_URL`, not
-     a separate throwaway database. This is an explicit non-production-only
-     exception; never use production credentials or target production.
-     Before any destructive statement, complete a read-only preflight:
-     positively verify the deployed release, candidate commit/tree/image, and
-     target server/database/role against the approved non-production-only
-     configuration; establish production separation from approved private
-     environment metadata without connecting to production; confirm required
-     database access/privileges and the candidate's full migration runner
-     route; and locate a complete owner-approved private restoration source
-     for every provisioned non-production runtime configuration. If the
-     identity, separation, route, privileges, or complete restoration source
-     cannot be established, stop before destruction.
-   - Serialize the maintenance window. Stop the non-production web and worker
-     deployments and every other consumer of the target database; prevent new
-     consumers from connecting and verify that no unidentified database
-     sessions remain. Run each integration suite in its own `node --test`
-     invocation, serially, with `WORKER_TEST_DATABASE_URL` sourced only from
-     the verified non-production credentials. Do not run recall evaluation or
-     any other tool as a substitute for these suites. Keep secrets and
-     configuration values out of command output and logs.
-   - After the suites, do not merely restart the worker: fully reconstruct a
-     clean schema using the deployed candidate's complete ordered migration
-     composition, restore all required non-production runtime configuration
-     from the approved private source, and verify the migration ledger and
-     configuration completeness without exposing values. Then restart/enable
-     and verify the same candidate (no image or source substitution), with
-     the expected deployments ready and no synthetic integration data left.
-     Any task-scoped private configuration capture must be securely handled
-     and removed after verified restoration; do not retain snapshots as
-     routine recovery aids. Only after this reconstruction and verification
-     may the deployed loopback gate and deployed smoke run.
-     If restoration cannot be completed and verified, keep non-production
-     consumers stopped and report the blocker; do not proceed to the gate,
-     smoke, push, or PR.
+   - **Focused database integration** — use a positively verified disposable
+     database (with pgvector enabled when the check requires it) for relevant
+     changed persistence behavior. Legacy suites may truncate domain tables,
+     synthesize runtime configuration, exercise destructive migration paths,
+     or inject failures; these remain explicit isolated-test tools, not
+     automatic publication gates. Never target any application database,
+     including non-production, with those suites. Do not stop deployed
+     consumers, reset schema/ledger, capture or restore runtime configuration,
+     or invoke the retired destructive ship-it procedure. If an appropriate
+     disposable fixture or extension is unavailable, report that gap instead
+     of substituting an application database.
    - **Disposable-stack Playwright suite** — the implemented E2E coverage
-     (`tests/e2e/README.md`). It exercises the committed candidate's
-     production build (per the candidate-source rule in step 5) against a
-     local fake provider and a run-owned throwaway PostgreSQL: no live model
-     calls, no real application database, run-owned cleanup. Prerequisites:
-     `pnpm install`, the pinned Playwright browser
-     (`pnpm exec playwright install chromium` from `tests/e2e`),
-     `pnpm --filter @companion/web build`, Docker, and free loopback ports
-     (defaults 4620–4624). Run `pnpm --filter @companion/e2e test` (or
-     `pnpm exec playwright test` from `tests/e2e`). When the E2E tooling
-     itself changed, also run its own suites: `pnpm --filter @companion/e2e
-     test:stack` and, for the deployed-smoke core, `pnpm --filter
-     @companion/e2e test:smoke`. Note the documented limit: the suite
-     exercises locally built source, not the deployed immutable artifacts.
+     (`tests/e2e/README.md`) exercises the committed candidate's local
+     production build against its run-owned throwaway PostgreSQL, fake
+     OpenRouter chat/decision provider, and configured real embedding service
+     using synthetic inputs. Set `E2E_RUNS_DIR` to a new unique task-owned
+     directory outside the historical `tests/e2e/.runs` tree for every
+     harness invocation; startup and cleanup must never inspect that shared
+     history. This stack uses a synthetic fixture identity and does not verify
+     the maintained personality. Prompt-module include/skip details are
+     covered by hermetic worker tests; do not enable generic modules as an E2E
+     configuration rewrite. Run local E2E and only the isolated tooling checks
+     needed to verify changed harness behavior.
    - **The deployed candidate through the loopback test-entry gate** — the
      documented E2E access to a non-production release (`apps/web/README.md`,
      `deploy/helm/environments/non-production/README.md`): `kubectl
@@ -224,7 +194,9 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
      drives the actual deployed candidate through its loopback test-entry
      gate (the script performs its own port-forward) and sends one synthetic
      message — real, billable provider calls and a non-production database
-     write — then removes its own data with race-safe, targeted cleanup.
+     write. Its conversation, traces, and normal learned effects are
+     intentionally retained as non-production history; only task-local files
+     and the port-forward are cleaned up.
      The owner's standing authorization (recorded 2026-11-01) covers these
      billable non-production provider calls within this flow, and the owner
      has affirmed that the non-production environment and all accounts
@@ -234,22 +206,23 @@ the user. Never fabricate success, bypass a gate, or assume an exception.
      refuses to run without both variables, and exclusivity is still the
      owner's assertion, not a system guarantee: nothing prevents another
      process or person from reaching the dev stack concurrently, so never
-     claim concurrent access is impossible. The script detects overlap
-     conservatively and stays in control throughout: read-only preflight
-     stops before anything is sent on any doubt (deployed image identity,
-     gate attestation and enablement, a free forward port, cleanup linkage,
-     thread quiescence, no leftover smoke rows); a pre-send state check
-     aborts before any provider call if the thread changed since preflight;
-     post-send accounting flags unexpected growth, retains everything, and
-     reports it — including when the owner themselves is actively using the
-     dev thread, where the quiescence checks legitimately refuse. If the
-     script refuses, aborts, or reports overlap, anomalies, or retained
-     data, stop and report its evidence; never route around a guard. If a
-     run is interrupted, recover idempotently with the script's `--recover`
-     path (`E2E_DEPLOYED_SMOKE_ALLOWED=1 node
-     tests/e2e/deployed-dev-smoke.mjs --recover`). The one-call cost
-     expectation derives from deployed configuration and is not hard-capped
-     by the script.
+     claim concurrent access is impossible. Read-only preflight verifies the
+     deployed image identity, gate attestation and enablement, a free forward
+     port, scenario linkage, provisioned-configuration fingerprint, thread
+     quiescence, and no unsettled prior smoke rows. Completed intentionally
+     retained history is allowed, with a unique-marker check before each send.
+     Relationship questions, cursor initialization, and runnable consolidation
+     are normal behavior, not
+     preflight failures. A pre-send check aborts if the thread or provisioned
+     configuration changed since preflight. Post-send verification checks the
+     retained conversation, turn association, provider boundaries,
+     semantic-shadow evidence, learned-state metadata, and configuration
+     invariance. Unexpected overlap or a true scenario failure remains a
+     failure with evidence retained; expected intentional retention is a pass.
+     Never route around a guard. The legacy `--recover` cleanup is explicit-
+     only for interrupted or selected historical markers and never runs
+     automatically. The one-call cost expectation derives from deployed
+     configuration and is not hard-capped by the script.
 8. **Run the pre-publication safety checks.** After verification and before
    pushing, re-review exactly what would be published: the outgoing diff
    against the intended base, and the checklist in

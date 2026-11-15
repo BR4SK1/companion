@@ -82,54 +82,43 @@ create a Service, Ingress, or other route for the test port, and never
 enable the gate in production values (see
 [`production/README.md`](production/README.md)).
 
-## Destructive integration maintenance against the application database
+## Database integration safety
 
-The worker integration suites are a post-deployment ship-it gate. Unlike the
-local Playwright stack, they use the non-production application's own database
-through `WORKER_TEST_DATABASE_URL`; they destructively clear/recreate schema
-and synthetic configuration. This is authorized only for this non-production
-workflow. Outside that exact workflow, use only a separately verified
-disposable isolated database or leave the suites skipped; never point them at
-an application database. Do not use production credentials, connect to
-production, or point the test variable at any other target.
+Database-backed suites that truncate domain data, synthesize runtime
+configuration, exercise destructive migration paths, or inject failures are
+explicit isolated-test tools, not routine ship-it gates. `WORKER_TEST_DATABASE_URL`
+may point only to a positively verified disposable database dedicated to the
+run. Never target an application database, including this non-production
+database, with those suites. Do not stop deployed consumers, reset a schema or
+migration ledger, or capture/restore provisioned configuration to satisfy a
+test. Where relevant, validate changed persistence behavior on a disposable
+fixture with required extensions already available; migrations do not provision
+extensions.
 
-Before the first destructive statement, use read-only checks to positively
-verify the exact deployed candidate and the target server/database/role against
-the approved non-production-only configuration. Prove production separation
-from approved private environment metadata without connecting to production.
-Confirm the database access/privileges and the candidate's complete migration
-runner route. Locate a complete owner-approved private restoration source for
-every required non-production runtime configuration. If any identity, access,
-route, separation, or restoration prerequisite is missing or ambiguous, stop
-before destruction.
+The deployment candidate receives its ordinary forward migrations on startup.
+Candidate checks then use normal application flows against the identified
+non-production release and its already-provisioned identity, settings, memory,
+and prompt-module configuration. Do not reseed or replace that configuration.
+Check its invariance with approved metadata/fingerprints that do not expose
+content. The routine deployed smoke uses uniquely attributable synthetic input
+and intentionally retains its conversation, traces, and normal learned effects
+as non-production history. Do not rewind cursors/counters or delete canonical,
+shared, or otherwise ambiguous state. Legacy cleanup is explicit-only for
+selected historical markers; it is not a routine gate and must never run
+automatically. Preserve baseline memories. Stop if ownership, configuration
+invariance, extension capability, or candidate isolation cannot be established.
 
-Serialize a maintenance window for the non-production database: stop the web
-and worker deployments and every other consumer, prevent new connections, and
-verify that no unidentified database sessions remain. Run each integration
-suite in its own `node --test` invocation, one at a time, using only the
-verified non-production credentials. Keep connection strings and configuration
-values out of output and logs. The E2E suite remains separate and uses only its
-run-owned throwaway local PostgreSQL and fake provider.
-
-After integration, reconstruct a clean schema using the deployed candidate's
-full ordered migration composition, restore all required non-production
-runtime configuration from the approved private source, and verify the
-migration ledger and configuration completeness without exposing values. A
-worker restart alone does not restore state. Restart and verify the same
-candidate, confirm no synthetic integration data remains, and only then run the
-deployed loopback gate and smoke. If reconstruction fails, keep non-production
-consumers stopped and stop the ship workflow; do not continue to the gate,
-smoke, push, or PR. Any task-scoped private configuration capture must be
-safely handled and removed after verified restoration, not retained as a
-routine snapshot. This workflow does not provision or operate the external
-PostgreSQL service and does not apply to recall evaluation or other tools.
+Local E2E and deployed-smoke records must use a new, unique, task-owned
+`E2E_RUNS_DIR` outside the historical `tests/e2e/.runs` tree. The local browser
+stack uses a synthetic fixture identity, a fake OpenRouter chat/decision
+provider, a real configured embedding service, and a run-owned disposable
+PostgreSQL. It is not evidence about the maintained personality. Deployed checks
+through the loopback gate use the existing provisioned configuration. Keep the
+forward bound to workstation loopback and remove only task-owned resources.
 
 ## Open items
 
-- Provisioning the dedicated non-production PostgreSQL database/role and its
-  access rules is an external, owner-owned prerequisite (this repository does
-  not provision PostgreSQL).
-- Candidate identification/serialization and a complete private
-  non-production configuration restoration source remain hard prerequisites
-  for destructive integration maintenance; stop when either is unavailable.
-  The runner-free trigger/controller remains unresolved.
+- PostgreSQL remains an external service and is not provisioned or operated by
+  this repository. Candidate identification/serialization remains required so
+  normal-use checks cannot silently switch versions. The runner-free
+  trigger/controller remains unresolved.
