@@ -134,16 +134,19 @@ export async function applyIngestStateUpdate(
 
   const assignments: string[] = [];
   if (watermarkEnd !== undefined) {
-    // Monotonic guard: an older pass's watermark never overwrites a newer
-    // one (tuple comparison on end_at, then turn id as the tiebreaker).
+    // Resolve the authoritative timestamp in PostgreSQL. node-postgres parses
+    // timestamptz into millisecond-precision Date values, while PostgreSQL
+    // stores microseconds; writing the Date back can leave the persisted
+    // cursor fractionally behind the source turn forever.
+    const advancesWatermark = `memory_ingest_state.watermark_end_at IS NULL
+       OR memory_ingest_state.watermark_turn_id IS NULL
+       OR (memory_ingest_state.watermark_end_at, memory_ingest_state.watermark_turn_id)
+          < (watermark_candidate.end_at, $${watermarkEnd + 1}::uuid)`;
     assignments.push(
-      `watermark_end_at = GREATEST(COALESCE(memory_ingest_state.watermark_end_at, '-infinity'::timestamptz), $${watermarkEnd}::timestamptz)`,
-      `watermark_turn_id = CASE
-         WHEN memory_ingest_state.watermark_end_at IS NULL
-           OR memory_ingest_state.watermark_end_at < $${watermarkEnd}::timestamptz
-         THEN $${watermarkEnd + 1}::uuid
-         WHEN memory_ingest_state.watermark_end_at = $${watermarkEnd}::timestamptz
-              AND memory_ingest_state.watermark_turn_id < $${watermarkEnd + 1}::uuid
+      `watermark_end_at = CASE WHEN ${advancesWatermark}
+         THEN watermark_candidate.end_at
+         ELSE memory_ingest_state.watermark_end_at END`,
+      `watermark_turn_id = CASE WHEN ${advancesWatermark}
          THEN $${watermarkEnd + 1}::uuid
          ELSE memory_ingest_state.watermark_turn_id END`,
     );
@@ -166,8 +169,17 @@ export async function applyIngestStateUpdate(
   }
   if (assignments.length === 0) return;
   assignments.push("updated_at = now()");
+  const watermarkCandidate = watermarkEnd === undefined
+    ? ""
+    : `WITH watermark_candidate AS (
+         SELECT COALESCE(
+           (SELECT max(created_at) FROM conversation_message WHERE turn_id = $${watermarkEnd + 1}::uuid),
+           $${watermarkEnd}::timestamptz
+         ) AS end_at
+       ) `;
+  const watermarkFrom = watermarkEnd === undefined ? "" : " FROM watermark_candidate";
   await executor.query(
-    `UPDATE memory_ingest_state SET ${assignments.join(", ")} WHERE id = true`,
+    `${watermarkCandidate}UPDATE memory_ingest_state SET ${assignments.join(", ")}${watermarkFrom} WHERE id = true`,
     values,
   );
 }
