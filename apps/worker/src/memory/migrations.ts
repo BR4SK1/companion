@@ -548,9 +548,120 @@ CREATE TABLE memory_operation (
 CREATE INDEX memory_operation_kind_idx ON memory_operation (kind, started_at);
 `;
 
+const MEMORY_SEMANTIC_SHADOW = `
+-- pgvector is provided and enabled by the database owner; migrations never
+-- install extensions. This table stores derived vectors plus source references.
+CREATE TABLE memory_semantic_embedding (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  fact_id uuid REFERENCES memory_fact (id) ON DELETE CASCADE,
+  canonical_observation_id text REFERENCES memory_canonical_observation (canonical_observation_id) ON DELETE CASCADE,
+  source_content_hash text NOT NULL,
+  source_updated_at timestamptz NOT NULL,
+  input_version text NOT NULL,
+  model text NOT NULL,
+  model_revision text NOT NULL,
+  model_code_revision text NOT NULL,
+  embedding vector(768),
+  attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  retry_after timestamptz,
+  last_error_category text,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK ((fact_id IS NOT NULL) <> (canonical_observation_id IS NOT NULL)),
+  CHECK (embedding IS NOT NULL OR last_error_category IS NOT NULL)
+);
+CREATE UNIQUE INDEX memory_semantic_embedding_fact_idx
+  ON memory_semantic_embedding (fact_id) WHERE fact_id IS NOT NULL;
+CREATE UNIQUE INDEX memory_semantic_embedding_observation_idx
+  ON memory_semantic_embedding (canonical_observation_id) WHERE canonical_observation_id IS NOT NULL;
+
+-- Metadata-only shadow comparison. Candidate ids are foreign-keyed to current
+-- source records; no claim, query, or generated text is copied here.
+CREATE TABLE memory_semantic_shadow_attempt (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  turn_id uuid,
+  turn_attempt integer CHECK (turn_attempt IS NULL OR turn_attempt >= 1),
+  recall_operation_id uuid REFERENCES memory_operation (id) ON DELETE SET NULL,
+  source text NOT NULL CHECK (source IN ('chat', 'api')),
+  outcome text NOT NULL CHECK (outcome IN ('ok', 'failed', 'skipped')),
+  error_category text,
+  skip_reason text CHECK (skip_reason IS NULL OR skip_reason = 'non_comparable_baseline'),
+  retrieval_mode text NOT NULL CHECK (retrieval_mode IN ('keyword', 'hybrid', 'timeline')),
+  reference_time timestamptz NOT NULL,
+  time_range_start timestamptz,
+  time_range_end timestamptz,
+  query_fingerprint char(64) NOT NULL,
+  input_version text NOT NULL,
+  ranking_strategy_version text NOT NULL,
+  model text NOT NULL,
+  model_revision text NOT NULL,
+  model_code_revision text NOT NULL,
+  baseline_candidate_count integer NOT NULL CHECK (baseline_candidate_count >= 0),
+  semantic_only_candidate_count integer NOT NULL CHECK (semantic_only_candidate_count >= 0),
+  result_limit integer NOT NULL CHECK (result_limit >= 1),
+  max_chars integer NOT NULL CHECK (max_chars >= 500),
+  started_at timestamptz NOT NULL,
+  finished_at timestamptz NOT NULL,
+  CHECK ((turn_id IS NULL) = (turn_attempt IS NULL)),
+  CHECK ((time_range_start IS NULL) = (time_range_end IS NULL)),
+  CHECK (time_range_start IS NULL OR time_range_start < time_range_end),
+  CHECK ((outcome = 'skipped') = (skip_reason IS NOT NULL)),
+  CHECK (skip_reason IS NULL OR error_category IS NULL),
+  FOREIGN KEY (turn_id, turn_attempt)
+    REFERENCES trace_attempt (turn_id, attempt) ON DELETE SET NULL
+);
+CREATE INDEX memory_semantic_shadow_attempt_time_idx
+  ON memory_semantic_shadow_attempt (started_at DESC);
+
+CREATE TABLE memory_semantic_shadow_candidate (
+  attempt_id uuid NOT NULL REFERENCES memory_semantic_shadow_attempt (id) ON DELETE CASCADE,
+  arm text NOT NULL CHECK (arm IN ('baseline', 'semantic_rerank', 'hybrid')),
+  source_kind text NOT NULL CHECK (source_kind IN ('fact', 'observation')),
+  source_id text NOT NULL,
+  fact_key text REFERENCES memory_fact (fact_key) ON DELETE CASCADE,
+  canonical_observation_id text REFERENCES memory_canonical_observation (canonical_observation_id) ON DELETE CASCADE,
+  candidate_origin text NOT NULL CHECK (candidate_origin IN ('keyword', 'temporal_keyword', 'recency', 'semantic_only')),
+  baseline_rank integer,
+  semantic_rank integer,
+  similarity real CHECK (similarity IS NULL OR (similarity >= -1 AND similarity <= 1)),
+  arm_rank integer,
+  budget_included boolean NOT NULL,
+  result_rank integer,
+  CHECK ((source_kind = 'fact' AND fact_key IS NOT NULL AND canonical_observation_id IS NULL AND source_id = fact_key) OR
+         (source_kind = 'observation' AND canonical_observation_id IS NOT NULL AND fact_key IS NULL AND source_id = canonical_observation_id)),
+  PRIMARY KEY (attempt_id, arm, source_kind, source_id),
+  CHECK (baseline_rank IS NULL OR baseline_rank >= 1),
+  CHECK (semantic_rank IS NULL OR semantic_rank >= 1),
+  CHECK (arm_rank IS NULL OR arm_rank >= 1),
+  CHECK (result_rank IS NULL OR result_rank >= 1)
+);
+`;
+
 export const memoryMigrations: readonly Migration[] = [
   {
     id: "0003_memory_work",
     sql: MEMORY_WORK,
+  },
+  {
+    id: "0004_memory_semantic_shadow",
+    sql: MEMORY_SEMANTIC_SHADOW,
+  },
+  {
+    id: "0021_memory_operation_turn_attribution",
+    sql: `
+      -- An ingest operation can cover a bounded batch of turns. Keep that
+      -- provenance relational so owned scenario artifacts can be traced and
+      -- cleaned without treating a batch operation as belonging to one turn.
+      CREATE TABLE memory_operation_turn (
+        operation_id uuid NOT NULL REFERENCES memory_operation (id) ON DELETE CASCADE,
+        turn_id uuid NOT NULL REFERENCES conversation_turn (id),
+        PRIMARY KEY (operation_id, turn_id)
+      );
+      CREATE INDEX memory_operation_turn_turn_idx ON memory_operation_turn (turn_id);
+
+      -- The watermark's UUID is a cursor token, not an ownership reference.
+      -- Keep the position after source-turn cleanup without rewinding it.
+      ALTER TABLE memory_ingest_state
+        DROP CONSTRAINT memory_ingest_state_watermark_turn_id_fkey;
+    `,
   },
 ];

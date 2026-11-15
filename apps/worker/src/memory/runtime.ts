@@ -2,8 +2,9 @@
  * Memory runtime: the in-process scheduler that keeps the memory pipeline
  * moving on one owner's data.
  *
- * Responsibilities (all serial per concern, all reconciling, all traced
- * metadata-only in `memory_operation`):
+ * Ordinary memory responsibilities are serial per concern and traced as
+ * metadata-only `memory_operation` rows where the operation contract calls
+ * for it. Semantic shadow evidence uses its own typed relational tables.
  *
  * - Ingest: a completed turn triggers a settled, debounced ingest attempt;
  *   a reconciliation sweep covers turns published while the worker was down.
@@ -60,6 +61,11 @@ import {
 import { getClosedTemporalSummaryPeriods } from "./temporal/periods.ts";
 import { getIngestState } from "./facts.ts";
 import { memoryErrorCategory } from "./errors.ts";
+import { createEmbeddingClient } from "./embeddings.ts";
+import { reconcileSemanticEmbeddingBatch, runSemanticShadowRecall } from "./semantic-store.ts";
+import { createSemanticScheduler } from "./semantic-scheduler.ts";
+import type { CanonicalRecallCandidate } from "./recall.ts";
+import type { RecallMode } from "./recall-time.ts";
 
 export type MemoryOperationKind =
   | "fact_extraction"
@@ -76,6 +82,8 @@ export type MemoryOperationKind =
 export interface MemoryOperationInput {
   readonly kind: MemoryOperationKind;
   readonly turnId?: string;
+  /** All source turns for a bounded batch-level memory operation. */
+  readonly sourceTurnIds?: readonly string[];
   readonly runId?: string;
   readonly promotionId?: string;
   readonly outcome: "ok" | "failed";
@@ -94,13 +102,23 @@ export interface MemoryOperationInput {
 export async function recordMemoryOperation(
   pool: PostgresPool,
   input: MemoryOperationInput,
-): Promise<void> {
-  await pool.query(
-    `INSERT INTO memory_operation
-       (kind, turn_id, run_id, promotion_id, outcome, detail, model,
-        prompt_version, input_tokens, output_tokens, llm_calls, started_at,
-        finished_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+): Promise<string | null> {
+  const result = await pool.query<{ id: string }>(
+    `WITH inserted AS (
+       INSERT INTO memory_operation
+         (kind, turn_id, run_id, promotion_id, outcome, detail, model,
+          prompt_version, input_tokens, output_tokens, llm_calls, started_at,
+          finished_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+       RETURNING id
+     ), attributed AS (
+       INSERT INTO memory_operation_turn (operation_id, turn_id)
+       SELECT inserted.id, source.turn_id
+       FROM inserted CROSS JOIN unnest($14::uuid[]) AS source(turn_id)
+       ON CONFLICT DO NOTHING
+       RETURNING operation_id
+     )
+     SELECT id FROM inserted`,
     [
       input.kind,
       input.turnId ?? null,
@@ -115,8 +133,10 @@ export async function recordMemoryOperation(
       input.llmCalls ?? null,
       input.startedAt,
       input.finishedAt ?? null,
+      input.sourceTurnIds ?? [],
     ],
   );
+  return result.rows[0]?.id ?? null;
 }
 
 export interface MemoryRuntimeDeps {
@@ -127,9 +147,27 @@ export interface MemoryRuntimeDeps {
   readonly log?: (message: string) => void;
 }
 
+export interface SemanticShadowRequest {
+  readonly source: "chat" | "api";
+  readonly turnId?: string;
+  readonly turnAttempt?: number;
+  readonly recallOperationId?: string | null;
+  readonly query: string;
+  readonly referenceTime: Date;
+  readonly limit: number;
+  readonly maxChars: number;
+  readonly candidates: readonly CanonicalRecallCandidate[];
+  readonly baselineOrigin: "keyword" | "temporal_keyword" | "recency";
+  readonly retrievalMode: RecallMode;
+  readonly emptyQueryFallback: boolean;
+  readonly timeRange?: { readonly start: string; readonly end: string };
+}
+
 export interface MemoryRuntime {
   /** Notify the runtime that a turn was published (fire-and-forget). */
   onTurnPublished(turnId: string): void;
+  /** Bounded best-effort semantic comparison; never returns data to recall. */
+  enqueueSemanticShadow(input: SemanticShadowRequest): void;
   close(): Promise<void>;
 }
 
@@ -160,6 +198,8 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
   const { pool, config, configuration } = deps;
   const log = deps.log ?? ((message: string) => console.log(message));
   const queue = new SerialQueue();
+  const embeddingClient = createEmbeddingClient({ baseUrl: config.embeddingBaseUrl });
+  let semanticReconciliationTimer: ReturnType<typeof setInterval> | undefined;
 
   const subjectIds = configuration.subjects.map((subject) => subject.id);
   const profileSubjects = configuration.subjects.filter(
@@ -189,6 +229,24 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
     callLlm,
   };
 
+  const semanticScheduler = createSemanticScheduler({
+    reconcile: async () => {
+      const result = await reconcileSemanticEmbeddingBatch({ pool, client: embeddingClient });
+      if (result.selected > 0) {
+        log(`[MEMORY] semantic embedding reconciliation: selected=${String(result.selected)} stored=${String(result.stored)} failed=${String(result.failed)}`);
+      }
+    },
+    compare: (request) => runSemanticShadowRecall({
+      pool,
+      client: embeddingClient,
+      config,
+      log,
+      ...request,
+    }),
+    log,
+    errorCategory: memoryErrorCategory,
+  });
+
   async function runIngest(reason: "turn-complete" | "reconciliation"): Promise<void> {
     // Gate: ingest (and everything downstream of it — consolidation and
     // auto-promotion) only ever runs when ingest is enabled. The flag is
@@ -216,6 +274,7 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
         llmCalls: summary.llmCalls,
         startedAt,
         finishedAt: new Date(),
+        sourceTurnIds: summary.selectedTurnIds,
       });
       if (summary.watermarkInitialized) {
         log(
@@ -549,6 +608,14 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
     });
   };
 
+  const enqueueSemanticReconciliation = (): void => {
+    if (!closed) semanticScheduler.enqueueReconciliation();
+  };
+
+  const enqueueSemanticShadow = (request: SemanticShadowRequest): void => {
+    if (!closed) semanticScheduler.enqueueShadow(request);
+  };
+
   const scheduleSettledIngest = (): void => {
     if (closed || !config.ingestEnabled || ingestTimer !== undefined) return;
     // First-wins: one attempt after the settle window covers every turn
@@ -569,11 +636,17 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
     enqueueTemporalSweep();
   }, config.temporalReconciliationMs);
 
+  semanticReconciliationTimer = setInterval(() => {
+    enqueueSemanticReconciliation();
+  }, 60_000);
+
   // Initial reconciliation: cover turns published while this process was
   // down. The ingest pipeline itself stays new-turn-only: on a fresh
   // database (no watermark) it initializes the cursor at the newest existing
   // completed turn instead of processing history.
   enqueueIngest("reconciliation");
+  // One source batch at startup, then a bounded resumable batch per minute.
+  enqueueSemanticReconciliation();
   // Initial temporal sweep: closed periods since the last process lifetime.
   enqueueTemporalSweep();
   if (!config.profileSummariesEnabled) {
@@ -606,13 +679,16 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
       void turnId;
       scheduleSettledIngest();
     },
+    enqueueSemanticShadow,
     close: async () => {
       closed = true;
       if (ingestTimer !== undefined) clearTimeout(ingestTimer);
       clearInterval(reconciliationTimer);
       clearInterval(temporalTimer);
+      if (semanticReconciliationTimer !== undefined) clearInterval(semanticReconciliationTimer);
       await profileRuntime.close();
       await queue.drain();
+      await semanticScheduler.close();
     },
   };
 }

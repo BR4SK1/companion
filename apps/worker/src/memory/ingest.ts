@@ -51,6 +51,8 @@ export type MemoryIngestReason = "turn-complete" | "reconciliation" | "manual";
 
 export interface IngestRunSummary {
   readonly selectedTurns: number;
+  /** Source turns selected by this pass, for metadata-only operation attribution. */
+  readonly selectedTurnIds: readonly string[];
   readonly extractedTurns: number;
   readonly oversizedTurnsSkipped: number;
   readonly factsWritten: number;
@@ -122,6 +124,7 @@ export async function ingestTurns(
 function emptySummary(reason: MemoryIngestReason): IngestRunSummary {
   return {
     selectedTurns: 0,
+    selectedTurnIds: [],
     extractedTurns: 0,
     oversizedTurnsSkipped: 0,
     factsWritten: 0,
@@ -188,6 +191,7 @@ async function ingestWithWatermark(
 
   const baseSummary: IngestRunSummary = {
     selectedTurns: selected.length,
+    selectedTurnIds: selected.map((turn) => turn.turnId),
     extractedTurns: 0,
     oversizedTurnsSkipped: 0,
     factsWritten: 0,

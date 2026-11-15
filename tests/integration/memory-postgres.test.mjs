@@ -27,6 +27,16 @@ import {
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
+import {
+  EMBEDDING_CODE_REVISION,
+  EMBEDDING_DIMENSIONS,
+  EMBEDDING_INPUT_VERSION,
+  EMBEDDING_MODEL,
+  EMBEDDING_MODEL_REVISION,
+  embeddingContentHash,
+  renderEmbeddingInput,
+  vectorLiteral,
+} from "../../apps/worker/src/memory/embeddings.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
 import { loadMemoryConfig } from "../../apps/worker/src/memory/config.ts";
@@ -85,7 +95,9 @@ const MEMORY_TABLES = [
   "memory_promotion", "memory_promotion_item", "memory_temporal_summary",
   "memory_temporal_summary_message", "memory_profile_summary",
   "memory_observation_profile", "memory_observation_profile_claim",
-  "memory_ingest_state", "memory_operation",
+  "memory_ingest_state", "memory_operation", "memory_operation_turn",
+  "memory_semantic_shadow_candidate", "memory_semantic_shadow_attempt",
+  "memory_semantic_embedding",
 ];
 
 const SUBJECTS_SQL = `
@@ -275,7 +287,11 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
   it("applies the memory migration idempotently with the domain tables present", async () => {
     const second = await runMigrations(pool, memoryMigrations);
     assert.deepEqual(second.applied, []);
-    assert.deepEqual(second.alreadyApplied, ["0003_memory_work"]);
+    assert.deepEqual(second.alreadyApplied, [
+      "0003_memory_work",
+      "0004_memory_semantic_shadow",
+      "0021_memory_operation_turn_attribution",
+    ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
        WHERE table_schema = 'public' AND table_name LIKE 'memory_%'
@@ -285,6 +301,90 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     for (const table of MEMORY_TABLES) {
       assert.ok(names.includes(table), `missing table ${table}`);
     }
+  });
+
+  it("keeps article operation kinds valid in the full memory/article migration composition", async () => {
+    for (const kind of ["article_ingestion", "article_memory_share"]) {
+      const id = await recordMemoryOperation(pool, {
+        kind,
+        outcome: "ok",
+        startedAt: new Date(),
+        finishedAt: new Date(),
+      });
+      assert.match(id ?? "", /^[0-9a-f-]{36}$/i);
+    }
+    const rows = await pool.query(
+      `SELECT kind FROM memory_operation WHERE kind IN ('article_ingestion', 'article_memory_share') ORDER BY kind`,
+    );
+    assert.deepEqual(rows.rows.map((row) => row.kind), ["article_ingestion", "article_memory_share"]);
+  });
+
+  it("attributes batch-level memory operations to every selected source turn", async () => {
+    const turnIds = [
+      "10000000-0000-4000-8000-000000000021",
+      "10000000-0000-4000-8000-000000000022",
+    ];
+    await pool.query(
+      `INSERT INTO conversation_turn (id, status, created_at, completed_at)
+       SELECT turn_id, 'completed', now(), now()
+       FROM unnest($1::uuid[]) AS selected(turn_id)`,
+      [turnIds],
+    );
+    const operationId = await recordMemoryOperation(pool, {
+      kind: "fact_extraction",
+      outcome: "ok",
+      startedAt: new Date(),
+      finishedAt: new Date(),
+      sourceTurnIds: turnIds,
+    });
+    assert.match(operationId ?? "", /^[0-9a-f-]{36}$/i);
+    const result = await pool.query(
+      `SELECT operation.turn_id, array_agg(source.turn_id ORDER BY source.turn_id) AS source_turn_ids
+       FROM memory_operation operation
+       JOIN memory_operation_turn source ON source.operation_id = operation.id
+       WHERE operation.id = $1
+       GROUP BY operation.id`,
+      [operationId],
+    );
+    assert.equal(result.rows[0].turn_id, null, "a batch operation is not falsely assigned to one turn");
+    assert.deepEqual(result.rows[0].source_turn_ids.sort(), turnIds.sort());
+  });
+
+  it("stores and compares typed 768-dimensional pgvector embeddings", async () => {
+    const turnId = "10000000-0000-4000-8000-000000000001";
+    const factKey = "semantic-pgvector-fixture";
+    await pool.query(
+      `INSERT INTO conversation_turn (id, status, created_at, completed_at)
+       VALUES ($1, 'completed', now(), now())`,
+      [turnId],
+    );
+    const fact = await pool.query(
+      `INSERT INTO memory_fact
+         (fact_key, turn_id, subject_id, kind, claim, topics, observed_at, explicitness,
+          evidence_basis, extraction_version, ingest_version)
+       VALUES ($1, $2, 'user', 'preference', 'synthetic vector fixture', '{}', now(),
+               'explicit', 'direct_statement', 'test', 'test')
+       RETURNING id, updated_at`,
+      [factKey, turnId],
+    );
+    const text = renderEmbeddingInput({ claim: "synthetic vector fixture" });
+    const vector = [1, ...Array(EMBEDDING_DIMENSIONS - 1).fill(0)];
+    await pool.query(
+      `INSERT INTO memory_semantic_embedding
+         (fact_id, source_content_hash, source_updated_at, input_version, model, model_revision,
+          model_code_revision, embedding)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::vector(768))`,
+      [fact.rows[0].id, embeddingContentHash(text), fact.rows[0].updated_at, EMBEDDING_INPUT_VERSION,
+        EMBEDDING_MODEL, EMBEDDING_MODEL_REVISION, EMBEDDING_CODE_REVISION, vectorLiteral(vector)],
+    );
+    const compared = await pool.query(
+      `SELECT (1 - (embedding <=> $1::vector(768)))::real AS similarity,
+              source_updated_at = $2 AS source_timestamp_matches
+       FROM memory_semantic_embedding WHERE fact_id = $3`,
+      [vectorLiteral(vector), fact.rows[0].updated_at, fact.rows[0].id],
+    );
+    assert.equal(compared.rows[0].similarity, 1);
+    assert.equal(compared.rows[0].source_timestamp_matches, true);
   });
 
   it("loads configuration fail-closed", async () => {

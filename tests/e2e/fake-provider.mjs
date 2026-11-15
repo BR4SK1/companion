@@ -100,41 +100,43 @@ export function startFakeProvider({ port, expectedBearer, log = () => {} }) {
   }
 
   function decisionsResponse(requestBody) {
-    // One choice question per turn, keyed `response_pattern` (worker
-    // contract). Answer with the first offered option, preserving the
-    // request's order, and include optional probability fields so the
-    // worker's diagnostics path handles them as returned.
-    const question = requestBody.questions?.response_pattern;
-    if (
-      question === undefined ||
-      question === null ||
-      question.type !== "choice" ||
-      typeof question.criteria !== "object" ||
-      question.criteria === null
-    ) {
+    // Deterministically select the first offered response-pattern option.
+    // Prompt-module include/skip behavior is covered by hermetic worker tests;
+    // this disposable E2E fixture does not rewrite module configuration.
+    const questions = requestBody.questions;
+    if (typeof questions !== "object" || questions === null) {
       return { status: 400, body: { error: "unsupported decision request" } };
     }
-    const options = Object.keys(question.criteria);
-    if (options.length === 0) {
-      return { status: 400, body: { error: "no options offered" } };
-    }
-    const probabilities = {};
-    for (const option of options) {
-      probabilities[option] = 1 / options.length;
+    const answers = {};
+    for (const [questionId, question] of Object.entries(questions)) {
+      if (
+        question === undefined ||
+        question === null ||
+        question.type !== "choice" ||
+        typeof question.criteria !== "object" ||
+        question.criteria === null
+      ) {
+        return { status: 400, body: { error: "unsupported decision question" } };
+      }
+      const options = Object.keys(question.criteria);
+      if (options.length === 0) {
+        return { status: 400, body: { error: "no options offered" } };
+      }
+      const choice = options[0];
+      const probabilities = Object.fromEntries(options.map((option) => [option, 1 / options.length]));
+      answers[questionId] = {
+        type: "choice",
+        choice,
+        probabilities,
+        confidence: 0.9,
+      };
     }
     return {
       status: 200,
       body: {
         id: `e2e-decision-${String(chatCounter + 1)}`,
         model: requestBody.model,
-        answers: {
-          response_pattern: {
-            type: "choice",
-            choice: options[0],
-            probabilities,
-            confidence: 0.9,
-          },
-        },
+        answers,
         usage: { input_tokens: 7, output_tokens: 3 },
       },
     };

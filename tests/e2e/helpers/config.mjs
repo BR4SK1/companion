@@ -5,7 +5,8 @@
  * environment contract between the stack supervisor (`stack.mjs`, started
  * by Playwright as its web server) and the test specs. Everything is
  * overridable through `E2E_*` environment variables; both processes inherit
- * the same environment, so they always agree.
+ * the same environment, so they always agree. `E2E_RUNS_DIR` is required and
+ * must be isolated from the historical shared `.runs` tree.
  *
  * Defaults are high, uncommon loopback ports chosen to avoid colliding with
  * the development defaults of the applications themselves. The supervisor
@@ -16,6 +17,8 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { resolveTaskRunsDir } from "./runs-dir.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -42,6 +45,28 @@ function strFromEnv(name, fallback) {
   return raw === undefined || raw.length === 0 ? fallback : raw;
 }
 
+function baseUrlFromEnv(name) {
+  const raw = process.env[name];
+  if (raw === undefined || raw.length === 0) return null;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error(`${name} must be a valid HTTP(S) base URL`);
+  }
+  if (
+    !["http:", "https:"].includes(parsed.protocol) ||
+    parsed.username ||
+    parsed.password ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new Error(`${name} must be an HTTP(S) origin without credentials, path, query, or fragment`);
+  }
+  return parsed.origin;
+}
+
 export const config = {
   /** Synthetic authoritative zone used by the disposable stack's UI journeys. */
   temporalTimezone: "America/Los_Angeles",
@@ -55,9 +80,14 @@ export const config = {
   providerPort: intFromEnv("E2E_PROVIDER_PORT", 4623),
   /** Disposable PostgreSQL container's host port (loopback only). */
   pgPort: intFromEnv("E2E_PG_PORT", 4624),
+  /** Explicitly configured internal embedding service; never default to a fake. */
+  embeddingBaseUrl: baseUrlFromEnv("WORKER_MEMORY_EMBEDDING_BASE_URL"),
 
   /** Pinned disposable PostgreSQL image. */
-  pgImage: strFromEnv("E2E_PG_IMAGE", "postgres:17.6-alpine"),
+  pgImage: strFromEnv(
+    "E2E_PG_IMAGE",
+    "pgvector/pgvector:0.8.1-pg17@sha256:3e8b3adfd27b5707128f60956f62a793c3c9326ea8cfaf0eab7adccb5d700b21",
+  ),
 
   /** Application source locations. */
   webDir: path.join(repoRoot, "apps", "web"),
@@ -78,4 +108,4 @@ export const config = {
 };
 
 /** Where run-owned state and logs live (created per run, gitignored). */
-export const runsDirAbsolute = strFromEnv("E2E_RUNS_DIR", path.join(e2eDir, ".runs"));
+export const runsDirAbsolute = resolveTaskRunsDir();

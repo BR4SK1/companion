@@ -25,6 +25,8 @@ export interface PostgresConnectionConfig {
   readonly password?: string;
   /** Maximum pool size. Provisional default is `pg`'s own (10). */
   readonly max?: number;
+  /** Bound how long an operation can wait to acquire a pool client. */
+  readonly connectionTimeoutMillis?: number;
 }
 
 /**
@@ -44,6 +46,9 @@ export function createPostgresPool(
     ...(config.user !== undefined ? { user: config.user } : {}),
     ...(config.password !== undefined ? { password: config.password } : {}),
     ...(config.max !== undefined ? { max: config.max } : {}),
+    ...(config.connectionTimeoutMillis !== undefined
+      ? { connectionTimeoutMillis: config.connectionTimeoutMillis }
+      : {}),
   });
 }
 

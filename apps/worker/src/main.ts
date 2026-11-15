@@ -63,8 +63,8 @@ import {
   MEMORY_PROFILE_PROMPT_VERSION,
   promptContentHash,
 } from "./memory/prompts.ts";
-import { startMemoryRuntime, recordMemoryOperation } from "./memory/runtime.ts";
-import { recallCanonical } from "./memory/recall.ts";
+import { startMemoryRuntime, recordMemoryOperation, type SemanticShadowRequest } from "./memory/runtime.ts";
+import { recallCanonicalDetailed } from "./memory/recall.ts";
 import {
   buildCanonicalMemoryContextForPrompt,
   renderProfileSection,
@@ -102,7 +102,10 @@ import { runEngineLoop } from "./work/engine.ts";
 
 async function main(): Promise<void> {
   const config = loadWorkerConfig(process.env);
-  const pool = createPostgresPool({ connectionString: config.databaseUrl });
+  const pool = createPostgresPool({
+    connectionString: config.databaseUrl,
+    connectionTimeoutMillis: 5_000,
+  });
 
   const shutdown = new AbortController();
   const onSignal = (): void => {
@@ -286,7 +289,7 @@ async function main(): Promise<void> {
 
       // Per-turn memory context. Every section degrades independently: a
       // failed section logs a warning and the turn continues with the rest.
-      loadMemoryContext = async ({ userText, referenceTime }) => {
+      loadMemoryContext = async ({ turnId, turnAttempt, userText, referenceTime }) => {
         const now = referenceTime;
         const profileSubjects = configuration.subjects.filter(
           (subject) => subject.profileEnabled,
@@ -299,18 +302,20 @@ async function main(): Promise<void> {
         // Fact keys the recall chunk surfaced this turn — the dedupe input
         // for the per-turn article-memory share candidates.
         let recallFactKeys: string[] = [];
+        let semanticShadowRequest: SemanticShadowRequest | undefined;
         if (memoryConfig.recallEnabled) {
           try {
             const recallQuery = userText.trim().split(/\s+/).slice(0, 16).join(" ").slice(0, 512);
             if (recallQuery.length > 0) {
               const recallStartedAt = new Date();
-              const recall = await recallCanonical(pool, memoryConfig, {
+              const detailedRecall = await recallCanonicalDetailed(pool, memoryConfig, {
                 query: recallQuery,
                 referenceTime: now,
                 limit: memoryConfig.recallLimit,
                 maxChars: memoryConfig.recallMaxChars,
                 timezone: configuration.behavior.timezone,
               });
+              const recall = detailedRecall.response;
               memoryContext = buildCanonicalMemoryContextForPrompt({
                 items: recall.results,
                 now,
@@ -318,8 +323,9 @@ async function main(): Promise<void> {
               recallFactKeys = recall.results
                 .filter((item) => item.type === "fact")
                 .map((item) => item.id);
-              await recordMemoryOperation(pool, {
+              const recallOperationId = await recordMemoryOperation(pool, {
                 kind: "recall",
+                turnId,
                 outcome: "ok",
                 detail:
                   `mode=${recall.query.mode}` +
@@ -333,7 +339,26 @@ async function main(): Promise<void> {
                   ` ms=${String(recall.diagnostics.totalMs)}`,
                 startedAt: recallStartedAt,
                 finishedAt: new Date(),
-              }).catch(() => undefined);
+              }).catch(() => null);
+              semanticShadowRequest = {
+                source: "chat",
+                turnId,
+                turnAttempt,
+                recallOperationId,
+                query: detailedRecall.normalizedInput.query,
+                referenceTime: detailedRecall.normalizedInput.referenceTime,
+                limit: detailedRecall.normalizedInput.limit,
+                maxChars: detailedRecall.normalizedInput.maxChars,
+                candidates: detailedRecall.candidates,
+                baselineOrigin: recall.query.emptyQueryFallback
+                  ? "recency"
+                  : recall.query.mode === "hybrid" ? "temporal_keyword" : "keyword",
+                retrievalMode: recall.query.mode,
+                emptyQueryFallback: recall.query.emptyQueryFallback,
+                ...(recall.query.timeRange !== undefined
+                  ? { timeRange: { start: recall.query.timeRange.start, end: recall.query.timeRange.end } }
+                  : {}),
+              };
             }
           } catch (error) {
             console.warn(
@@ -394,6 +419,10 @@ async function main(): Promise<void> {
             }
           }
           profileSection = sections.length > 0 ? sections.join("\n\n") : undefined;
+        }
+
+        if (semanticShadowRequest !== undefined) {
+          memoryRuntime?.enqueueSemanticShadow(semanticShadowRequest);
         }
 
         return {
@@ -457,16 +486,17 @@ async function main(): Promise<void> {
             // provisioned configuration.
             recall: async (input: { query: string; limit?: number }) => {
               const startedAt = new Date();
-              const result = await recallCanonical(pool, memoryConfig, {
+              const detailedResult = await recallCanonicalDetailed(pool, memoryConfig, {
                 query: input.query,
                 referenceTime: startedAt,
                 ...(input.limit !== undefined ? { limit: input.limit } : {}),
                 maxChars: memoryConfig.recallMaxChars,
                 timezone: provisionedMemoryConfiguration.behavior.timezone,
               });
+              const result = detailedResult.response;
               // Metadata-only trace, never a content copy; a tracing failure
               // must not fail an already-successful recall.
-              await recordMemoryOperation(pool, {
+              const recallOperationId = await recordMemoryOperation(pool, {
                 kind: "recall",
                 outcome: "ok",
                 detail:
@@ -478,7 +508,24 @@ async function main(): Promise<void> {
                   ` ms=${String(result.diagnostics.totalMs)}`,
                 startedAt,
                 finishedAt: new Date(),
-              }).catch(() => undefined);
+              }).catch(() => null);
+              memoryRuntime?.enqueueSemanticShadow({
+                source: "api",
+                recallOperationId,
+                query: detailedResult.normalizedInput.query,
+                referenceTime: detailedResult.normalizedInput.referenceTime,
+                limit: detailedResult.normalizedInput.limit,
+                maxChars: detailedResult.normalizedInput.maxChars,
+                candidates: detailedResult.candidates,
+                baselineOrigin: result.query.emptyQueryFallback
+                  ? "recency"
+                  : result.query.mode === "hybrid" ? "temporal_keyword" : "keyword",
+                retrievalMode: result.query.mode,
+                emptyQueryFallback: result.query.emptyQueryFallback,
+                ...(result.query.timeRange !== undefined
+                  ? { timeRange: { start: result.query.timeRange.start, end: result.query.timeRange.end } }
+                  : {}),
+              });
               return result;
             },
           }

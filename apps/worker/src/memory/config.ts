@@ -70,6 +70,8 @@ export interface MemoryConfig {
   /** Model id for every memory LLM task. */
   readonly model: string;
   readonly openrouterBaseUrl: string;
+  /** Internal service address only; this cannot enable, disable, or redirect shadow outputs. */
+  readonly embeddingBaseUrl: string;
   readonly chatTimeoutMs: number;
   /** Ingest watermark pipeline. */
   readonly ingestMaxTurns: number;
@@ -173,6 +175,11 @@ export function loadMemoryConfig(
       env,
       "WORKER_MEMORY_OPENROUTER_BASE_URL",
       "https://openrouter.ai/api/v1",
+    ),
+    embeddingBaseUrl: optionalString(
+      env,
+      "WORKER_MEMORY_EMBEDDING_BASE_URL",
+      "http://127.0.0.1:5113",
     ),
     chatTimeoutMs: optionalNumber(env, "WORKER_MEMORY_CHAT_TIMEOUT_MS", DEFAULTS.chatTimeoutMs, {
       integer: true,

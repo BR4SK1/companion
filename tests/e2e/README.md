@@ -5,8 +5,9 @@
 Implemented Playwright coverage of user-visible behavior through the web/BFF
 boundary, exercising the real applications — the web production build with its
 BFF edge and loopback test-entry gate, and the real worker (private HTTP API,
-durable work, response-pattern decision, chat generation) — against a local
-fake OpenRouter provider and a disposable throwaway PostgreSQL.
+durable work, response-pattern decisions, chat generation) — against a local
+fake OpenRouter provider, a configured real embedding service, and a disposable
+throwaway PostgreSQL.
 
 The Playwright/E2E toolchain is pinned to Node.js **22.23.4** in
 [`.nvmrc`](.nvmrc) and in this package's `engines` field. Its test,
@@ -21,41 +22,63 @@ runtime:
 pnpm install                                      # installs the pinned Playwright
 pnpm --filter @companion/web build                # the suite serves the production build
 pnpm --filter @companion/e2e install:chromium     # installs the pinned browser build (Node 22.23.4)
-pnpm --filter @companion/e2e test                 # disposable-stack Playwright suite (Node 22.23.4)
+E2E_RUNS_DIR="$(mktemp -d)" pnpm --filter @companion/e2e test # isolated disposable-stack Playwright suite (Node 22.23.4)
 ```
+
+Give every stack, stack-operations, and deployed-smoke invocation a new
+`E2E_RUNS_DIR` outside the historical `tests/e2e/.runs` tree. Keep that
+run-owned directory until cleanup is verified; remove only that exact directory
+when no recovery marker or owned resource remains.
+
+The stack requires the existing `WORKER_MEMORY_EMBEDDING_BASE_URL` environment
+setting to identify the approved internal embedding service. Source it from
+private local infrastructure configuration; do not add its value to this
+README or any tracked fixture. For isolated maintenance/testing, set
+`E2E_RUNS_DIR` to a new task-owned directory so startup reconciliation and
+cleanup cannot inspect historical `.runs` entries.
 
 ### Request scope: full E2E versus local-only
 
 An unqualified request to "run E2E" means a **full E2E run**: this disposable
 local stack **plus** deployed non-production validation, which includes the
 [deployed smoke](#deployed-non-production-smoke-explicitly-acknowledged-real-billable-provider)
-and its real, billable provider calls. The command above runs only the
-fake-provider Playwright suite — it never includes the smoke, which runs only
-through its own documented command. A request explicitly scoped to local-only
-validation (for example "run the local e2e suite") covers exactly this
-fake-provider coverage and nothing deployed. The deployed smoke is also a
-valid request on its own, independent of a full E2E run.
+and its real, billable provider calls. The command above runs only the local
+Playwright stack: OpenRouter chat/decision calls use a fake provider, while
+synthetic embedding requests use the configured real embedding service. It
+never includes the deployed smoke, which runs only through its own documented
+command. A request explicitly scoped to local-only validation (for example
+"run the local e2e suite") covers exactly this local coverage and nothing
+deployed. The deployed smoke is also a valid request on its own, independent of
+a full E2E run.
 
 The stack supervisor (`stack.mjs`, started by Playwright as its web server)
-brings up, in order:
+uses these dependencies:
 
 1. a **fake provider** (`fake-provider.mjs`, in-process): the two OpenRouter
    endpoints the worker is configured to call, deterministic, with a control
    API the tests use to script behavior (success, HTTP 500, hang, latency)
    and to read recorded request bodies for assertions. It requires the
-   bearer credential the worker was configured with. No external network
-   calls are made and no live model is called anywhere.
-2. a **throwaway PostgreSQL** in a dedicated Docker container (pinned image,
-   loopback-only port, per-run random user/password, `--rm`).
-3. the **worker** (`apps/worker`) against that throwaway database and the
-   fake provider (the provider URLs are configuration; no provider fallback
-   exists), with a per-run random service token. The first start applies
-   migrations; the supervisor provisions a synthetic `America/Los_Angeles`
-   timezone only in this disposable database, then gracefully restarts the
-   worker before exposing the stack so its startup-captured setting is active
-   for the whole run. The history fixture uses 00:30 UTC instants to test
-   Pacific local-day dividers rather than accidentally testing UTC grouping.
-4. the **web production build** (`apps/web/server.mjs`) with the
+   bearer credential the worker was configured with. Chat and decision calls
+   remain fake-only.
+2. a **throwaway pgvector-ready PostgreSQL** in a dedicated Docker container
+   (pinned image, loopback-only port, per-run random user/password, `--rm`).
+   The supervisor enables the vector extension only in this disposable E2E
+   database; application migrations never install it.
+3. the **configured real embedding service**, supplied through the existing
+   `WORKER_MEMORY_EMBEDDING_BASE_URL` setting from approved private local
+   infrastructure configuration. The URL is not stored in source, run records,
+   or public documentation; the supervisor does not start, stop, or proxy that
+   service. Embedding requests use only synthetic E2E data.
+4. the **worker** (`apps/worker`) against that throwaway database, fake
+   provider, and real embedding service (all URLs are explicit configuration;
+   no provider fallback exists), with a per-run random service token. The
+   first start applies migrations; the supervisor provisions a synthetic
+   `America/Los_Angeles` timezone only in this disposable database, then
+   gracefully restarts the worker before exposing the stack so its
+   startup-captured setting is active for the whole run. The history fixture
+   uses 00:30 UTC instants to test Pacific local-day dividers rather than
+   accidentally testing UTC grouping.
+5. the **web production build** (`apps/web/server.mjs`) with the
    non-production-only loopback test gate explicitly enabled in
    `trusted-local` mode — the documented path for a run outside Kubernetes.
    The OIDC configuration values are synthetic placeholders that the test
@@ -66,19 +89,24 @@ brings up, in order:
 
 - The Playwright suite never touches an application database: its only
   database is the throwaway container the E2E run itself created, and the
-  supervisor removes that container with the run. This is separate from the
-  destructive worker integration phase documented in
-  [`../integration/README.md`](../integration/README.md), which is authorized
-  only against the positively verified non-production application database
-  under exclusive maintenance and complete reconstruction. The Playwright
-  suite's own data is synthetic (generated `e2e-*` strings; seeded response
-  patterns and completed past turns).
-- No live model calls and no production access; the only provider is the
-  local fake. Unimplemented capabilities (image generation, uploads, voice,
+  supervisor removes that container with the run. Its chat identity, timezone,
+  response patterns, and conversation rows are disposable synthetic fixtures;
+  they are not the maintained non-production personality or configuration.
+  Database-backed integration tools are separately restricted to verified
+  disposable targets; no destructive suite is authorized against an
+  application database. The Playwright suite's own scenario data is synthetic
+  (generated `e2e-*` strings, fixture response patterns, and completed past
+  turns).
+- The local fake remains the only chat/decision provider, and no production
+  access occurs. The configured embedding service is real and may run inference
+  on synthetic E2E data; it is an external dependency and is never managed by
+  the stack. Unimplemented capabilities (image generation, uploads, voice,
   real Keycloak MFA) are not claimed or exercised anywhere.
-- Ports default to `4620`–`4624` on `127.0.0.1` and are overridable via
-  `E2E_*` variables (see `helpers/config.mjs`). The supervisor refuses to
-  start when a configured port is already taken — it never hijacks one.
+- Application/database ports default to `4620`–`4624` on `127.0.0.1` and are
+  overridable via `E2E_*` variables (see `helpers/config.mjs`). The embedding
+  service uses its configured base URL and has no local test listener. The
+  supervisor refuses to start when a configured port is already taken — it
+  never hijacks one.
 - Secrets (worker token, session secrets, database password) are generated
   per run, kept in the supervisor's process environment only, and never
   logged, written to run records, or committed.
@@ -87,7 +115,7 @@ brings up, in order:
 
 Every run records what it created — its own supervisor PID with the `/proc`
 start time, each child PID with its start time, and the container name — in
-`.runs/<run-id>/state.json` (gitignored):
+`$E2E_RUNS_DIR/<run-id>/state.json` (gitignored):
 
 - On normal exit, failure, `SIGINT`, or `SIGTERM` (including Playwright's own
   teardown and a parent-death watch for a hard-killed runner) the supervisor
@@ -168,6 +196,11 @@ on the turn's own recorded request rather than on request counts:
    `/api` surface never intercepted (subresource fetches and top-level
    navigations alike), and HTTP error responses preserved. No messages are
    sent; no provider traffic occurs.
+Prompt-module applicability include/skip and isolated function behavior are
+covered in hermetic worker unit tests with injected decisions. The disposable
+browser suite does not enable or rewrite prompt-module definitions; behavior of
+the maintained provisioned modules is exercised only through deployed normal
+usage with the existing configuration intact.
 
 ## Deployed non-production smoke (explicitly acknowledged; real billable provider)
 

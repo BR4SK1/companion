@@ -2230,6 +2230,12 @@ export async function applyRetractionUpdate(
         `Canonical observation ${locked.canonicalObservationId} changed during retraction`,
       );
     }
+    // Retractions remove derived vectors in the same transaction. The canonical
+    // record remains as audit state, but its private semantic representation does not.
+    await client.query(
+      `DELETE FROM memory_semantic_embedding WHERE canonical_observation_id = $1`,
+      [locked.canonicalObservationId],
+    );
     return { status: "completed", historyEventId: event.historyEventId };
   });
 }

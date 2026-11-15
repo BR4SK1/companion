@@ -175,6 +175,7 @@ export interface TurnProcessorDeps {
    */
   readonly loadMemoryContext?: (input: {
     readonly turnId: string;
+    readonly turnAttempt: number;
     readonly userText: string;
     readonly referenceTime: Date;
   }) => Promise<MemoryChatContext | null>;
@@ -376,6 +377,7 @@ export async function processTurnWork(
       try {
         const loaded = await deps.loadMemoryContext({
           turnId: work.turn.id,
+          turnAttempt: work.turn.attempt,
           userText,
           referenceTime: attemptReferenceTime,
         });
