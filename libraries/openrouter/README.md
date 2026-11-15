@@ -6,7 +6,7 @@ This library area is the home for OpenRouter integration code. Shared provider t
 
 ### Shared transport (`src/transport.ts`)
 
-`postJson` performs one JSON POST with optional bearer authentication and a timeout, and translates failures into typed `OpenRouterTransportError` errors (`network`, `timeout`, `http_status`, `invalid_json`). It knows nothing about capability contracts: payloads stay opaque, response validation belongs to the capability modules or the composing application. No retries, backoff, fallback routing, model/provider selection, or credential storage are included; the caller injects credentials and (for tests) the fetch implementation.
+`postJson` performs one JSON POST with optional bearer authentication and a deadline that remains active through complete response-body consumption, and translates failures into typed `OpenRouterTransportError` errors (`network`, `timeout`, `http_status`, `invalid_json`). It knows nothing about capability contracts: payloads stay opaque, response validation belongs to the capability modules or the composing application. No retries, backoff, fallback routing, model/provider selection, or credential storage are included; the caller injects credentials and (for tests) the fetch implementation.
 
 ### Chat contract (`src/chat.ts`)
 

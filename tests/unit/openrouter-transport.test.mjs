@@ -103,6 +103,36 @@ describe("transport error translation", () => {
     );
   });
 
+  for (const status of [200, 503]) {
+    it(`keeps the deadline active while reading a stalled ${status} response body`, async () => {
+      let observedSignal;
+      const fetchImpl = async (url, init) => {
+        observedSignal = init.signal;
+        const body = new ReadableStream({
+          start(controller) {
+            init.signal.addEventListener("abort", () => {
+              const error = new Error("The operation was aborted");
+              error.name = "AbortError";
+              controller.error(error);
+            }, { once: true });
+          },
+        });
+        return new Response(body, { status });
+      };
+      const startedAt = Date.now();
+      await assert.rejects(
+        postJson("https://example.test/endpoint", {}, { fetchImpl, timeoutMs: 25 }),
+        (error) => {
+          assert.ok(error instanceof OpenRouterTransportError);
+          assert.equal(error.kind, "timeout");
+          return true;
+        },
+      );
+      assert.equal(observedSignal.aborted, true);
+      assert.ok(Date.now() - startedAt < 1_000);
+    });
+  }
+
   it("maps non-2xx responses to http_status errors with truncated body", async () => {
     const fetchImpl = jsonFetch(429, { error: "rate limited" });
     await assert.rejects(

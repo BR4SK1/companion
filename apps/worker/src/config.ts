@@ -39,6 +39,8 @@ export interface WorkerConfig {
    * The web BFF holds the same value (`WEB_WORKER_TOKEN`).
    */
   readonly apiToken: string;
+  /** Explicit service credentials supplied only to DB-authored prompt modules. */
+  readonly promptModuleCredentials: Readonly<Record<string, string>>;
   /** Private HTTP API listener (cluster-internal only; no public ingress). */
   readonly http: WorkerHttpConfig;
 }
@@ -135,6 +137,43 @@ function optionalNumber(
   return value;
 }
 
+function promptModuleCredentials(
+  env: Record<string, string | undefined>,
+): Readonly<Record<string, string>> {
+  const raw = env.WORKER_PROMPT_MODULE_CREDENTIALS_JSON;
+  if (raw === undefined || raw.length === 0) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new WorkerConfigError(
+      "WORKER_PROMPT_MODULE_CREDENTIALS_JSON must be a JSON object of named string credentials",
+    );
+  }
+  if (
+    typeof parsed !== "object" || parsed === null || Array.isArray(parsed)
+  ) {
+    throw new WorkerConfigError(
+      "WORKER_PROMPT_MODULE_CREDENTIALS_JSON must be a JSON object of named string credentials",
+    );
+  }
+  const credentials: Record<string, string> = {};
+  for (const [name, value] of Object.entries(parsed)) {
+    if (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(name) || typeof value !== "string") {
+      throw new WorkerConfigError(
+        "WORKER_PROMPT_MODULE_CREDENTIALS_JSON must contain only named string credentials",
+      );
+    }
+    Object.defineProperty(credentials, name, {
+      value,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  }
+  return Object.freeze(credentials);
+}
+
 function optionalHttpHost(
   env: Record<string, string | undefined>,
   name: string,
@@ -222,6 +261,7 @@ export function loadWorkerConfig(
       { integer: true, minimum: 0 },
     ),
     apiToken,
+    promptModuleCredentials: promptModuleCredentials(env),
     http: {
       host: optionalHttpHost(env, "WORKER_HTTP_HOST", DEFAULT_HTTP_HOST),
       port: optionalPort(env, "WORKER_HTTP_PORT", DEFAULT_HTTP_PORT),

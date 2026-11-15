@@ -24,11 +24,7 @@ import {
   withTransaction,
 } from "../../libraries/postgres/src/index.ts";
 import { conversationMigrations } from "../../apps/worker/src/conversation/migrations.ts";
-import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
-import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
-import { relationshipMigrations } from "../../apps/worker/src/relationship/migrations.ts";
-import { routineMigrations } from "../../apps/worker/src/routine/migrations.ts";
-import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
+import { workerMigrations } from "../../apps/worker/src/migrations.ts";
 import {
   CLAIM_ADVISORY_LOCK_KEY,
   createConversationStore,
@@ -112,6 +108,19 @@ async function createIsolatedMigrationFixture(ownerPool, databaseUrl, prefix) {
   }
 }
 
+async function withRestoredChatIdentity(pool, action) {
+  try {
+    return await action();
+  } finally {
+    await pool.query(
+      `INSERT INTO chat_identity (id, content, revision)
+       VALUES ('identity', 'Integration fixture identity: generic test text.', 1)
+       ON CONFLICT (id) DO UPDATE SET
+         content = EXCLUDED.content, revision = EXCLUDED.revision`,
+    );
+  }
+}
+
 async function readVectorExtensionFingerprint(db) {
   const result = await db.query(
     `SELECT e.oid::text AS oid, e.extname, e.extversion,
@@ -132,10 +141,9 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
   before(async () => {
     pool = createPostgresPool({ connectionString: DATABASE_URL });
     store = createConversationStore(pool);
-    // Fresh application against the provided non-production database; the
-    // worker applies the conversation and memory domain migrations together
-    // (see main.ts), so every test below assumes both domain schemas exist.
-    await runMigrations(pool, [...conversationMigrations, ...memoryMigrations, ...articleMigrations, ...temporalMigrations]);
+    // Match the actual worker composition so this fixture reflects a fresh
+    // application database, including relationship and routine domains.
+    await runMigrations(pool, workerMigrations);
     // The chat identity is required runtime configuration (like
     // response_pattern): provision a generic fixture row so engine cycles
     // can run. It is configuration, not per-test data, so the beforeEach
@@ -170,30 +178,13 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
   });
 
   it("re-applies migrations idempotently with the domain tables present", async () => {
-    const second = await runMigrations(pool, [
-      ...conversationMigrations,
-      ...memoryMigrations,
-      ...articleMigrations,
-      ...temporalMigrations,
-    ]);
+    const second = await runMigrations(pool, workerMigrations);
     assert.deepEqual(second.applied, []);
-    // Ids are feature-owned labels, not a global sequence: the composition
-    // array applies the conversation domain's migrations (0001, 0002, 0004)
-    // before the memory domain's (0003), because memory tables hold foreign
-    // keys into conversation tables.
-    assert.deepEqual(second.alreadyApplied, [
-      "0001_conversation_work",
-      "0002_conversation_tracing",
-      "0004_chat_identity",
-      "0005_message_timing",
-      "0006_conversation_thread_order",
-      "0003_memory_work",
-      "0007_article_work",
-      "0008_article_share_and_evidence",
-      "0009_article_observation_claim",
-      "0016_authoritative_temporal_context",
-      "0017_trace_attempt_temporal_context",
-    ]);
+    assert.deepEqual(
+      second.alreadyApplied,
+      workerMigrations.map(({ id }) => id),
+      "fresh-database fixture must track the canonical worker migration composition",
+    );
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
        WHERE table_schema = 'public'
@@ -2505,104 +2496,116 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     );
   });
 
+  it("restores the chat-identity fixture when a migration assertion fails", async () => {
+    const assertionFailure = new Error("simulated migration assertion failure");
+    await assert.rejects(
+      withRestoredChatIdentity(pool, async () => {
+        await pool.query(`DELETE FROM chat_identity WHERE id = 'identity'`);
+        throw assertionFailure;
+      }),
+      (error) => error === assertionFailure,
+    );
+    const restored = await pool.query(
+      `SELECT content, revision FROM chat_identity WHERE id = 'identity'`,
+    );
+    assert.equal(restored.rows.length, 1);
+    assert.equal(restored.rows[0].content, "Integration fixture identity: generic test text.");
+    assert.equal(restored.rows[0].revision, 1);
+  });
+
   it("preserves a legacy pre-tracing turn and its decision JSONB through the tracing migration", async () => {
-    // Roll the database back to its pre-tracing shape: drop the tracing
-    // tables and their migration bookkeeping rows, keep the domain tables.
-    // The chat-identity migration (0004) and the article, relationship, and
-    // routine chunk migrations also alter trace tables, so re-apply them in
-    // the same order as the worker's domain migration composition.
-    await pool.query(
-      `DROP TABLE IF EXISTS
-         trace_attempt_chat_choice, trace_attempt_chat_message, trace_attempt_chat,
-         trace_attempt_decision_probability, trace_attempt_decision,
-         trace_attempt_pattern, trace_attempt_context, trace_attempt,
-         chat_identity`,
-    );
-    await pool.query(`DROP INDEX IF EXISTS article_share_turn_reaction_idx`);
-    await pool.query(
-      `DELETE FROM companion_schema_migration
-       WHERE id IN ('0002_conversation_tracing', '0004_chat_identity',
-                    '0008_article_share_and_evidence', '0011_relationship_chat_chunk',
-                     '0013_routine_chat_chunk', '0017_trace_attempt_temporal_context')`,
-    );
+    await withRestoredChatIdentity(pool, async () => {
+      // Roll the database back to its pre-tracing shape: drop the tracing
+      // tables and their migration bookkeeping rows, keep the domain tables.
+      // The chat-identity migration (0004) and article, relationship, routine,
+      // and prompt-module migrations also alter trace tables, so re-apply them in
+      // the same order as the worker's domain migration composition.
+      await pool.query(
+        `DROP TABLE IF EXISTS
+           trace_attempt_prompt_module_chat_message,
+           trace_attempt_prompt_module_probability, trace_attempt_prompt_module,
+           prompt_module, trace_attempt_chat_choice, trace_attempt_chat_message, trace_attempt_chat,
+           trace_attempt_decision_probability, trace_attempt_decision,
+           trace_attempt_pattern, trace_attempt_context, trace_attempt,
+           chat_identity`,
+      );
+      await pool.query(`DROP INDEX IF EXISTS article_share_turn_reaction_idx`);
+      await pool.query(
+        `DELETE FROM companion_schema_migration
+         WHERE id IN ('0002_conversation_tracing', '0004_chat_identity',
+                      '0008_article_share_and_evidence', '0011_relationship_chat_chunk',
+                       '0013_routine_chat_chunk', '0017_trace_attempt_temporal_context',
+                       '0018_generic_prompt_modules', '0019_prompt_module_chat_attribution')`,
+      );
 
-    // A legacy turn exactly as pre-tracing code wrote it.
-    const legacy = await pool.query(
-      `INSERT INTO conversation_turn
-         (id, status, attempt, selected_pattern_id, decision, completed_at)
-       VALUES (gen_random_uuid(), 'completed', 1, 'concise',
-               '{"choice":"concise","confidence":0.9,"model":"legacy-model"}', now())
-       RETURNING id`,
-    );
-    const legacyTurnId = legacy.rows[0].id;
-    await pool.query(
-      `INSERT INTO conversation_message
-         (role, content, turn_id, effective_at, time_source,
-          client_time_status, server_received_at)
-       VALUES ('assistant', 'legacy reply', $1, now(), 'server', 'absent', now())`,
-      [legacyTurnId],
-    );
+      // A legacy turn exactly as pre-tracing code wrote it.
+      const legacy = await pool.query(
+        `INSERT INTO conversation_turn
+           (id, status, attempt, selected_pattern_id, decision, completed_at)
+         VALUES (gen_random_uuid(), 'completed', 1, 'concise',
+                 '{"choice":"concise","confidence":0.9,"model":"legacy-model"}', now())
+         RETURNING id`,
+      );
+      const legacyTurnId = legacy.rows[0].id;
+      await pool.query(
+        `INSERT INTO conversation_message
+           (role, content, turn_id, effective_at, time_source,
+            client_time_status, server_received_at)
+         VALUES ('assistant', 'legacy reply', $1, now(), 'server', 'absent', now())`,
+        [legacyTurnId],
+      );
 
-    // Re-apply every migration that owns the recreated trace tables or adds
-    // a system-message chunk classification, in the worker composition order.
-    const applied = await runMigrations(pool, [
-      ...conversationMigrations,
-      ...articleMigrations,
-      ...relationshipMigrations,
-      ...routineMigrations,
-      ...temporalMigrations,
-    ]);
-    assert.deepEqual(applied.applied, [
-      "0002_conversation_tracing",
-      "0004_chat_identity",
-      "0008_article_share_and_evidence",
-      "0011_relationship_chat_chunk",
-      "0013_routine_chat_chunk",
-      "0017_trace_attempt_temporal_context",
-    ]);
-    const chunkConstraint = await pool.query(
-      `SELECT pg_get_constraintdef(oid) AS definition
-       FROM pg_constraint
-       WHERE conrelid = 'trace_attempt_chat_message'::regclass
-         AND conname = 'trace_attempt_chat_message_chunk_check'`,
-    );
-    assert.match(chunkConstraint.rows[0].definition, /relationship/);
-    assert.match(chunkConstraint.rows[0].definition, /routine/);
+      // Re-apply every migration that owns the recreated trace tables or adds
+      // a system-message chunk classification, in the worker composition order.
+      const applied = await runMigrations(pool, workerMigrations);
+      assert.deepEqual(applied.applied, [
+        "0002_conversation_tracing",
+        "0004_chat_identity",
+        "0008_article_share_and_evidence",
+        "0011_relationship_chat_chunk",
+        "0013_routine_chat_chunk",
+        "0017_trace_attempt_temporal_context",
+        "0018_generic_prompt_modules",
+        "0019_prompt_module_chat_attribution",
+      ]);
+      const chunkConstraint = await pool.query(
+        `SELECT pg_get_constraintdef(oid) AS definition
+         FROM pg_constraint
+         WHERE conrelid = 'trace_attempt_chat_message'::regclass
+           AND conname = 'trace_attempt_chat_message_chunk_check'`,
+      );
+      assert.match(chunkConstraint.rows[0].definition, /relationship/);
+      assert.match(chunkConstraint.rows[0].definition, /routine/);
+      assert.match(chunkConstraint.rows[0].definition, /prompt_module/);
 
-    // The legacy row is untouched: the decision JSONB is exactly as inserted,
-    // and no attempt rows were fabricated for it.
-    const turn = await pool.query(
-      "SELECT status, selected_pattern_id, decision FROM conversation_turn WHERE id = $1",
-      [legacyTurnId],
-    );
-    assert.deepEqual(turn.rows[0].decision, {
-      choice: "concise",
-      confidence: 0.9,
-      model: "legacy-model",
+      // The legacy row is untouched: the decision JSONB is exactly as inserted,
+      // and no attempt rows were fabricated for it.
+      const turn = await pool.query(
+        "SELECT status, selected_pattern_id, decision FROM conversation_turn WHERE id = $1",
+        [legacyTurnId],
+      );
+      assert.deepEqual(turn.rows[0].decision, {
+        choice: "concise",
+        confidence: 0.9,
+        model: "legacy-model",
+      });
+      const attemptRows = await pool.query(
+        "SELECT count(*)::int AS n FROM trace_attempt WHERE turn_id = $1",
+        [legacyTurnId],
+      );
+      assert.equal(attemptRows.rows[0].n, 0);
+
+      // The report presents the legacy turn with no recorded attempts and its
+      // legacy decision JSONB, clearly kept apart from traced attempts.
+      const report = await store.getTurnTraceReport({ turnId: legacyTurnId });
+      assert.equal(report.turn.id, legacyTurnId);
+      assert.deepEqual(report.turn.decision, {
+        choice: "concise",
+        confidence: 0.9,
+        model: "legacy-model",
+      });
+      assert.equal(report.attempts.length, 0);
     });
-    const attemptRows = await pool.query(
-      "SELECT count(*)::int AS n FROM trace_attempt WHERE turn_id = $1",
-      [legacyTurnId],
-    );
-    assert.equal(attemptRows.rows[0].n, 0);
-
-    // The report presents the legacy turn with no recorded attempts and its
-    // legacy decision JSONB, clearly kept apart from traced attempts.
-    const report = await store.getTurnTraceReport({ turnId: legacyTurnId });
-    assert.equal(report.turn.id, legacyTurnId);
-    assert.deepEqual(report.turn.decision, {
-      choice: "concise",
-      confidence: 0.9,
-      model: "legacy-model",
-    });
-    assert.equal(report.attempts.length, 0);
-
-    // The rolled-back-and-reapplied chat-identity table starts empty again:
-    // re-provision the fixture row the rest of the suite assumes.
-    await pool.query(
-      `INSERT INTO chat_identity (id, content, revision)
-       VALUES ('identity', 'Integration fixture identity: generic test text.', 1)`,
-    );
   });
 
   /**

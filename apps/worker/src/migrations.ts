@@ -8,6 +8,7 @@ import { articleMigrations } from "./articles/migrations.ts";
 import { relationshipMigrations } from "./relationship/migrations.ts";
 import { routineMigrations } from "./routine/migrations.ts";
 import { temporalMigrations } from "./temporal/migrations.ts";
+import { promptModuleMigrations } from "./prompt-modules/migrations.ts";
 
 /**
  * The single ordered migration composition used by both worker startup and
@@ -21,6 +22,7 @@ export const workerMigrations = [
   ...relationshipMigrations,
   ...routineMigrations,
   ...temporalMigrations,
+  ...promptModuleMigrations,
 ] as const;
 
 /** Apply the complete worker schema without starting runtime services. */

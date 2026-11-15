@@ -15,6 +15,7 @@ import {
   renderChat,
   renderDecision,
   renderDecisionAnnotation,
+  renderPromptModules,
   renderReport,
 } from "../../apps/worker/src/cli.ts";
 
@@ -559,5 +560,44 @@ describe("worker trace CLI rendering: per-question decisions and the article act
     assert.ok(text.includes("decision (choice, question response_pattern):"));
     assert.ok(!text.includes("article action:"));
     assert.ok(!text.includes("decisions ("));
+  });
+});
+
+describe("worker trace CLI rendering: generic prompt modules", () => {
+  it("reports criteria, decisions, outcome, timing, fallback, and inclusion without code or secrets", () => {
+    const lines = renderPromptModules([{
+      moduleId: "service-module-id",
+      moduleKey: "service_module",
+      position: 2,
+      decisionDescription: "Use when a supplementary status note is relevant.",
+      definitionHash: "a".repeat(64),
+      fallbackAvailable: true,
+      decisionState: "responded",
+      decisionModel: "decision-model",
+      responseModel: "decision-build",
+      responseProvider: "provider",
+      decisionChoice: "include",
+      selected: true,
+      confidence: 0.8,
+      probabilities: [{ optionId: "include", value: 0.8 }],
+      decisionMs: 24,
+      executionState: "timed_out",
+      executionOrdinal: 0,
+      executionMs: 5000,
+      failureKind: "execution_timeout",
+      outputReady: true,
+      fallbackSelected: true,
+      fallbackUsed: true,
+      included: true,
+      chatMessagePosition: 4,
+    }]);
+    const text = lines.join("\n");
+    assert.ok(text.includes("applicability:"));
+    assert.ok(text.includes("decision: state=responded, choice=include, selected=true"));
+    assert.ok(text.includes("execution: timed_out, ordinal=0, ms=5000, failure=execution_timeout"));
+    assert.ok(text.includes("output ready=true, fallback: available=true, selected=true, used=true"));
+    assert.ok(text.includes("prompt inclusion: chat message position 4"));
+    assert.ok(!text.includes("functionDefinition"));
+    assert.ok(!text.includes("module-secret-canary"));
   });
 });

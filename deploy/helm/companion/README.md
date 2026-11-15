@@ -81,6 +81,10 @@ application re-verifies at runtime:
   [`examples/companion-secrets.example.yaml`](examples/companion-secrets.example.yaml)
   for the expected keys (`WORKER_DATABASE_URL`, `OPENROUTER_API_KEY`,
   `WORKER_API_TOKEN`, plus the web keys when one shared Secret is used).
+  `WORKER_PROMPT_MODULE_CREDENTIALS_JSON` is optional and, when present, is a
+  JSON object of explicitly exposed credentials for trusted DB-authored prompt
+  modules; it is never required for ordinary chat. See the worker's
+  [prompt module trust and configuration notes](../../../apps/worker/README.md#generic-prompt-modules).
   `WORKER_API_TOKEN` is the private service-to-service credential and must
   equal the web deployment's `WEB_WORKER_TOKEN`. The example must be copied
   to a local version-control-excluded location and filled in before

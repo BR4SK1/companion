@@ -127,8 +127,10 @@ worker:
   service:
     port: 8080
   # Name of an existing Secret in the release namespace that must provide the
-  # keys WORKER_DATABASE_URL, OPENROUTER_API_KEY, and WORKER_API_TOKEN. The
-  # chart never creates or templates secrets. WORKER_API_TOKEN is the private
+  # keys WORKER_DATABASE_URL, OPENROUTER_API_KEY, and WORKER_API_TOKEN; it may
+  # also optionally provide WORKER_PROMPT_MODULE_CREDENTIALS_JSON, a JSON
+  # object explicitly passed to trusted prompt modules. The chart never creates
+  # or templates secrets. WORKER_API_TOKEN is the private
   # service-to-service credential; the web deployment's WEB_WORKER_TOKEN must
   # hold the same value.
   existingSecret: ""

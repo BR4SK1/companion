@@ -1,5 +1,6 @@
 /**
- * Per-turn processing: response-pattern decision first, chat second.
+ * Per-turn processing: response-pattern/article decisions, independent optional
+ * module applicability/execution, then chat.
  *
  * The processor is transport-agnostic: the caller injects the two capability
  * calls and the context loaders. This keeps the orchestration testable
@@ -84,6 +85,18 @@ import type {
   DecisionsResponse,
 } from "@companion/openrouter";
 import { parseChatResponse } from "@companion/openrouter/chat";
+import { runPromptModules } from "../prompt-modules/runtime.ts";
+import type {
+  PromptModuleContext,
+  PromptModuleDefinition,
+  PromptModuleDecisionTrace,
+  PromptModuleExecutionTrace,
+  PromptModulePromptOutput,
+  PromptModuleRunResult,
+  PromptModuleTraceBoundary,
+} from "../prompt-modules/types.ts";
+import { PromptModuleTraceWriteError } from "../prompt-modules/types.ts";
+import { TraceWriteFencedError } from "../conversation/store.ts";
 import {
   parseDecisionsExchange,
   parseDecisionsRequest,
@@ -92,6 +105,8 @@ import {
 export interface TurnProcessorDeps {
   readonly decisionModel: string;
   readonly chatModel: string;
+  /** Current lease owner for fenced prompt-module trace writes. */
+  readonly leaseOwner?: string;
   /** Injectable wall-clock source for deterministic attempt-context tests. */
   readonly now?: () => Date;
   /** Perform the Decisions call; resolves with the raw response body. */
@@ -189,6 +204,31 @@ export interface TurnProcessorDeps {
   readonly loadRelationshipContext?: (turnId: string, referenceTime: Date) => Promise<string | null>;
   /** Optional configured scheduled/applied routine state; failures degrade to no context. */
   readonly loadRoutineContext?: (turnId: string, referenceTime: Date) => Promise<string | null>;
+  /** Enabled prompt modules are loaded afresh for each attempt. */
+  readonly loadPromptModules?: () => Promise<readonly PromptModuleDefinition[]>;
+  /** Explicit service credentials only; the full worker environment is not passed to module code. */
+  readonly promptModuleCredentials?: Readonly<Record<string, string>>;
+  readonly executePromptModule?: (input: {
+    readonly module: PromptModuleDefinition;
+    readonly context: PromptModuleContext;
+  }) => Promise<PromptModuleRunResult>;
+  readonly recordPromptModuleDefinitions?: (input: {
+    readonly turnId: string;
+    readonly leaseOwner: string;
+    readonly decisionModel: string;
+    readonly modules: readonly PromptModuleDefinition[];
+  }) => Promise<void>;
+  readonly recordPromptModuleDecision?: (input: {
+    readonly turnId: string;
+    readonly leaseOwner: string;
+    readonly result: PromptModuleDecisionTrace;
+  }) => Promise<void>;
+  readonly recordPromptModuleExecution?: (input: {
+    readonly turnId: string;
+    readonly leaseOwner: string;
+    readonly result: PromptModuleExecutionTrace;
+  }) => Promise<void>;
+  readonly log?: (message: string) => void;
   /** Learns only from the just-completed new turn; failures never fail chat. */
   readonly extractRelationshipAnswers?: (input: {
     readonly turnId: string;
@@ -220,6 +260,20 @@ function decisionState(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+async function recordPromptModuleTrace<T>(
+  boundary: PromptModuleTraceBoundary,
+  write: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await write();
+  } catch (error) {
+    if (error instanceof TraceWriteFencedError) throw error;
+    // Trace errors can carry SQL/provider text; retain only the fixed feature
+    // boundary category and never echo raw detail into turn state or logs.
+    throw new PromptModuleTraceWriteError(boundary);
+  }
 }
 
 /**
@@ -584,6 +638,59 @@ export async function processTurnWork(
     }
   }
 
+  let promptModuleChunks: readonly PromptModulePromptOutput[] = [];
+  const promptModuleTracingReady =
+    deps.recordPromptModuleDefinitions !== undefined &&
+    deps.recordPromptModuleDecision !== undefined &&
+    deps.recordPromptModuleExecution !== undefined &&
+    deps.executePromptModule !== undefined &&
+    deps.leaseOwner !== undefined;
+  if (deps.loadPromptModules !== undefined && promptModuleTracingReady) {
+    try {
+      const modules = await deps.loadPromptModules();
+      if (modules.length > 0) {
+        promptModuleChunks = await runPromptModules({
+          turnId: work.turn.id,
+          leaseOwner: deps.leaseOwner!,
+          decisionModel: deps.decisionModel,
+          state: decisionState(history, work.messages),
+          modules,
+          context: {
+            credentials: deps.promptModuleCredentials ?? {},
+            conversation: [...history, ...work.messages].map((message) => ({
+              role: message.role,
+              content: message.content,
+            })),
+          },
+          callDecisions: deps.callDecisions,
+          execute: deps.executePromptModule!,
+          recordDefinitions: (input) => recordPromptModuleTrace("definitions", () =>
+            deps.recordPromptModuleDefinitions!(input),
+          ),
+          recordDecision: (input) => recordPromptModuleTrace("decision", () =>
+            deps.recordPromptModuleDecision!(input),
+          ),
+          recordExecution: (input) => recordPromptModuleTrace("execution", () =>
+            deps.recordPromptModuleExecution!(input),
+          ),
+          ...(deps.log !== undefined ? { log: deps.log } : {}),
+        });
+      }
+    } catch (error) {
+      if (error instanceof TraceWriteFencedError) throw error;
+      // Prompt modules are optional and additive. A non-fencing feature trace
+      // failure drops their outputs, but does not displace the mandatory chat
+      // request/outcome trace. Raw SQL and function errors may contain secrets.
+      const operationalCategory = error instanceof PromptModuleTraceWriteError
+        ? `trace_write_failed boundary=${error.boundary}`
+        : "processing_failed boundary=module_runtime";
+      (deps.log ?? console.warn)(
+        `[PROMPT_MODULE] ${operationalCategory}; continuing without module thoughts`,
+      );
+      promptModuleChunks = [];
+    }
+  }
+
   const temporal = deps.temporalSettings === undefined
     ? undefined
     : buildTemporalContext(attemptReferenceTime, deps.temporalSettings);
@@ -607,35 +714,59 @@ export async function processTurnWork(
   // The assembled prompt is the single source of truth for the wire request
   // and its trace metadata: chunk classification and source linkage are
   // index-aligned by construction.
-  const { request: chatRequest, messages: assembledMessages } = buildChatPrompt({
-    model: deps.chatModel,
-    history,
-    turnMessages: work.messages,
-    identity: identity.content,
-    guidance: selected !== undefined ? selected.responseGuidance : null,
-    ...(profilesChunk !== null ? { profiles: profilesChunk } : {}),
-    temporal: fullTemporalChunk,
-    ...(recallChunk !== null ? { recall: recallChunk } : {}),
-    ...(articleChunk !== null ? { article: articleChunk } : {}),
-    ...(relationshipChunk !== null ? { relationship: relationshipChunk } : {}),
-    ...(routineChunk !== null ? { routine: routineChunk } : {}),
-    ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
-    ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
+  const assemblePrompt = (modules: readonly PromptModulePromptOutput[]) =>
+    buildChatPrompt({
+      model: deps.chatModel,
+      history,
+      turnMessages: work.messages,
+      identity: identity.content,
+      guidance: selected !== undefined ? selected.responseGuidance : null,
+      ...(profilesChunk !== null ? { profiles: profilesChunk } : {}),
+      temporal: fullTemporalChunk,
+      ...(recallChunk !== null ? { recall: recallChunk } : {}),
+      ...(articleChunk !== null ? { article: articleChunk } : {}),
+      ...(relationshipChunk !== null ? { relationship: relationshipChunk } : {}),
+      ...(routineChunk !== null ? { routine: routineChunk } : {}),
+      ...(modules.length > 0 ? { promptModules: modules } : {}),
+      ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
+      ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
+    });
+  let { request: chatRequest, messages: assembledMessages } = assemblePrompt(promptModuleChunks);
+  const alignedChatTrace = () => ({
+    messageSources: assembledMessages.map((message) => message.sourceMessageId),
+    messageChunks: assembledMessages.map((message) => message.chunk),
+    messagePromptModuleIds: assembledMessages.map((message) => message.promptModuleId),
   });
-  const messageSources = assembledMessages.map(
-    (message) => message.sourceMessageId,
-  );
-  const messageChunks = assembledMessages.map((message) => message.chunk);
+  let { messageSources, messageChunks, messagePromptModuleIds } = alignedChatTrace();
 
-  // Chat request boundary: persisted before the provider call.
+  // Chat request boundary: persisted before the provider call. If the optional
+  // module-to-message association alone cannot be recorded, discard all module
+  // outputs and retry the mandatory baseline chat trace without them.
   if (deps.recordChatRequest !== undefined) {
-    await deps.recordChatRequest({
+    const recordRequest = () => deps.recordChatRequest!({
       request: chatRequest,
       messageSources,
       messageChunks,
+      messagePromptModuleIds,
       identityRevision: identity.revision,
       temporalContext: temporalTrace,
     });
+    try {
+      await recordRequest();
+    } catch (error) {
+      if (
+        !(error instanceof PromptModuleTraceWriteError) ||
+        error.boundary !== "chat_attribution" ||
+        promptModuleChunks.length === 0
+      ) throw error;
+      (deps.log ?? console.warn)(
+        "[PROMPT_MODULE] trace_write_failed boundary=chat_attribution; continuing without module thoughts",
+      );
+      promptModuleChunks = [];
+      ({ request: chatRequest, messages: assembledMessages } = assemblePrompt([]));
+      ({ messageSources, messageChunks, messagePromptModuleIds } = alignedChatTrace());
+      await recordRequest();
+    }
   }
 
   let rawChatResponse: unknown;
@@ -651,11 +782,14 @@ export async function processTurnWork(
           request: chatRequest,
           messageSources,
           messageChunks,
+          messagePromptModuleIds,
           identityRevision: identity.revision,
           outcome: chatFailureTrace(error),
         });
-      } catch {
-        // best-effort; the original error propagates
+      } catch (traceError) {
+        // Preserve the original transport error for ordinary trace failures,
+        // but a lease fence always stops this stale attempt.
+        if (traceError instanceof TraceWriteFencedError) throw traceError;
       }
     }
     throw error;
@@ -672,11 +806,14 @@ export async function processTurnWork(
           request: chatRequest,
           messageSources,
           messageChunks,
+          messagePromptModuleIds,
           identityRevision: identity.revision,
           outcome: chatInvalidTrace(error),
         });
-      } catch {
-        // best-effort; the original error propagates
+      } catch (traceError) {
+        // Preserve the original contract error for ordinary trace failures,
+        // but a lease fence always stops this stale attempt.
+        if (traceError instanceof TraceWriteFencedError) throw traceError;
       }
     }
     throw error;
@@ -698,6 +835,7 @@ export async function processTurnWork(
       request: chatRequest,
       messageSources,
       messageChunks,
+      messagePromptModuleIds,
       identityRevision: identity.revision,
       outcome: {
         kind: "responded",
