@@ -7,8 +7,9 @@
  * boundary values (choice, optional probabilities/confidence) for every
  * recorded decision question — the response-pattern decision and, when
  * asked, the per-turn article-memory share decision, whose action is
- * annotated as prompt inclusion only, never a share claim — and the chat
- * boundary (request messages, response choices, usage).
+ * annotated as prompt inclusion only, never a share claim; optional generic
+ * prompt-module criteria/decisions/execution metadata; and the chat boundary
+ * (request messages, response choices, usage).
  *
  * The CLI only ever reads; it never writes. It requires no provider
  * credentials: the worker's database URL is the only configuration it needs.
@@ -19,9 +20,11 @@ import { pathToFileURL } from "node:url";
 import {
   closePostgresPool,
   createPostgresPool,
+  type PostgresPool,
 } from "@companion/postgres";
 
 import { createConversationStore } from "./conversation/store.ts";
+import { createPromptModuleStore } from "./prompt-modules/store.ts";
 import { ARTICLE_SHARE_QUESTION_ID } from "./articles/share.ts";
 import type {
   TraceChat,
@@ -29,6 +32,16 @@ import type {
   TurnAttemptTrace,
   TurnTraceReport,
 } from "./conversation/types.ts";
+import type { PromptModuleTraceRecord } from "./prompt-modules/types.ts";
+
+/** Compose the read-only report store with each domain's feature-owned trace reader. */
+export function createTraceReportStore(pool: PostgresPool) {
+  const promptModuleStore = createPromptModuleStore(pool);
+  return createConversationStore(pool, {
+    loadPromptModuleTrace: (client, attemptId) =>
+      promptModuleStore.loadAttemptTrace(client, attemptId),
+  });
+}
 
 export function printUsage(): void {
   console.log("Usage: node src/cli.ts <turnId> [--json]");
@@ -184,6 +197,36 @@ export function renderDecisionAnnotation(
   return lines;
 }
 
+export function renderPromptModules(
+  modules: readonly PromptModuleTraceRecord[],
+): readonly string[] {
+  if (modules.length === 0) return ["  prompt modules: (none selected/configured for this attempt)"];
+  const lines: string[] = [`  prompt modules (${modules.length} configured):`];
+  for (const module of modules) {
+    lines.push(`    ${String(module.position)}: ${module.moduleKey} (id=${module.moduleId})`);
+    lines.push(`      applicability: ${JSON.stringify(module.decisionDescription)}`);
+    lines.push(`      definition sha256: ${module.definitionHash}`);
+    lines.push(
+      `      decision: state=${module.decisionState}, choice=${module.decisionChoice ?? "(none)"}, selected=${module.selected ?? "(unknown)"}, model=${module.responseModel ?? module.decisionModel ?? "(n/a)"}, ms=${module.decisionMs ?? "(n/a)"}`,
+    );
+    if (module.confidence !== null) lines.push(`      confidence: ${module.confidence}`);
+    for (const probability of module.probabilities) {
+      lines.push(`      probability ${probability.optionId}: ${probability.value}`);
+    }
+    lines.push(
+      `      execution: ${module.executionState}, ordinal=${module.executionOrdinal ?? "(n/a)"}, ms=${module.executionMs ?? "(n/a)"}, failure=${module.failureKind ?? "(none)"}`,
+    );
+    lines.push(
+      `      output ready=${module.outputReady}, fallback: available=${module.fallbackAvailable}, selected=${module.fallbackSelected}, used=${module.fallbackUsed}`,
+    );
+    lines.push(
+      `      prompt inclusion: ${module.included ? `chat message position ${String(module.chatMessagePosition)}` : "omitted"}`,
+    );
+  }
+  lines.push("    function source, credentials, and module output are not duplicated here; included output appears only in the normal chat request trace.");
+  return lines;
+}
+
 export function renderAttempt(attempt: TurnAttemptTrace): readonly string[] {
   const lines: string[] = [];
   const outcome = attempt.outcome ?? "in flight (never finalized)";
@@ -240,6 +283,7 @@ export function renderAttempt(attempt: TurnAttemptTrace): readonly string[] {
   } else {
     lines.push("  decision: (not recorded)");
   }
+  lines.push(...renderPromptModules(attempt.promptModules ?? []));
   if (attempt.chat !== null) {
     lines.push(...renderChat(attempt.chat));
   } else {
@@ -306,7 +350,7 @@ async function main(): Promise<void> {
 
   const pool = createPostgresPool({ connectionString: databaseUrl });
   try {
-    const store = createConversationStore(pool);
+    const store = createTraceReportStore(pool);
     const report = await store.getTurnTraceReport({ turnId });
     if (json) {
       console.log(JSON.stringify(report, null, 2));

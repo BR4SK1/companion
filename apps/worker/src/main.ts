@@ -73,6 +73,8 @@ import { getTemporalSummaryPromptContext } from "./memory/temporal/store.ts";
 import { getProfileDocument } from "./memory/profiles-v2.ts";
 import { memoryErrorCategory } from "./memory/errors.ts";
 import { loadTemporalSettings } from "./temporal/store.ts";
+import { createPromptModuleStore } from "./prompt-modules/store.ts";
+import { executePromptModule } from "./prompt-modules/executor.ts";
 
 /**
  * Runs one fenced trace write and refuses to continue on a lost lease. The
@@ -195,6 +197,7 @@ async function main(): Promise<void> {
     const routineStore = createRoutineStore({ pool, timezone: temporalSettings.timezone });
     await routineStore.reconcile();
 
+    const promptModuleStore = createPromptModuleStore(pool);
     const store = createConversationStore(pool, {
       clientTimeMaxAheadMs: config.clientTimeMaxAheadMs,
       ...(engagementStore !== undefined
@@ -203,6 +206,10 @@ async function main(): Promise<void> {
               engagementStore.onUserMessageInserted(tx, inserted),
           }
         : {}),
+      onPromptModuleChatMessagesRecorded: (client, association) =>
+        promptModuleStore.recordChatAttribution(client, association),
+      loadPromptModuleTrace: (client, attemptId) =>
+        promptModuleStore.loadAttemptTrace(client, attemptId),
     });
     routineRuntime = startRoutineRuntime({
       store: routineStore,
@@ -507,6 +514,7 @@ async function main(): Promise<void> {
           processTurnWork(work, {
             decisionModel: config.openrouter.decisionModel,
             chatModel: config.openrouter.chatModel,
+            leaseOwner,
             temporalSettings,
             callDecisions: (request) =>
               postJson(config.openrouter.decisionsUrl, request, {
@@ -519,6 +527,21 @@ async function main(): Promise<void> {
                 timeoutMs: config.openrouter.chatTimeoutMs,
               }),
             loadPatterns: () => store.getEnabledResponsePatterns(),
+            loadPromptModules: () => promptModuleStore.loadEnabled(),
+            promptModuleCredentials: config.promptModuleCredentials,
+            executePromptModule,
+            recordPromptModuleDefinitions: (payload) =>
+              recordTraced("prompt-module definitions", work.turn.id, () =>
+                promptModuleStore.recordDefinitions(payload),
+              ),
+            recordPromptModuleDecision: (payload) =>
+              recordTraced("prompt-module decision", work.turn.id, () =>
+                promptModuleStore.recordDecision(payload),
+              ),
+            recordPromptModuleExecution: (payload) =>
+              recordTraced("prompt-module execution", work.turn.id, () =>
+                promptModuleStore.recordExecution(payload),
+              ),
             // Required, fail-closed configuration: a missing or empty
             // identity row is an IdentityConfigurationError that fails the
             // attempt before any snapshot, decision, or provider call — the

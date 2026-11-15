@@ -80,6 +80,7 @@ import type {
   TurnTraceReport,
   TurnWork,
 } from "./types.ts";
+import type { PromptModuleTraceRecord } from "../prompt-modules/types.ts";
 import { IdentityConfigurationError } from "./types.ts";
 
 /**
@@ -258,6 +259,20 @@ export interface ConversationStoreOptions {
   readonly onUserMessageInserted?: UserMessageInsertedHook;
   /** Post-commit notification for new user messages; errors are swallowed. */
   readonly onUserMessageCommitted?: UserMessageCommittedHook;
+  /** Feature-owned module attribution, invoked atomically with chat message rows. */
+  readonly onPromptModuleChatMessagesRecorded?: (
+    client: PostgresPoolClient,
+    input: {
+      readonly attemptId: string;
+      readonly chatId: string;
+      readonly messages: readonly { readonly moduleId: string; readonly position: number }[];
+    },
+  ) => Promise<void>;
+  /** Feature-owned read of prompt-module trace rows within the report snapshot. */
+  readonly loadPromptModuleTrace?: (
+    client: PostgresPoolClient,
+    attemptId: string,
+  ) => Promise<readonly PromptModuleTraceRecord[]>;
 }
 
 /**
@@ -1250,6 +1265,71 @@ export function createConversationStore(
     }
   }
 
+  function alignedPromptModuleIds(
+    payload: ChatRequestTracePayload | ChatOutcomeTracePayload,
+  ): readonly (string | null)[] {
+    const messageCount = payload.request.messages.length;
+    if (payload.messageSources.length !== messageCount) {
+      throw new Error("chat trace messageSources must align with the request messages");
+    }
+    if (payload.messageChunks.length !== messageCount) {
+      throw new Error("chat trace messageChunks must align with the request messages");
+    }
+    const promptModuleIds = payload.messagePromptModuleIds ?? Array.from(
+      { length: messageCount },
+      () => null,
+    );
+    if (promptModuleIds.length !== messageCount) {
+      throw new Error("chat trace messagePromptModuleIds must align with the request messages");
+    }
+    for (let position = 0; position < messageCount; position += 1) {
+      const isPromptModule = payload.messageChunks[position] === "prompt_module";
+      if (isPromptModule !== (promptModuleIds[position] !== null)) {
+        throw new Error("prompt_module chunks require exactly one aligned module id");
+      }
+    }
+    return promptModuleIds;
+  }
+
+  async function insertChatMessageRows(
+    client: PostgresPoolClient,
+    attemptId: string,
+    chatId: string,
+    payload: ChatRequestTracePayload | ChatOutcomeTracePayload,
+  ): Promise<void> {
+    const promptModuleIds = alignedPromptModuleIds(payload);
+    if (payload.request.messages.length > 0) {
+      await client.query(
+        `INSERT INTO trace_attempt_chat_message
+           (chat_id, position, role, content, source_message_id, chunk)
+         SELECT $1, s.position, s.role, s.content, s.source_message_id, s.chunk
+         FROM unnest($2::int[], $3::text[], $4::text[], $5::uuid[], $6::text[])
+              AS s(position, role, content, source_message_id, chunk)`,
+        [
+          chatId,
+          payload.request.messages.map((_, index) => index),
+          payload.request.messages.map((message) => message.role),
+          payload.request.messages.map((message) => message.content),
+          payload.messageSources,
+          payload.messageChunks,
+        ],
+      );
+    }
+    const moduleMessages = promptModuleIds.flatMap((moduleId, position) =>
+      moduleId === null ? [] : [{ moduleId, position }],
+    );
+    if (moduleMessages.length > 0) {
+      if (options?.onPromptModuleChatMessagesRecorded === undefined) {
+        throw new Error("prompt-module chat attribution writer is not configured");
+      }
+      await options.onPromptModuleChatMessagesRecorded(client, {
+        attemptId,
+        chatId,
+        messages: moduleMessages,
+      });
+    }
+  }
+
   /**
    * Writes the chat request record: the exact request as sent, with per-message
    * source linkage, in state `requested` before the provider call. Fenced and
@@ -1260,16 +1340,6 @@ export function createConversationStore(
     attemptId: string,
     payload: ChatRequestTracePayload,
   ): Promise<void> {
-    if (payload.messageSources.length !== payload.request.messages.length) {
-      throw new Error(
-        "chat trace messageSources must align with the request messages",
-      );
-    }
-    if (payload.messageChunks.length !== payload.request.messages.length) {
-      throw new Error(
-        "chat trace messageChunks must align with the request messages",
-      );
-    }
     if (payload.temporalContext !== undefined) {
       const temporal = payload.temporalContext;
       await client.query(
@@ -1318,29 +1388,14 @@ export function createConversationStore(
     if (chatRow === undefined) {
       throw new Error("chat trace upsert returned no row");
     }
-    // Re-write the exact messages each time: the request is the attempt's
-    // boundary fact, recorded as sent.
+    // Feature-owned attribution references use ON DELETE CASCADE; its trigger
+    // clears inclusion state if this request replaces previously attributed rows.
+    // A module-free request therefore needs no prompt-module-store access.
     await client.query(
       `DELETE FROM trace_attempt_chat_message WHERE chat_id = $1`,
       [chatRow.id],
     );
-    if (payload.request.messages.length > 0) {
-      await client.query(
-        `INSERT INTO trace_attempt_chat_message
-           (chat_id, position, role, content, source_message_id, chunk)
-         SELECT $1, s.position, s.role, s.content, s.source_message_id, s.chunk
-         FROM unnest($2::int[], $3::text[], $4::text[], $5::uuid[], $6::text[])
-              AS s(position, role, content, source_message_id, chunk)`,
-        [
-          chatRow.id,
-          payload.request.messages.map((_, index) => index),
-          payload.request.messages.map((message) => message.role),
-          payload.request.messages.map((message) => message.content),
-          payload.messageSources.map((source) => source),
-          payload.messageChunks.map((chunk) => chunk),
-        ],
-      );
-    }
+    await insertChatMessageRows(client, attemptId, chatRow.id, payload);
   }
 
   /**
@@ -1359,16 +1414,7 @@ export function createConversationStore(
     attemptId: string,
     payload: ChatOutcomeTracePayload,
   ): Promise<void> {
-    if (payload.messageSources.length !== payload.request.messages.length) {
-      throw new Error(
-        "chat trace messageSources must align with the request messages",
-      );
-    }
-    if (payload.messageChunks.length !== payload.request.messages.length) {
-      throw new Error(
-        "chat trace messageChunks must align with the request messages",
-      );
-    }
+    alignedPromptModuleIds(payload);
     const outcome = payload.outcome;
     let state: string;
     let responseId: string | null = null;
@@ -1449,29 +1495,17 @@ export function createConversationStore(
     if (chatRow === undefined) {
       throw new Error("chat trace upsert returned no row");
     }
-    // Re-write the exact messages and choices each time: the request and
-    // response are the attempt's boundary facts, recorded as returned.
-    await client.query(
-      `DELETE FROM trace_attempt_chat_message WHERE chat_id = $1`,
+    // The request boundary owns the exact message snapshot and its module
+    // associations. Preserve it when present; direct outcome-only callers get
+    // the same self-contained message trace as before.
+    const existingMessages = await client.query<{ position: number }>(
+      `SELECT position FROM trace_attempt_chat_message WHERE chat_id = $1 LIMIT 1`,
       [chatRow.id],
     );
-    if (payload.request.messages.length > 0) {
-      await client.query(
-        `INSERT INTO trace_attempt_chat_message
-           (chat_id, position, role, content, source_message_id, chunk)
-         SELECT $1, s.position, s.role, s.content, s.source_message_id, s.chunk
-         FROM unnest($2::int[], $3::text[], $4::text[], $5::uuid[], $6::text[])
-              AS s(position, role, content, source_message_id, chunk)`,
-        [
-          chatRow.id,
-          payload.request.messages.map((_, index) => index),
-          payload.request.messages.map((message) => message.role),
-          payload.request.messages.map((message) => message.content),
-          payload.messageSources.map((source) => source),
-          payload.messageChunks.map((chunk) => chunk),
-        ],
-      );
+    if (existingMessages.rows.length === 0) {
+      await insertChatMessageRows(client, attemptId, chatRow.id, payload);
     }
+    // Choices are outcome data and remain idempotently replaced on each write.
     await client.query(
       `DELETE FROM trace_attempt_chat_choice WHERE chat_id = $1`,
       [chatRow.id],
@@ -1910,6 +1944,9 @@ export function createConversationStore(
             decisions.find((entry) => entry.questionId === "response_pattern") ??
             decisions[0] ??
             null;
+          const promptModules = options?.loadPromptModuleTrace === undefined
+            ? []
+            : await options.loadPromptModuleTrace(client, attemptRow.id);
           // Chat trace (one row per attempt, when the chat was recorded).
           const chatResult = await client.query<ChatRow>(
             `SELECT state, request_model, temperature, max_tokens,
@@ -2018,6 +2055,7 @@ export function createConversationStore(
             })),
             decision,
             decisions,
+            promptModules,
             chat,
           });
         }

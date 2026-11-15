@@ -25,6 +25,8 @@ test("worker startup and migration-only command share the complete ordered schem
       "0015_routine_announcement_period_id",
       "0016_authoritative_temporal_context",
       "0017_trace_attempt_temporal_context",
+      "0018_generic_prompt_modules",
+      "0019_prompt_module_chat_attribution",
     ],
   );
   assert.equal(new Set(workerMigrations.map(({ id }) => id)).size, workerMigrations.length);

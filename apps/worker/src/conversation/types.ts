@@ -14,14 +14,16 @@ import type {
   DecisionsResponse,
 } from "@companion/openrouter";
 import type { ChatRequest, ChatResponse } from "@companion/openrouter/chat";
+import type { PromptModuleTraceRecord } from "../prompt-modules/types.ts";
 
 export type MessageRole = "user" | "assistant";
 
 /**
  * Which assembly chunk a chat-request message belongs to. Synthetic system
  * messages are classified by their source (identity, generated subject
- * profiles, temporal memory, long-term recall, article and relationship
- * context, selected response-pattern guidance); every conversation message is `conversation`. The classification
+ * profiles, prompt-module thoughts, temporal memory, long-term recall, article,
+ * relationship and routine context, selected response-pattern guidance); every
+ * conversation message is `conversation`. The classification
  * is trace metadata only — the rendered text itself is already recorded in
  * the chat boundary as sent.
  */
@@ -33,6 +35,7 @@ export type ChatChunkName =
   | "article"
   | "relationship"
   | "routine"
+  | "prompt_module"
   | "guidance"
   | "conversation";
 
@@ -255,6 +258,8 @@ export interface ChatRequestTracePayload {
    * conversation message is `conversation`.
    */
   readonly messageChunks: readonly ChatChunkName[];
+  /** Optional feature-owned attribution aligned with messages; null for non-module chunks. */
+  readonly messagePromptModuleIds?: readonly (string | null)[];
   /** The `chat_identity` revision the request carried. */
   readonly identityRevision: number;
   /** Current local clock/season/occasion facts used by this exact request. */
@@ -293,6 +298,8 @@ export interface ChatOutcomeTracePayload {
   readonly request: ChatRequest;
   readonly messageSources: readonly (string | null)[];
   readonly messageChunks: readonly ChatChunkName[];
+  /** Optional feature-owned attribution aligned with messages; null for non-module chunks. */
+  readonly messagePromptModuleIds?: readonly (string | null)[];
   readonly identityRevision: number;
   readonly outcome: ChatOutcomeTrace;
 }
@@ -424,6 +431,8 @@ export interface TurnAttemptTrace {
    * boundary and selection outcome.
    */
   readonly decisions: readonly TraceDecision[];
+  /** Prompt-module criteria, decisions, execution outcomes, and inclusion metadata. */
+  readonly promptModules: readonly PromptModuleTraceRecord[];
   readonly chat: TraceChat | null;
 }
 

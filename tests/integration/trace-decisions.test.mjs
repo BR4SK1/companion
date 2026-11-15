@@ -22,6 +22,7 @@ import { conversationMigrations } from "../../apps/worker/src/conversation/migra
 import { memoryMigrations } from "../../apps/worker/src/memory/migrations.ts";
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
+import { promptModuleMigrations } from "../../apps/worker/src/prompt-modules/migrations.ts";
 import { createConversationStore } from "../../apps/worker/src/conversation/store.ts";
 import { processTurnWork } from "../../apps/worker/src/work/processor.ts";
 import { renderReport } from "../../apps/worker/src/cli.ts";
@@ -64,6 +65,7 @@ describe("turn trace report: every decision question (PostgreSQL)", { skip: !has
       ...memoryMigrations,
       ...articleMigrations,
       ...temporalMigrations,
+      ...promptModuleMigrations,
     ]);
     await pool.query(
       `INSERT INTO chat_identity (id, content, revision)

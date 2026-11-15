@@ -62,6 +62,14 @@ function truncate(text: string): string {
     : `${text.slice(0, MAX_RETAINED_BODY_LENGTH)}…`;
 }
 
+function timeoutError(url: string, timeoutMs: number, cause?: unknown): OpenRouterTransportError {
+  return new OpenRouterTransportError(
+    "timeout",
+    `request to ${url} timed out after ${String(timeoutMs)}ms`,
+    cause !== undefined ? { cause } : {},
+  );
+}
+
 /**
  * POST `body` as JSON and resolve with the parsed JSON response body.
  * Throws `OpenRouterTransportError` for network failure, timeout, non-2xx
@@ -75,14 +83,17 @@ export async function postJson(
 ): Promise<unknown> {
   const fetchImpl = options.fetchImpl ?? fetch;
   const controller = new AbortController();
+  let timeoutFired = false;
   const timeout =
     options.timeoutMs !== undefined
-      ? setTimeout(() => controller.abort(), options.timeoutMs)
+      ? setTimeout(() => {
+          timeoutFired = true;
+          controller.abort();
+        }, options.timeoutMs)
       : undefined;
 
-  let response: Response;
   try {
-    response = await fetchImpl(url, {
+    const response = await fetchImpl(url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -94,13 +105,46 @@ export async function postJson(
       body: JSON.stringify(body),
       signal: controller.signal,
     });
-  } catch (error) {
-    if (error instanceof Error && error.name === "AbortError") {
+    if (timeoutFired) throw timeoutError(url, options.timeoutMs ?? 0);
+
+    if (!response.ok) {
+      // Keep the existing best-effort HTTP error body policy, while allowing
+      // the overall deadline to interrupt a stalled body read.
+      const text = await response.text().catch((error: unknown) => {
+        if (
+          timeoutFired ||
+          (error instanceof Error && error.name === "AbortError")
+        ) {
+          throw error;
+        }
+        return "";
+      });
+      if (timeoutFired) throw timeoutError(url, options.timeoutMs ?? 0);
       throw new OpenRouterTransportError(
-        "timeout",
-        `request to ${url} timed out after ${String(options.timeoutMs ?? 0)}ms`,
+        "http_status",
+        `request to ${url} returned HTTP ${String(response.status)}`,
+        { status: response.status, body: text.length > 0 ? truncate(text) : undefined },
+      );
+    }
+
+    const text = await response.text();
+    if (timeoutFired) throw timeoutError(url, options.timeoutMs ?? 0);
+    try {
+      return JSON.parse(text) as unknown;
+    } catch (error) {
+      throw new OpenRouterTransportError(
+        "invalid_json",
+        `response from ${url} is not valid JSON`,
         { cause: error },
       );
+    }
+  } catch (error) {
+    if (error instanceof OpenRouterTransportError) throw error;
+    if (
+      timeoutFired ||
+      (error instanceof Error && error.name === "AbortError")
+    ) {
+      throw timeoutError(url, options.timeoutMs ?? 0, error);
     }
     throw new OpenRouterTransportError(
       "network",
@@ -111,25 +155,5 @@ export async function postJson(
     if (timeout !== undefined) {
       clearTimeout(timeout);
     }
-  }
-
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new OpenRouterTransportError(
-      "http_status",
-      `request to ${url} returned HTTP ${String(response.status)}`,
-      { status: response.status, body: text.length > 0 ? truncate(text) : undefined },
-    );
-  }
-
-  const text = await response.text();
-  try {
-    return JSON.parse(text) as unknown;
-  } catch (error) {
-    throw new OpenRouterTransportError(
-      "invalid_json",
-      `response from ${url} is not valid JSON`,
-      { cause: error },
-    );
   }
 }

@@ -1,35 +1,38 @@
 /**
  * Modular, deterministic chat prompt assembly for a claimed turn.
  *
- * Every synthetic section is its own system message (one chunk each), in a
+ * Each synthetic section is represented by system message(s) in a
  * fixed order, followed by the conversation messages in exact chronological
  * order:
  *
  * 1. `identity`     — the owner-authored identity/persona from `chat_identity`
  *                     (required configuration; a missing identity is a
  *                     configuration error upstream, never an invented one).
- * 2. `profiles`     — optional generated subject profiles (v2 observation
+ * 2. `prompt_module` — optional independently selected authoritative,
+ *                     additive companion thoughts/feelings from trusted
+ *                     database-configured functions.
+ * 3. `profiles`     — optional generated subject profiles (v2 observation
  *                     profiles). Kept as a separate chunk from the other
  *                     memory sections because it is a separately generated,
  *                     fingerprint-gated document rather than per-turn recall
  *                     output; it sits after identity and before the per-turn
  *                     memory chunks, preserving the profile→temporal→recall
  *                     relative order the single-memory-message layout used.
- * 3. `temporal`     — optional recent temporal memory summaries.
- * 4. `recall`       — optional long-term canonical recall for this turn.
- * 5. `article`      — optional per-turn article-memory context (the chosen
+ * 4. `temporal`     — optional recent temporal memory summaries.
+ * 5. `recall`       — optional long-term canonical recall for this turn.
+ * 6. `article`      — optional per-turn article-memory context (the chosen
  *                     article-memory share decision), placed after recall so
  *                     the lexical chunk stays first among memory sections.
- * 6. `relationship` — optional runtime-configured relationship/familiarity
+ * 7. `relationship` — optional runtime-configured relationship/familiarity
  *                     context, after article context and before guidance.
- * 7. `routine`     — optional scheduled/applied routine state and configured
+ * 8. `routine`     — optional scheduled/applied routine state and configured
  *                     interaction context, before response guidance.
- * 8. `guidance`     — the selected response pattern's response guidance
+ * 9. `guidance`     — the selected response pattern's response guidance
  *                     (absent when no pattern was selected — with no
  *                     patterns enabled, or none selected, the request simply
  *                     carries no guidance chunk; fallback policy for missing
  *                     selections is unresolved).
- * 9. `conversation` — the prior-turn history (oldest first, bounded to the
+ * 10. `conversation` — the prior-turn history (oldest first, bounded to the
  *                     most recent window by `getThreadContext`) followed by
  *                     the exact user messages grouped into the turn.
  *
@@ -49,18 +52,17 @@ import type {
   ChatChunkName,
   ConversationMessage,
 } from "../conversation/types.ts";
+import type { PromptModulePromptOutput } from "../prompt-modules/types.ts";
 
 /** One assembled prompt message with its chunk classification and source. */
 export interface AssembledChatMessage {
   readonly role: "system" | "user" | "assistant";
   readonly content: string;
   readonly chunk: ChatChunkName;
-  /**
-   * The conversation_message id for `conversation` messages; null for every
-   * synthetic system chunk (identity, profiles, temporal, recall, article,
-   * relationship, routine, guidance).
-   */
+  /** The conversation_message id for conversation messages; null for synthetic chunks. */
   readonly sourceMessageId: string | null;
+  /** The database module id for a prompt_module message; null otherwise. */
+  readonly promptModuleId: string | null;
 }
 
 export interface BuildChatRequestParams {
@@ -96,6 +98,8 @@ export interface BuildChatRequestParams {
   readonly relationship?: string | null;
   /** Optional configured routine state and reactive interaction context. */
   readonly routine?: string | null;
+  /** Independently selected module outputs with stable database identity/order. */
+  readonly promptModules?: readonly PromptModulePromptOutput[];
   readonly temperature?: number;
   readonly maxTokens?: number;
 }
@@ -124,7 +128,18 @@ export function buildChatPrompt(
     content: params.identity,
     chunk: "identity",
     sourceMessageId: null,
+    promptModuleId: null,
   });
+  for (const thought of params.promptModules ?? []) {
+    if (!hasContent(thought.content)) continue;
+    messages.push({
+      role: "system",
+      content: `Authoritative additive companion thoughts and feelings (not background data):\n${thought.content}`,
+      chunk: "prompt_module",
+      sourceMessageId: null,
+      promptModuleId: thought.moduleId,
+    });
+  }
   for (const [chunk, section] of [
     ["profiles", params.profiles],
     ["temporal", params.temporal],
@@ -139,6 +154,7 @@ export function buildChatPrompt(
         content: section as string,
         chunk,
         sourceMessageId: null,
+        promptModuleId: null,
       });
     }
   }
@@ -148,6 +164,7 @@ export function buildChatPrompt(
       content: params.guidance,
       chunk: "guidance",
       sourceMessageId: null,
+      promptModuleId: null,
     });
   }
   for (const message of [...params.history, ...params.turnMessages]) {
@@ -156,6 +173,7 @@ export function buildChatPrompt(
       content: message.content,
       chunk: "conversation",
       sourceMessageId: message.id,
+      promptModuleId: null,
     });
   }
   const request = parseChatRequest({

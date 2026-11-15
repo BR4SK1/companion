@@ -55,6 +55,14 @@ spec:
                 secretKeyRef:
                   name: {{ $secret }}
                   key: WORKER_API_TOKEN
+            {{- /* Optional named credentials for trusted prompt modules. When absent,
+            modules receive an empty credentials map. */}}
+            - name: WORKER_PROMPT_MODULE_CREDENTIALS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: WORKER_PROMPT_MODULE_CREDENTIALS_JSON
+                  optional: true
             - name: WORKER_HTTP_PORT
               value: {{ .Values.worker.containerPort | quote }}
             {{- range $key, $value := .Values.worker.env }}
