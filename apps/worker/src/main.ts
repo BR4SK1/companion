@@ -442,7 +442,7 @@ async function main(): Promise<void> {
     // fail-closed no-op that logs exactly `ingestion not configured`, so
     // starting the scheduler unconditionally is safe and keeps the
     // documented contract honest: provisioning (or disabling) the article
-    // tables takes effect on the next poll without a restart. The
+    // tables takes effect on the next scheduled attempt without a restart. The
     // OpenRouter endpoint and credential are environment configuration,
     // available regardless of provisioning state.
     articleRuntime = startArticleRuntime({

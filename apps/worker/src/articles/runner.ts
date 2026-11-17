@@ -10,8 +10,8 @@
  *   changes apply on the next attempt without a worker restart.
  * - Missing or incomplete configuration is a rollout state: the runner logs
  *   exactly `ingestion not configured` and returns before any feed fetch,
- *   provider call, or state write. It keeps polling, so provisioning later
- *   enables ingestion without a restart.
+ *   provider call, or state write. The runtime rechecks it on its fixed
+ *   12-hour scheduler cadence, so provisioning later enables ingestion.
  * - Fetch each enabled feed with bounded, SSRF-safe networking and persist
  *   excerpt-level items idempotently (unique per URL; a re-fetch never
  *   duplicates an item).
@@ -50,6 +50,12 @@ import {
   renderArticleReviewInput,
 } from "./prompts.ts";
 import { runArticleObservationConsolidation } from "./observation.ts";
+import {
+  ARTICLE_CONFIGURATION_RECHECK_MS,
+  ARTICLE_INGEST_INTERVAL_MS,
+  ArticleFeedShuffleCycle,
+  reserveArticleIngestionSlot,
+} from "./schedule.ts";
 import { boundedFetchText, checkFeedUrlSafety, parseFeed, resolveFeedHost } from "./rss.ts";
 import type { PinnedRequestFn } from "./pinnedHttp.ts";
 import type { FeedHostLookup } from "./rss.ts";
@@ -68,18 +74,8 @@ export const ARTICLE_INGEST_VERSION = "article-ingest-v1";
 
 /** How long a generation claim lease is held while an LLM attempt runs. */
 const DEFAULT_LEASE_MS = 10 * 60 * 1000;
-/** How often the runner wakes to check configuration and feeds when idle. */
-const DEFAULT_POLL_INTERVAL_MS = 15 * 60 * 1000;
-/**
- * Hard cap on feeds attempted per run: feed count is personal configuration
- * with no code-side bound, so without a cap one run's fetch phase (network
- * timeout per feed) would be unbounded. Feeds beyond the cap are not
- * starved: the runtime rotates the starting position across runs (see
- * `ArticleRuntimeDeps`), so every enabled feed is attempted over successive
- * runs. With the default 12s fetch timeout this bounds a run's fetch phase
- * at roughly two minutes plus the generation budget.
- */
-export const MAX_FEEDS_PER_RUN = 8;
+/** Exactly one enabled feed is fetched during a permitted ingestion run. */
+export const MAX_FEEDS_PER_RUN = 1;
 /** Bounded review output contract presented to the model. */
 const REVIEW_RESPONSE_FORMAT: Record<string, unknown> = {
   type: "json_schema",
@@ -141,7 +137,6 @@ export interface ArticleRuntimeDeps {
    */
   readonly callLlm: ArticleRuntimeLlmCaller;
   readonly log?: (message: string) => void;
-  readonly pollIntervalMs?: number;
   readonly leaseMs?: number;
   /**
    * Injectable protocol transport for feed fetching (the pinned-connector
@@ -457,22 +452,22 @@ async function finalizeReaction(
  * below serializes attempts through the same function. Never throws into the
  * caller.
  *
- * `options.feedStartIndex` rotates which enabled feeds a capped run attempts
- * (see `MAX_FEEDS_PER_RUN`); the runtime advances it across runs so feeds
- * beyond the per-run cap are not starved. Manual and default runs start at
- * the configured position order.
+ * Each permitted run reserves one durable 12-hour slot, then selects exactly
+ * one enabled feed from the runtime's random round-robin cycle. Direct/manual
+ * callers get a one-shot cycle; the started runtime shares its cycle with
+ * scheduled and `runOnce` attempts.
  */
 export async function runIngestionAttempt(
   deps: ArticleRuntimeDeps,
   reason: string,
-  options: { feedStartIndex?: number } = {},
+  options: { feedCycle?: ArticleFeedShuffleCycle } = {},
 ): Promise<ArticleIngestionSummary> {
   const pool = deps.pool;
   const log = deps.log ?? ((message: string) => console.log(message));
   const leaseMs = deps.leaseMs ?? DEFAULT_LEASE_MS;
   const resolveHost = deps.resolveFeedHost ?? resolveFeedHost;
   const result = emptyResult();
-  const startedAt = new Date();
+  let startedAt = new Date();
 
   // Configuration load: fail closed before any fetch, provider call, or
   // state write. Missing is the expected rollout state on an unprovisioned
@@ -505,9 +500,25 @@ export async function runIngestionAttempt(
     return { status: "invalid", result };
   }
 
-  // Fetch phase: enabled feeds are attempted with bounded, safe networking;
-  // failures are per-feed and never stop the run. The per-run cap and the
-  // rotation start index bound a run's fetch work (see `MAX_FEEDS_PER_RUN`).
+  let ingestionTraceId: string;
+  try {
+    const slot = await reserveArticleIngestionSlot(pool, {
+      reason,
+      model: config.behavior.model,
+      promptVersion: ARTICLE_REACTION_GENERATION_PROMPT_VERSION,
+    });
+    if (slot.status === "rate_limited") {
+      return { status: "rate_limited", result, retryAfterMs: slot.retryAfterMs };
+    }
+    ingestionTraceId = slot.reservation.traceId;
+    startedAt = slot.reservation.startedAt;
+  } catch (error) {
+    log(`[ARTICLE] ingestion slot reservation failed: ${articleErrorCategory(error)}`);
+    return { status: "invalid", result };
+  }
+
+  // Fetch exactly one enabled feed in this durable 12-hour slot. Item reaction
+  // work remains independently bounded by max_generations_per_run.
   const feedArticles: {
     feedId: string;
     url: string;
@@ -516,31 +527,30 @@ export async function runIngestionAttempt(
     publishedAt: Date | null;
   }[] = [];
   const feedCount = config.feeds.length;
-  const feedsThisRun = Math.min(MAX_FEEDS_PER_RUN, feedCount);
-  const startIndex = Math.max(0, Math.floor(options.feedStartIndex ?? 0)) % feedCount;
-  for (let index = 0; index < feedsThisRun; index += 1) {
-    const feed = config.feeds[(startIndex + index) % feedCount]!;
+  const cycle = options.feedCycle ?? new ArticleFeedShuffleCycle();
+  const feed = cycle.next(config.feeds);
+  if (feed !== undefined) {
     result.feedsAttempted += 1;
     const safety = checkFeedUrlSafety(feed.url);
     if (!safety.ok) {
       result.feedsFailed += 1;
       log(`[ARTICLE] feed ${feed.id} skipped: ${safety.reason}`);
-      continue;
-    }
-    try {
-      const fetched = await boundedFetchText(feed.url, {
-        transport: deps.transport,
-        resolveHost,
-        ...(deps.lookupAll !== undefined ? { lookupAll: deps.lookupAll } : {}),
-      });
-      const articles = parseFeed(fetched.body, feed.id, {
-        maxExcerptChars: config.behavior.maxExcerptChars,
-      });
-      result.itemsFetched += articles.length;
-      feedArticles.push(...articles);
-    } catch (error) {
-      result.feedsFailed += 1;
-      log(`[ARTICLE] feed ${feed.id} fetch failed: ${articleErrorCategory(error)}`);
+    } else {
+      try {
+        const fetched = await boundedFetchText(feed.url, {
+          transport: deps.transport,
+          resolveHost,
+          ...(deps.lookupAll !== undefined ? { lookupAll: deps.lookupAll } : {}),
+        });
+        const articles = parseFeed(fetched.body, feed.id, {
+          maxExcerptChars: config.behavior.maxExcerptChars,
+        });
+        result.itemsFetched += articles.length;
+        feedArticles.push(...articles);
+      } catch (error) {
+        result.feedsFailed += 1;
+        log(`[ARTICLE] feed ${feed.id} fetch failed: ${articleErrorCategory(error)}`);
+      }
     }
   }
   try {
@@ -733,51 +743,46 @@ export async function runIngestionAttempt(
     log(`[ARTICLE] interest consolidation crashed: ${articleErrorCategory(error)}`);
   }
 
-  // Trace one metadata-only operation for the attempt.
-  const finishedAt = new Date();
-  await recordMemoryOperation(pool, {
-    kind: "article_ingestion",
-    outcome: "ok",
-    detail:
+  // Complete the reservation trace created atomically before the fetch. If
+  // finalization fails, the unfinished trace still correctly gates the next
+  // call after a restart.
+  await pool.query(
+    `UPDATE memory_operation
+     SET outcome = 'ok',
+         detail = $2,
+         llm_calls = $3,
+         finished_at = clock_timestamp()
+     WHERE id = $1 AND kind = 'article_ingestion'`,
+    [
+      ingestionTraceId,
       `reason=${reason} feedsAttempted=${result.feedsAttempted}` +
-      ` feedsFailed=${result.feedsFailed} itemsFetched=${result.itemsFetched}` +
-      ` itemsNew=${result.itemsNew} candidates=${result.candidatesAttempted}` +
-      ` generated=${result.generated} rejected=${result.rejected}` +
-      ` failed=${result.failed} skippedClaims=${result.skippedClaims}` +
-      ` lostFinalizes=${result.lostFinalizes}`,
-    model: config.behavior.model,
-    promptVersion: ARTICLE_REACTION_GENERATION_PROMPT_VERSION,
-    llmCalls: result.llmCalls,
-    startedAt,
-    finishedAt,
-  }).catch(() => undefined);
+        ` feedsFailed=${result.feedsFailed} itemsFetched=${result.itemsFetched}` +
+        ` itemsNew=${result.itemsNew} candidates=${result.candidatesAttempted}` +
+        ` generated=${result.generated} rejected=${result.rejected}` +
+        ` failed=${result.failed} skippedClaims=${result.skippedClaims}` +
+        ` lostFinalizes=${result.lostFinalizes}`,
+      result.llmCalls,
+    ],
+  ).catch((error: unknown) => {
+    log(`[ARTICLE] ingestion trace finalization failed: ${articleErrorCategory(error)}`);
+  });
 
-  // The enabled-feed count is returned so the runtime can rotate the next
-  // run's starting position past the feeds this run attempted.
   return { status: "ok", result, feedsAvailable: feedCount };
 }
 
 /**
- * Start the article runtime. It keeps polling on a timer even while
- * unprovisioned, so provisioning configuration later enables ingestion
- * without a worker restart. Attempts are serialized: a long attempt delays
- * the next one instead of overlapping. Timer ticks COALESCE (mirroring the
- * memory runtime's serial queue): at most one scheduled attempt sits in the
- * chain at a time, so ticks arriving while an attempt runs or queues
- * collapse into one follow-up instead of piling an attempt onto the chain
- * per tick.
+ * Start the article runtime. Startup checks the durable 12-hour gate; further
+ * attempts are scheduled for the next allowed slot. Missing configuration is
+ * checked again on the same fixed cadence. Scheduled and manual attempts are
+ * serialized and share one in-memory random feed cycle.
  */
 export function startArticleRuntime(deps: ArticleRuntimeDeps): ArticleRuntime {
-  const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const log = deps.log ?? ((message: string) => console.log(message));
+  const feedCycle = new ArticleFeedShuffleCycle();
   let tail: Promise<unknown> = Promise.resolve();
-  let timer: ReturnType<typeof setInterval> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
   let attemptQueued = false;
-  // Feed rotation cursor: the starting position of the next run's capped
-  // fetch phase, advanced by the number of feeds each run attempted so
-  // feeds beyond the per-run cap rotate through over successive runs.
-  let feedCursor = 0;
 
   /** Serialize onto the attempt chain; a rejected task never breaks the chain. */
   const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
@@ -789,19 +794,28 @@ export function startArticleRuntime(deps: ArticleRuntimeDeps): ArticleRuntime {
     return next;
   };
 
+  const scheduleNext = (delayMs: number): void => {
+    if (closed) return;
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(() => {
+      timer = undefined;
+      scheduledAttempt("interval");
+    }, Math.max(1, Math.min(delayMs, ARTICLE_INGEST_INTERVAL_MS)));
+  };
+
   const scheduledAttempt = (reason: string): void => {
-    if (attemptQueued) return;
+    if (attemptQueued || closed) return;
     attemptQueued = true;
     void enqueue(async () => {
       attemptQueued = false;
       if (closed) return;
+      let delayMs = ARTICLE_CONFIGURATION_RECHECK_MS;
       try {
-        const summary = await runIngestionAttempt(deps, reason, { feedStartIndex: feedCursor });
-        if (summary.status === "ok") {
-          if (summary.feedsAvailable !== undefined && summary.feedsAvailable > 0) {
-            feedCursor =
-              (feedCursor + summary.result.feedsAttempted) % summary.feedsAvailable;
-          }
+        const summary = await runIngestionAttempt(deps, reason, { feedCycle });
+        if (summary.status === "rate_limited") {
+          delayMs = summary.retryAfterMs ?? ARTICLE_INGEST_INTERVAL_MS;
+          log(`[ARTICLE] ingestion deferred by 12-hour cadence`);
+        } else if (summary.status === "ok") {
           log(
             `[ARTICLE] ingestion ok: items=${summary.result.itemsNew} ` +
               `generated=${summary.result.generated} rejected=${summary.result.rejected} ` +
@@ -810,20 +824,19 @@ export function startArticleRuntime(deps: ArticleRuntimeDeps): ArticleRuntime {
         }
       } catch (error) {
         log(`[ARTICLE] ingestion attempt crashed: ${articleErrorCategory(error)}`);
+      } finally {
+        scheduleNext(delayMs);
       }
     });
   };
 
   scheduledAttempt("startup");
-  timer = setInterval(() => {
-    scheduledAttempt("interval");
-  }, pollIntervalMs);
 
   return {
     runOnce: () =>
       enqueue(async () => {
         try {
-          return await runIngestionAttempt(deps, "manual");
+          return await runIngestionAttempt(deps, "manual", { feedCycle });
         } catch (error) {
           log(`[ARTICLE] manual ingestion failed: ${articleErrorCategory(error)}`);
           return { status: "invalid", result: emptyResult() };
@@ -831,7 +844,7 @@ export function startArticleRuntime(deps: ArticleRuntimeDeps): ArticleRuntime {
       }),
     close: async () => {
       closed = true;
-      if (timer !== undefined) clearInterval(timer);
+      if (timer !== undefined) clearTimeout(timer);
       await tail;
     },
   };

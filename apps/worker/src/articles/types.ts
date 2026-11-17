@@ -167,11 +167,9 @@ export interface ArticleMemoriesResponse {
 
 export interface ArticleIngestionSummary {
   readonly result: ArticleIngestionResult;
-  readonly status: "ok" | "not_configured" | "disabled" | "invalid";
-  /**
-   * Ok attempts only: the number of enabled feeds configuration provided for
-   * this attempt. The runtime uses it to rotate the next run's starting
-   * position past the feeds this run attempted (see `MAX_FEEDS_PER_RUN`).
-   */
+  readonly status: "ok" | "not_configured" | "disabled" | "invalid" | "rate_limited";
+  /** Delay until the durable 12-hour gate permits another fetch. */
+  readonly retryAfterMs?: number;
+  /** Number of enabled feeds loaded for a successful ingestion attempt. */
   readonly feedsAvailable?: number;
 }
