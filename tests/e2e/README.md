@@ -260,6 +260,20 @@ and may invoke configured external providers that incur charges.
   sanitized (step label + error kind + first line only, secrets redacted).
   The deployed UI is checked structurally (`[data-last-bubble]`) with
   Node-side comparisons so matched text and page snapshots never enter errors.
+- An operator may opt into an additional generic HTTP-module assertion by
+  supplying both `E2E_DEPLOYED_EXPECT_HTTP_MODULE_ID` and
+  `E2E_DEPLOYED_EXPECT_HTTP_MODULE_FINGERPRINT` from private run configuration.
+  Treat both values as private: do not commit or print them. With neither set,
+  the ordinary smoke behavior is unchanged; setting only one or supplying an
+  invalid value fails closed. The read-only preflight requires that exact
+  provisioned module to be enabled for HTTP POST with every-turn activation.
+  After the synthetic turn, its unique published attempt must show successful
+  execution, no selected or used fallback, and included output attributed to
+  the exact `prompt_module` chat message. Missing, skipped, failed, ambiguous,
+  fallback, or unattributed execution fails the smoke while retaining all
+  generated history. Evidence reports only a generic pass/fail result and a
+  content-free reason; the module identifier, fingerprint, endpoint, and
+  response are not emitted. This check never changes provisioned configuration.
 - SIGINT/SIGTERM abort the journey gracefully and retained-state verification
   runs before the process exits non-zero; a second signal exits immediately.
   SIGKILL cannot be handled — the ownership marker persisted before send
