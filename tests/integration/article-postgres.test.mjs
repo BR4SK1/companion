@@ -399,11 +399,14 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       "0005_message_timing",
       "0006_conversation_thread_order",
       "0003_memory_work",
+      "0004_memory_semantic_shadow",
+      "0021_memory_operation_turn_attribution",
       "0007_article_work",
       "0008_article_share_and_evidence",
       "0009_article_observation_claim",
       "0016_authoritative_temporal_context",
       "0017_trace_attempt_temporal_context",
+      "0020_companion_time_day_start_hour",
     ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
