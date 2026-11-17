@@ -10,6 +10,8 @@ import {
   type PromptModuleDefinition,
   type PromptModuleDecisionTrace,
   type PromptModuleExecutionTrace,
+  type PromptModuleExecutionMode,
+  type PromptModuleHttpPostConfig,
   type PromptModuleTraceRecord,
 } from "./types.ts";
 
@@ -51,10 +53,77 @@ interface PromptModuleRow {
   readonly id: string;
   readonly module_key: string;
   readonly decision_description: string;
-  readonly function_definition: string;
+  readonly function_definition: string | null;
+  readonly execution_mode: PromptModuleExecutionMode;
+  readonly http_endpoint_setting: string | null;
+  readonly http_scope_setting: string | null;
+  readonly http_scope_field: string | null;
+  readonly http_turn_id_field: string | null;
+  readonly http_local_datetime_field: string | null;
+  readonly http_previous_assistant_field: string | null;
+  readonly http_user_message_field: string | null;
+  readonly http_prior_conversation_field: string | null;
+  readonly http_response_text_field: string | null;
+  readonly http_field_max_bytes: number | null;
+  readonly http_prior_message_limit: number | null;
+  readonly http_request_max_bytes: number | null;
+  readonly http_response_max_bytes: number | null;
   readonly fallback_content: string | null;
   readonly timeout_ms: number;
   readonly position: number;
+  readonly activation_mode: PromptModuleDefinition["activationMode"];
+  readonly output_kind: PromptModuleDefinition["outputKind"];
+}
+
+function httpConfigFromRow(row: PromptModuleRow): PromptModuleHttpPostConfig | null {
+  const required = [
+    row.http_endpoint_setting,
+    row.http_response_text_field,
+    row.http_field_max_bytes,
+    row.http_prior_message_limit,
+    row.http_request_max_bytes,
+    row.http_response_max_bytes,
+  ];
+  if (required.some((value) => value === null)) return null;
+  return {
+    endpointSetting: row.http_endpoint_setting!,
+    scopeSetting: row.http_scope_setting,
+    scopeField: row.http_scope_field,
+    turnIdField: row.http_turn_id_field,
+    localDateTimeField: row.http_local_datetime_field,
+    previousAssistantResponseField: row.http_previous_assistant_field,
+    userMessageField: row.http_user_message_field,
+    priorConversationField: row.http_prior_conversation_field,
+    responseTextField: row.http_response_text_field!,
+    fieldMaxBytes: row.http_field_max_bytes!,
+    priorMessageLimit: row.http_prior_message_limit!,
+    requestMaxBytes: row.http_request_max_bytes!,
+    responseMaxBytes: row.http_response_max_bytes!,
+  };
+}
+
+function definitionFingerprint(
+  row: PromptModuleRow,
+  httpConfig: PromptModuleHttpPostConfig | null,
+): string {
+  const definition = row.execution_mode === "function"
+    ? row.function_definition ?? ""
+    : JSON.stringify({ executionMode: row.execution_mode, httpConfig: httpConfig ?? {
+        endpointSetting: row.http_endpoint_setting,
+        scopeSetting: row.http_scope_setting,
+        scopeField: row.http_scope_field,
+        turnIdField: row.http_turn_id_field,
+        localDateTimeField: row.http_local_datetime_field,
+        previousAssistantResponseField: row.http_previous_assistant_field,
+        userMessageField: row.http_user_message_field,
+        priorConversationField: row.http_prior_conversation_field,
+        responseTextField: row.http_response_text_field,
+        fieldMaxBytes: row.http_field_max_bytes,
+        priorMessageLimit: row.http_prior_message_limit,
+        requestMaxBytes: row.http_request_max_bytes,
+        responseMaxBytes: row.http_response_max_bytes,
+      } });
+  return createHash("sha256").update(definition).digest("hex");
 }
 
 async function findOpenAttempt(
@@ -78,21 +147,38 @@ export function createPromptModuleStore(pool: PostgresPool): PromptModuleStore {
   async function loadEnabled(): Promise<readonly PromptModuleDefinition[]> {
     const result = await pool.query<PromptModuleRow>(
       `SELECT id, module_key, decision_description, function_definition,
-              fallback_content, timeout_ms, position
+              execution_mode, http_endpoint_setting, http_scope_setting,
+              http_scope_field, http_turn_id_field, http_local_datetime_field,
+              http_previous_assistant_field, http_user_message_field,
+              http_prior_conversation_field, http_response_text_field,
+              http_field_max_bytes, http_prior_message_limit,
+              http_request_max_bytes, http_response_max_bytes,
+              fallback_content, timeout_ms, position, activation_mode, output_kind
        FROM prompt_module
        WHERE enabled = true
        ORDER BY position, id`,
     );
-    return result.rows.map((row) => ({
-      id: row.id,
-      key: row.module_key,
-      decisionDescription: row.decision_description,
-      functionDefinition: row.function_definition,
-      definitionHash: createHash("sha256").update(row.function_definition).digest("hex"),
-      fallbackContent: row.fallback_content,
-      timeoutMs: row.timeout_ms,
-      position: row.position,
-    }));
+    return result.rows.map((row) => {
+      const executionMode: PromptModuleExecutionMode = row.execution_mode === "function"
+        ? "function"
+        : "http_post";
+      const httpConfig = executionMode === "http_post" ? httpConfigFromRow(row) : null;
+      const definitionRow = { ...row, execution_mode: executionMode };
+      return {
+        id: row.id,
+        key: row.module_key,
+        decisionDescription: row.decision_description,
+        functionDefinition: executionMode === "function" ? row.function_definition : null,
+        executionMode,
+        httpConfig,
+        definitionHash: definitionFingerprint(definitionRow, httpConfig),
+        fallbackContent: row.fallback_content,
+        timeoutMs: row.timeout_ms,
+        position: row.position,
+        activationMode: row.activation_mode,
+        outputKind: row.output_kind,
+      };
+    });
   }
 
   async function loadAttemptTrace(
@@ -105,6 +191,9 @@ export function createPromptModuleStore(pool: PostgresPool): PromptModuleStore {
       position: number;
       decision_description: string;
       function_hash: string;
+      activation_mode: PromptModuleTraceRecord["activationMode"];
+      output_kind: PromptModuleTraceRecord["outputKind"];
+      execution_mode: PromptModuleTraceRecord["executionMode"];
       fallback_available: boolean;
       decision_state: PromptModuleTraceRecord["decisionState"];
       decision_model: string | null;
@@ -126,6 +215,7 @@ export function createPromptModuleStore(pool: PostgresPool): PromptModuleStore {
     }>(
       `SELECT module.module_id, module.module_key, module.position,
               module.decision_description, module.function_hash,
+              module.activation_mode, module.output_kind, module.execution_mode,
               module.fallback_available, module.decision_state,
               module.decision_model, module.response_model,
               module.response_provider, module.decision_choice,
@@ -157,6 +247,9 @@ export function createPromptModuleStore(pool: PostgresPool): PromptModuleStore {
         position: module.position,
         decisionDescription: module.decision_description,
         definitionHash: module.function_hash,
+        activationMode: module.activation_mode,
+        outputKind: module.output_kind,
+        executionMode: module.execution_mode,
         fallbackAvailable: module.fallback_available,
         decisionState: module.decision_state,
         decisionModel: module.decision_model,
@@ -199,16 +292,21 @@ export function createPromptModuleStore(pool: PostgresPool): PromptModuleStore {
         await client.query(
           `INSERT INTO trace_attempt_prompt_module
              (attempt_id, module_id, module_key, position, decision_description,
-              function_hash, fallback_available, decision_state, decision_model,
-              requested_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'requested', $8, now())
+              function_hash, fallback_available, activation_mode, output_kind,
+              execution_mode, decision_state, decision_model, requested_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+              CASE WHEN $8 = 'every_turn' THEN 'not_requested' ELSE 'requested' END,
+              CASE WHEN $8 = 'model_gated' THEN $11 ELSE NULL END, now())
            ON CONFLICT (attempt_id, module_id) DO UPDATE SET
              module_key = EXCLUDED.module_key,
              position = EXCLUDED.position,
              decision_description = EXCLUDED.decision_description,
              function_hash = EXCLUDED.function_hash,
              fallback_available = EXCLUDED.fallback_available,
-             decision_state = 'requested',
+             activation_mode = EXCLUDED.activation_mode,
+             output_kind = EXCLUDED.output_kind,
+             execution_mode = EXCLUDED.execution_mode,
+             decision_state = EXCLUDED.decision_state,
              decision_model = EXCLUDED.decision_model,
              response_model = NULL,
              response_provider = NULL,
@@ -236,6 +334,9 @@ export function createPromptModuleStore(pool: PostgresPool): PromptModuleStore {
             module.decisionDescription,
             module.definitionHash,
             module.fallbackContent !== null,
+            module.activationMode,
+            module.outputKind,
+            module.executionMode,
             input.decisionModel,
           ],
         );
@@ -389,7 +490,7 @@ export function createPromptModuleStore(pool: PostgresPool): PromptModuleStore {
              executed_at = now(),
              recorded_at = now()
          WHERE attempt_id = $1 AND module_id = $2
-           AND decision_state = 'responded' AND selected IS TRUE
+           AND decision_state IN ('responded', 'not_required') AND selected IS TRUE
          RETURNING module_id`,
         [
           attemptId,

@@ -212,7 +212,163 @@ ALTER TABLE trace_attempt_prompt_module
   );
 `;
 
+const PROMPT_MODULE_ACTIVATION_MODES = `
+ALTER TABLE prompt_module
+  ADD COLUMN activation_mode text NOT NULL DEFAULT 'model_gated'
+    CHECK (activation_mode IN ('model_gated', 'every_turn')),
+  ADD COLUMN output_kind text NOT NULL DEFAULT 'thoughts'
+    CHECK (output_kind IN ('thoughts', 'authoritative_context'));
+
+ALTER TABLE trace_attempt_prompt_module
+  ADD COLUMN activation_mode text NOT NULL DEFAULT 'model_gated'
+    CHECK (activation_mode IN ('model_gated', 'every_turn')),
+  ADD COLUMN output_kind text NOT NULL DEFAULT 'thoughts'
+    CHECK (output_kind IN ('thoughts', 'authoritative_context'));
+
+-- Replace the original decision-state and selected/state compatibility checks
+-- without relying on PostgreSQL's generated constraint names.
+DO $$
+DECLARE constraint_row record;
+BEGIN
+  FOR constraint_row IN
+    SELECT conname, pg_get_constraintdef(oid) AS definition
+    FROM pg_constraint
+    WHERE conrelid = 'trace_attempt_prompt_module'::regclass AND contype = 'c'
+  LOOP
+    IF constraint_row.definition LIKE '%decision_state%' AND
+       (constraint_row.definition LIKE '%not_requested%' OR constraint_row.definition LIKE '%selected IS NULL%') THEN
+      EXECUTE format('ALTER TABLE trace_attempt_prompt_module DROP CONSTRAINT %I', constraint_row.conname);
+    END IF;
+  END LOOP;
+END;
+$$;
+
+ALTER TABLE trace_attempt_prompt_module
+  ADD CONSTRAINT trace_attempt_prompt_module_decision_state_check
+    CHECK (decision_state IN ('not_requested', 'requested', 'responded', 'failed', 'invalid', 'not_required')),
+  ADD CONSTRAINT trace_attempt_prompt_module_selection_state_check
+    CHECK (selected IS NULL OR
+      (decision_state = 'responded' AND activation_mode = 'model_gated') OR
+      (decision_state = 'not_required' AND activation_mode = 'every_turn')),
+  DROP CONSTRAINT trace_attempt_prompt_module_output_shape,
+  ADD CONSTRAINT trace_attempt_prompt_module_output_shape CHECK (
+    (execution_ordinal IS NULL OR selected IS TRUE)
+    AND (NOT output_ready OR selected IS TRUE)
+    AND (NOT fallback_selected OR output_ready)
+    AND (NOT fallback_used OR (fallback_selected AND included))
+    AND (NOT included OR (output_ready AND selected IS TRUE))
+    AND (decision_state <> 'not_required' OR activation_mode = 'every_turn')
+  );
+`;
+
+const PROMPT_MODULE_HTTP_POST = `
+ALTER TABLE prompt_module
+  ADD COLUMN execution_mode text NOT NULL DEFAULT 'function'
+    CHECK (execution_mode IN ('function', 'http_post')),
+  ADD COLUMN http_endpoint_setting text
+    CHECK (http_endpoint_setting IS NULL OR http_endpoint_setting ~ '^[A-Za-z][A-Za-z0-9_.-]{0,63}$'),
+  ADD COLUMN http_scope_setting text
+    CHECK (http_scope_setting IS NULL OR http_scope_setting ~ '^[A-Za-z][A-Za-z0-9_.-]{0,63}$'),
+  ADD COLUMN http_scope_field text
+    CHECK (http_scope_field IS NULL OR http_scope_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD COLUMN http_turn_id_field text
+    CHECK (http_turn_id_field IS NULL OR http_turn_id_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD COLUMN http_local_datetime_field text
+    CHECK (http_local_datetime_field IS NULL OR http_local_datetime_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD COLUMN http_previous_assistant_field text
+    CHECK (http_previous_assistant_field IS NULL OR http_previous_assistant_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD COLUMN http_user_message_field text
+    CHECK (http_user_message_field IS NULL OR http_user_message_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD COLUMN http_prior_conversation_field text
+    CHECK (http_prior_conversation_field IS NULL OR http_prior_conversation_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD COLUMN http_response_text_field text
+    CHECK (http_response_text_field IS NULL OR http_response_text_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD COLUMN http_field_max_bytes integer
+    CHECK (http_field_max_bytes IS NULL OR http_field_max_bytes BETWEEN 1 AND 262144),
+  ADD COLUMN http_prior_message_limit integer
+    CHECK (http_prior_message_limit IS NULL OR http_prior_message_limit BETWEEN 0 AND 200),
+  ADD COLUMN http_request_max_bytes integer
+    CHECK (http_request_max_bytes IS NULL OR http_request_max_bytes BETWEEN 128 AND 1048576),
+  ADD COLUMN http_response_max_bytes integer
+    CHECK (http_response_max_bytes IS NULL OR http_response_max_bytes BETWEEN 1 AND 1048576);
+
+ALTER TABLE trace_attempt_prompt_module
+  ADD COLUMN execution_mode text NOT NULL DEFAULT 'function'
+    CHECK (execution_mode IN ('function', 'http_post'));
+
+ALTER TABLE prompt_module ALTER COLUMN function_definition DROP NOT NULL;
+
+DO $$
+DECLARE constraint_row record;
+BEGIN
+  FOR constraint_row IN
+    SELECT conname, pg_get_constraintdef(oid) AS definition
+    FROM pg_constraint
+    WHERE conrelid = 'prompt_module'::regclass AND contype = 'c'
+  LOOP
+    IF constraint_row.definition LIKE '%function_definition%' THEN
+      EXECUTE format('ALTER TABLE prompt_module DROP CONSTRAINT %I', constraint_row.conname);
+    END IF;
+  END LOOP;
+END;
+$$;
+
+ALTER TABLE prompt_module
+  ADD CONSTRAINT prompt_module_execution_config_shape CHECK (
+    (
+      execution_mode = 'function'
+      AND function_definition IS NOT NULL
+      AND length(btrim(function_definition)) > 0
+      AND length(function_definition) <= 131072
+      AND http_endpoint_setting IS NULL
+      AND http_scope_setting IS NULL
+      AND http_scope_field IS NULL
+      AND http_turn_id_field IS NULL
+      AND http_local_datetime_field IS NULL
+      AND http_previous_assistant_field IS NULL
+      AND http_user_message_field IS NULL
+      AND http_prior_conversation_field IS NULL
+      AND http_response_text_field IS NULL
+      AND http_field_max_bytes IS NULL
+      AND http_prior_message_limit IS NULL
+      AND http_request_max_bytes IS NULL
+      AND http_response_max_bytes IS NULL
+    ) OR (
+      execution_mode = 'http_post'
+      AND function_definition IS NULL
+      AND http_endpoint_setting IS NOT NULL
+      AND (
+        (http_scope_setting IS NULL AND http_scope_field IS NULL) OR
+        (http_scope_setting IS NOT NULL AND http_scope_field IS NOT NULL
+          AND http_scope_setting <> http_endpoint_setting)
+      )
+      AND http_response_text_field IS NOT NULL
+      AND http_field_max_bytes IS NOT NULL
+      AND http_prior_message_limit IS NOT NULL
+      AND http_request_max_bytes IS NOT NULL
+      AND http_response_max_bytes IS NOT NULL
+      AND (http_scope_field IS NULL OR http_turn_id_field IS NULL OR http_scope_field <> http_turn_id_field)
+      AND (http_scope_field IS NULL OR http_local_datetime_field IS NULL OR http_scope_field <> http_local_datetime_field)
+      AND (http_scope_field IS NULL OR http_previous_assistant_field IS NULL OR http_scope_field <> http_previous_assistant_field)
+      AND (http_scope_field IS NULL OR http_user_message_field IS NULL OR http_scope_field <> http_user_message_field)
+      AND (http_scope_field IS NULL OR http_prior_conversation_field IS NULL OR http_scope_field <> http_prior_conversation_field)
+      AND (http_turn_id_field IS NULL OR http_local_datetime_field IS NULL OR http_turn_id_field <> http_local_datetime_field)
+      AND (http_turn_id_field IS NULL OR http_previous_assistant_field IS NULL OR http_turn_id_field <> http_previous_assistant_field)
+      AND (http_turn_id_field IS NULL OR http_user_message_field IS NULL OR http_turn_id_field <> http_user_message_field)
+      AND (http_turn_id_field IS NULL OR http_prior_conversation_field IS NULL OR http_turn_id_field <> http_prior_conversation_field)
+      AND (http_local_datetime_field IS NULL OR http_previous_assistant_field IS NULL OR http_local_datetime_field <> http_previous_assistant_field)
+      AND (http_local_datetime_field IS NULL OR http_user_message_field IS NULL OR http_local_datetime_field <> http_user_message_field)
+      AND (http_local_datetime_field IS NULL OR http_prior_conversation_field IS NULL OR http_local_datetime_field <> http_prior_conversation_field)
+      AND (http_previous_assistant_field IS NULL OR http_user_message_field IS NULL OR http_previous_assistant_field <> http_user_message_field)
+      AND (http_previous_assistant_field IS NULL OR http_prior_conversation_field IS NULL OR http_previous_assistant_field <> http_prior_conversation_field)
+      AND (http_user_message_field IS NULL OR http_prior_conversation_field IS NULL OR http_user_message_field <> http_prior_conversation_field)
+    )
+  );
+`;
+
 export const promptModuleMigrations: readonly Migration[] = [
   { id: "0018_generic_prompt_modules", sql: PROMPT_MODULE_SCHEMA },
   { id: "0019_prompt_module_chat_attribution", sql: PROMPT_MODULE_CHAT_ATTRIBUTION },
+  { id: "0022_prompt_module_activation_modes", sql: PROMPT_MODULE_ACTIVATION_MODES },
+  { id: "0023_prompt_module_http_post", sql: PROMPT_MODULE_HTTP_POST },
 ];

@@ -80,6 +80,7 @@ import type {
   ChatRequest,
   ChatResponse,
 } from "@companion/openrouter/chat";
+import { DateTime } from "luxon";
 import type {
   DecisionsRequest,
   DecisionsResponse,
@@ -121,8 +122,10 @@ export interface TurnProcessorDeps {
    * fails the attempt before any snapshot, decision, or provider call).
    */
   readonly loadIdentity: () => Promise<ChatIdentity>;
-  /** Prior-turn context for this turn, oldest first. */
+  /** Prior-turn context for ordinary chat, oldest first and bounded by configuration. */
   readonly loadContext: (turnId: string) => Promise<readonly ConversationMessage[]>;
+  /** Most recent published assistant-turn reply before this turn's durable thread order. */
+  readonly loadPreviousPublishedAssistantReply: (turnId: string) => Promise<string | null>;
   /** Startup-captured private settings; absent means explicitly unconfigured. */
   readonly temporalSettings?: TemporalSettings;
   readonly temperature?: number;
@@ -261,6 +264,14 @@ function decisionState(
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function promptModuleLocalDateTime(instant: Date, timezone: string | null | undefined): string | null {
+  if (timezone === null || timezone === undefined) return null;
+  const local = DateTime.fromJSDate(instant, { zone: timezone });
+  return local.isValid
+    ? local.toFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZZ")
+    : null;
 }
 
 async function recordPromptModuleTrace<T>(
@@ -651,6 +662,8 @@ export async function processTurnWork(
     try {
       const modules = await deps.loadPromptModules();
       if (modules.length > 0) {
+        const previousAssistantResponse =
+          await deps.loadPreviousPublishedAssistantReply(work.turn.id) ?? "";
         promptModuleChunks = await runPromptModules({
           turnId: work.turn.id,
           leaseOwner: deps.leaseOwner!,
@@ -663,6 +676,18 @@ export async function processTurnWork(
               role: message.role,
               content: message.content,
             })),
+            priorConversation: history.slice(-40).map((message) => ({
+              role: message.role,
+              content: message.content,
+            })),
+            userMessages: work.messages
+              .filter((message) => message.role === "user")
+              .map((message) => message.content),
+            previousAssistantResponse,
+            localDateTime: promptModuleLocalDateTime(
+              new Date(work.turn.createdAt),
+              deps.temporalSettings?.timezone,
+            ),
           },
           callDecisions: deps.callDecisions,
           execute: deps.executePromptModule!,

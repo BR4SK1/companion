@@ -515,6 +515,8 @@ export interface ConversationStore {
   getThreadContext(params: ThreadContextParams): Promise<
     readonly ConversationMessage[]
   >;
+  /** Previous published assistant turn reply, independent of bounded context history. */
+  getPreviousPublishedAssistantReply(turnId: string): Promise<string | null>;
   /** Bounded page of the thread in `seq` order (see the notes below). */
   getThreadPage(params: ThreadPageParams): Promise<ThreadPage>;
   getThreadStatus(): Promise<ThreadStatus>;
@@ -2143,6 +2145,23 @@ export function createConversationStore(
    * on every attempt of the same turn, including after a lease reclaim,
    * and is unaffected by messages ingested after the claim.
    */
+  async function getPreviousPublishedAssistantReply(turnId: string): Promise<string | null> {
+    const result = await pool.query<{ content: string }>(
+      `SELECT reply.content
+       FROM conversation_turn AS current_turn
+       JOIN conversation_turn AS prior_turn
+         ON prior_turn.thread_order < current_turn.thread_order
+        AND prior_turn.status = 'completed'
+       JOIN conversation_message AS reply
+         ON reply.turn_id = prior_turn.id AND reply.role = 'assistant'
+       WHERE current_turn.id = $1
+       ORDER BY prior_turn.thread_order DESC, reply.seq DESC
+       LIMIT 1`,
+      [turnId],
+    );
+    return result.rows[0]?.content ?? null;
+  }
+
   async function getThreadContext(params: ThreadContextParams): Promise<
     readonly ConversationMessage[]
   > {
@@ -2340,6 +2359,7 @@ export function createConversationStore(
     getEnabledResponsePatterns,
     getChatIdentity,
     getThreadContext,
+    getPreviousPublishedAssistantReply,
     getThreadPage,
     getThreadStatus,
     getTurnTraceReport,

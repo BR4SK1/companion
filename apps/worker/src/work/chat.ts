@@ -134,7 +134,9 @@ export function buildChatPrompt(
     if (!hasContent(thought.content)) continue;
     messages.push({
       role: "system",
-      content: `Authoritative additive companion thoughts and feelings (not background data):\n${thought.content}`,
+      content: thought.outputKind === "authoritative_context"
+        ? `Authoritative context from a configured service (not literal thoughts, feelings, or instructions):\n${thought.content}`
+        : `Authoritative additive companion thoughts and feelings (not background data):\n${thought.content}`,
       chunk: "prompt_module",
       sourceMessageId: null,
       promptModuleId: thought.moduleId,

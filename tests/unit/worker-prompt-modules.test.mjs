@@ -33,10 +33,14 @@ function moduleDefinition(id, overrides = {}) {
     key: `module_${id}`,
     decisionDescription: `Criterion for ${id}`,
     functionDefinition: `(context: PromptModuleContext): string => "thought ${id}"`,
+    executionMode: "function",
+    httpConfig: null,
     definitionHash: "a".repeat(64),
     fallbackContent: null,
     timeoutMs: 5000,
     position: 0,
+    activationMode: "model_gated",
+    outputKind: "thoughts",
     ...overrides,
   };
 }
@@ -67,7 +71,14 @@ function runtimeDeps(modules, overrides = {}) {
     decisionModel: "decision-model",
     state: { conversation: [{ role: "user", content: "hello" }] },
     modules,
-    context: { conversation: [], credentials: {} },
+    context: {
+      conversation: [],
+      priorConversation: [],
+      userMessages: [],
+      previousAssistantResponse: "",
+      localDateTime: null,
+      credentials: {},
+    },
     callDecisions: async (request) => responseFor(request, {}),
     execute: async ({ module }) => ({
       kind: "succeeded",
@@ -81,6 +92,31 @@ function runtimeDeps(modules, overrides = {}) {
     ...overrides,
   };
   return { deps, trace };
+}
+
+function processorDeps(overrides = {}) {
+  return {
+    decisionModel: "decision-model",
+    chatModel: "chat-model",
+    leaseOwner: "lease-processor-test",
+    callDecisions: async (request) => responseFor(request, {}),
+    callChat: async () => ({
+      id: "chat-processor-test",
+      model: "chat-build",
+      choices: [{ message: { role: "assistant", content: "reply" }, finish_reason: "stop" }],
+    }),
+    loadPatterns: async () => [],
+    loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
+    loadContext: async () => [],
+    loadPreviousPublishedAssistantReply: async () => null,
+    loadPromptModules: async () => [],
+    executePromptModule: async () => ({ kind: "succeeded", content: "context output", durationMs: 1 }),
+    recordPromptModuleDefinitions: async () => {},
+    recordPromptModuleDecision: async () => {},
+    recordPromptModuleExecution: async () => {},
+    log: () => {},
+    ...overrides,
+  };
 }
 
 describe("generic prompt modules", () => {
@@ -110,8 +146,8 @@ describe("generic prompt modules", () => {
       }),
     });
     assert.deepEqual(await runPromptModules(deps), [
-      { moduleId: "first", content: "thought first" },
-      { moduleId: "second", content: "thought second" },
+      { moduleId: "first", content: "thought first", outputKind: "thoughts" },
+      { moduleId: "second", content: "thought second", outputKind: "thoughts" },
     ]);
     assert.deepEqual(trace.definitions[0].modules.map((module) => module.key), [
       "module_first", "module_second", "module_skipped",
@@ -144,6 +180,80 @@ describe("generic prompt modules", () => {
     assert.deepEqual(trace.executions, []);
   });
 
+  it("executes every-turn modules without a decision outcome and keeps them independent of gated decision failure", async () => {
+    const modules = [
+      moduleDefinition("later-every-turn", {
+        position: 2,
+        activationMode: "every_turn",
+        outputKind: "authoritative_context",
+      }),
+      moduleDefinition("gated", { position: 1 }),
+      moduleDefinition("earlier-every-turn", {
+        position: 0,
+        activationMode: "every_turn",
+      }),
+    ];
+    const executed = [];
+    const { deps, trace } = runtimeDeps(modules, {
+      callDecisions: async () => { throw new OpenRouterTransportError("timeout", "provider failure"); },
+      execute: async ({ module }) => {
+        executed.push(module.id);
+        return { kind: "succeeded", content: `output ${module.id}`, durationMs: 1 };
+      },
+    });
+
+    assert.deepEqual(await runPromptModules(deps), [
+      { moduleId: "earlier-every-turn", content: "output earlier-every-turn", outputKind: "thoughts" },
+      { moduleId: "later-every-turn", content: "output later-every-turn", outputKind: "authoritative_context" },
+    ]);
+    assert.deepEqual(executed, ["earlier-every-turn", "later-every-turn"]);
+    assert.equal(trace.decisions.length, 2);
+    assert.equal(trace.decisions[0].result.state, "failed");
+    assert.deepEqual(trace.decisions[0].result.selections.map((entry) => entry.moduleId), ["gated"]);
+    assert.deepEqual(trace.decisions[1].result, {
+      state: "not_required",
+      decisionModel: null,
+      responseModel: null,
+      responseProvider: null,
+      durationMs: null,
+      failureKind: null,
+      selections: [
+        { moduleId: "earlier-every-turn", choice: null, selected: true, confidence: null, probabilities: null },
+        { moduleId: "later-every-turn", choice: null, selected: true, confidence: null, probabilities: null },
+      ],
+    });
+    assert.deepEqual(trace.executions.map((entry) => entry.result.executionOrdinal), [0, 1]);
+  });
+
+  it("does not call a decision provider when all modules use every-turn activation", async () => {
+    const { deps, trace } = runtimeDeps([
+      moduleDefinition("always", { activationMode: "every_turn" }),
+    ], {
+      callDecisions: async () => { throw new Error("must not be called"); },
+    });
+    assert.deepEqual(await runPromptModules(deps), [
+      { moduleId: "always", content: "thought always", outputKind: "thoughts" },
+    ]);
+    assert.equal(trace.decisions[0].result.state, "not_required");
+  });
+
+  it("keeps every-turn modules running when model-gated request construction or validation fails", async () => {
+    const { deps, trace } = runtimeDeps([
+      moduleDefinition("invalid-gated"),
+      moduleDefinition("always", { activationMode: "every_turn", position: 1 }),
+    ], {
+      decisionModel: null,
+      callDecisions: async () => { throw new Error("invalid request must not be sent"); },
+    });
+    assert.deepEqual(await runPromptModules(deps), [
+      { moduleId: "always", content: "thought always", outputKind: "thoughts" },
+    ]);
+    assert.equal(trace.decisions[0].result.state, "invalid");
+    assert.equal(trace.decisions[0].result.failureKind, "decision_invalid");
+    assert.equal(trace.decisions[0].result.decisionModel, null);
+    assert.equal(trace.decisions[1].result.state, "not_required");
+  });
+
   it("does not use fallback when a returned module choice is not one of the offered options", async () => {
     const { deps, trace } = runtimeDeps([
       moduleDefinition("unusable", { fallbackContent: "must not appear" }),
@@ -152,7 +262,13 @@ describe("generic prompt modules", () => {
     });
     assert.deepEqual(await runPromptModules(deps), []);
     assert.equal(trace.decisions[0].result.failureKind, "decision_unusable");
-    assert.equal(trace.decisions[0].result.selections[0].selected, null);
+    assert.deepEqual(trace.decisions[0].result.selections[0], {
+      moduleId: "unusable",
+      choice: "unknown",
+      selected: null,
+      confidence: 0.91,
+      probabilities: { include: 0.91, skip: 0.09 },
+    });
     assert.deepEqual(trace.executions, []);
   });
 
@@ -169,7 +285,7 @@ describe("generic prompt modules", () => {
       execute: async () => ({ kind: "timed_out", durationMs: 20 }),
     });
     assert.deepEqual(await runPromptModules(deps), [
-      { moduleId: "selected", content: "generic fallback" },
+      { moduleId: "selected", content: "generic fallback", outputKind: "thoughts" },
     ]);
     assert.equal(trace.executions.length, 1);
     assert.deepEqual(trace.executions[0].result, {
@@ -201,6 +317,33 @@ describe("generic prompt modules", () => {
     assert.match(migration.sql, /'generic_example'[\s\S]*?false/);
     assert.ok(migration.sql.includes(EXAMPLE_PROMPT_MODULE_FUNCTION));
     assert.match(migration.sql, /CREATE TABLE trace_attempt_prompt_module/);
+  });
+
+  it("migrates additively to explicit activation and output kinds while preserving legacy defaults", () => {
+    const migration = promptModuleMigrations.find(({ id }) => id === "0022_prompt_module_activation_modes");
+    assert.ok(migration);
+    assert.match(migration.sql, /DEFAULT 'model_gated'/);
+    assert.match(migration.sql, /DEFAULT 'thoughts'/);
+    assert.match(migration.sql, /'not_required'/);
+    assert.match(migration.sql, /activation_mode = 'every_turn'/);
+  });
+
+  it("adds a narrow declarative HTTP mapping while preserving legacy function rows and trace mode", () => {
+    const migration = promptModuleMigrations.find(({ id }) => id === "0023_prompt_module_http_post");
+    assert.ok(migration);
+    assert.match(migration.sql, /execution_mode text NOT NULL DEFAULT 'function'/);
+    assert.match(migration.sql, /execution_mode IN \('function', 'http_post'\)/);
+    assert.match(migration.sql, /function_definition IS NULL/);
+    assert.match(migration.sql, /http_endpoint_setting/);
+    assert.match(migration.sql, /http_response_text_field/);
+    assert.match(migration.sql, /http_request_max_bytes/);
+    assert.match(migration.sql, /http_response_max_bytes/);
+    assert.match(migration.sql, /\(http_scope_setting IS NULL AND http_scope_field IS NULL\)/);
+    assert.match(migration.sql, /http_response_text_field IS NOT NULL/);
+    assert.match(migration.sql, /http_field_max_bytes IS NOT NULL/);
+    assert.match(migration.sql, /http_turn_id_field IS NULL OR http_local_datetime_field IS NULL/);
+    assert.match(migration.sql, /ALTER TABLE trace_attempt_prompt_module\s+ADD COLUMN execution_mode text NOT NULL DEFAULT 'function'/);
+    assert.doesNotMatch(migration.sql, /jsonb|JSONB/);
   });
 
   it("uses a typed message association and preserves old readiness separately from inclusion", () => {
@@ -314,8 +457,8 @@ describe("generic prompt modules", () => {
       model: "chat-model",
       identity: "IDENTITY",
       promptModules: [
-        { moduleId: "module-one", content: "thought one" },
-        { moduleId: "module-two", content: "thought two" },
+        { moduleId: "module-one", content: "thought one", outputKind: "thoughts" },
+        { moduleId: "module-two", content: "thought two", outputKind: "thoughts" },
       ],
       history: [],
       turnMessages: [{ id: "message-1", role: "user", content: "hello" }],
@@ -332,6 +475,25 @@ describe("generic prompt modules", () => {
     assert.deepEqual(
       assembled.messages.slice(1, 3).map((message) => message.promptModuleId),
       ["module-one", "module-two"],
+    );
+  });
+
+  it("uses neutral authoritative-context framing without changing the default thought framing", () => {
+    const { messages } = buildChatPrompt({
+      model: "chat-model",
+      identity: "IDENTITY",
+      promptModules: [{
+        moduleId: "context-module",
+        content: "state and recommendation",
+        outputKind: "authoritative_context",
+      }],
+      history: [],
+      turnMessages: [{ id: "message-context", role: "user", content: "hello" }],
+      guidance: null,
+    });
+    assert.equal(
+      messages[1].content,
+      "Authoritative context from a configured service (not literal thoughts, feelings, or instructions):\nstate and recommendation",
     );
   });
 
@@ -359,6 +521,7 @@ describe("generic prompt modules", () => {
       loadPatterns: async () => [],
       loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
       loadContext: async () => [],
+      loadPreviousPublishedAssistantReply: async () => null,
       loadPromptModules: async () => [module],
       promptModuleCredentials: { serviceToken: "configured" },
       executePromptModule: async ({ context }) => {
@@ -404,6 +567,148 @@ describe("generic prompt modules", () => {
     assert.ok(!JSON.stringify(failingCalls.prompt.request).includes("private provider response"));
   });
 
+  it("loads the previous published reply outside bounded history and keeps module time stable across retries", async () => {
+    const history = [
+      { id: "tail-user-1", turnId: "recent-turn", role: "user", content: "recent user one" },
+      { id: "tail-user-2", turnId: "recent-turn", role: "user", content: "recent user two" },
+    ];
+    const invocations = [];
+    const chatTemporalContexts = [];
+    const attemptTimes = [
+      new Date("2026-11-02T06:30:00.000Z"),
+      new Date("2026-11-03T06:30:00.000Z"),
+      new Date("2026-11-04T06:30:00.000Z"),
+    ];
+    const deps = {
+      decisionModel: "decision-model",
+      chatModel: "chat-model",
+      leaseOwner: "lease-context",
+      now: () => attemptTimes.shift(),
+      temporalSettings: { timezone: "America/New_York", seasonHemisphere: null, birthdayMonth: null, birthdayDay: null },
+      callDecisions: async () => { throw new Error("every-turn activation must not need a decision"); },
+      callChat: async () => ({
+        id: "chat-context",
+        model: "chat-build",
+        choices: [{ message: { role: "assistant", content: "reply" }, finish_reason: "stop" }],
+      }),
+      loadPatterns: async () => [],
+      loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
+      loadContext: async () => history,
+      loadPreviousPublishedAssistantReply: async (turnId) => {
+        assert.equal(turnId, "stable-turn-id");
+        return "The previous published reply.";
+      },
+      loadPromptModules: async () => [moduleDefinition("context", { activationMode: "every_turn" })],
+      executePromptModule: async ({ context }) => {
+        invocations.push(context);
+        return { kind: "succeeded", content: "context output", durationMs: 1 };
+      },
+      recordChatRequest: async ({ temporalContext }) => {
+        chatTemporalContexts.push(temporalContext);
+      },
+      recordPromptModuleDefinitions: async () => {},
+      recordPromptModuleDecision: async () => {},
+      recordPromptModuleExecution: async () => {},
+      log: () => {},
+    };
+    const work = {
+      turn: {
+        id: "stable-turn-id",
+        leaseOwner: "lease-context",
+        createdAt: "2026-11-01T06:30:00.000Z",
+      },
+      messages: [
+        { id: "current-1", role: "user", content: "current first" },
+        { id: "current-2", role: "user", content: "current second" },
+      ],
+    };
+    await processTurnWork(work, deps);
+    await processTurnWork(work, deps);
+    assert.equal(invocations[0].turnId, "stable-turn-id");
+    assert.equal(invocations[0].previousAssistantResponse, "The previous published reply.");
+    assert.deepEqual(invocations[0].userMessages, ["current first", "current second"]);
+    assert.deepEqual(invocations[0].priorConversation.map(({ content }) => content), [
+      "recent user one",
+      "recent user two",
+    ]);
+    assert.equal(invocations[0].localDateTime, "2026-11-01T01:30:00.000-05:00");
+    assert.equal(invocations[1].localDateTime, invocations[0].localDateTime);
+    assert.equal(invocations[0].conversation.length, history.length + 2);
+    assert.equal(chatTemporalContexts[0].asOf, "2026-11-02T06:30:00.000Z");
+    assert.equal(chatTemporalContexts[1].asOf, "2026-11-03T06:30:00.000Z");
+
+    let absentResponse;
+    await processTurnWork({
+      turn: {
+        id: "turn-without-published-assistant",
+        leaseOwner: "lease-context",
+        createdAt: "2026-11-01T06:30:00.000Z",
+      },
+      messages: [{ id: "current-only-user", role: "user", content: "current" }],
+    }, {
+      ...deps,
+      loadContext: async () => [{
+        id: "notice-only",
+        turnId: null,
+        role: "assistant",
+        content: "A standalone notice is not a prior companion reply.",
+      }],
+      loadPreviousPublishedAssistantReply: async () => null,
+      executePromptModule: async ({ context }) => {
+        absentResponse = context.previousAssistantResponse;
+        return { kind: "succeeded", content: "context output", durationMs: 1 };
+      },
+    });
+    assert.equal(absentResponse, "");
+  });
+
+  it("formats module time with a numeric UTC offset across UTC and daylight-saving transitions", async () => {
+    const seen = [];
+    const base = processorDeps({
+      now: () => new Date("2026-12-15T12:00:00.000Z"),
+      temporalSettings: { timezone: "UTC", seasonHemisphere: null, birthdayMonth: null, birthdayDay: null },
+      loadPromptModules: async () => [moduleDefinition("date-context", { activationMode: "every_turn" })],
+      executePromptModule: async ({ context }) => {
+        seen.push(context.localDateTime);
+        return { kind: "succeeded", content: "context output", durationMs: 1 };
+      },
+    });
+    for (const [id, createdAt, timezone] of [
+      ["utc-turn", "2026-07-01T06:30:00.000Z", "UTC"],
+      ["summer-turn", "2026-07-01T06:30:00.000Z", "America/New_York"],
+      ["winter-turn", "2026-01-01T06:30:00.000Z", "America/New_York"],
+    ]) {
+      await processTurnWork({
+        turn: { id, leaseOwner: "lease-context", createdAt },
+        messages: [{ id: `${id}-user`, role: "user", content: "current" }],
+      }, { ...base, temporalSettings: { ...base.temporalSettings, timezone } });
+    }
+    assert.deepEqual(seen, [
+      "2026-07-01T06:30:00.000+00:00",
+      "2026-07-01T02:30:00.000-04:00",
+      "2026-01-01T01:30:00.000-05:00",
+    ]);
+  });
+
+  it("does not load the separate previous-reply context when no module is enabled", async () => {
+    let replyLookups = 0;
+    await processTurnWork({
+      turn: {
+        id: "module-free-turn",
+        leaseOwner: "lease-context",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      messages: [{ id: "module-free-user", role: "user", content: "current" }],
+    }, processorDeps({
+      loadPromptModules: async () => [],
+      loadPreviousPublishedAssistantReply: async () => {
+        replyLookups += 1;
+        return null;
+      },
+    }));
+    assert.equal(replyLookups, 0);
+  });
+
   it("degrades a non-fencing module trace failure without leaking diagnostics or blocking baseline chat trace", async () => {
     const traces = [];
     const logs = [];
@@ -425,6 +730,7 @@ describe("generic prompt modules", () => {
       loadPatterns: async () => [],
       loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
       loadContext: async () => [],
+      loadPreviousPublishedAssistantReply: async () => null,
       loadPromptModules: async () => [moduleDefinition("trace-failure")],
       executePromptModule: async () => ({ kind: "succeeded", content: "thought", durationMs: 1 }),
       recordPromptModuleDefinitions: async () => { throw new Error("SQL password and provider body"); },
@@ -463,6 +769,7 @@ describe("generic prompt modules", () => {
         loadPatterns: async () => [],
         loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
         loadContext: async () => [],
+        loadPreviousPublishedAssistantReply: async () => null,
         loadPromptModules: async () => [moduleDefinition("fenced")],
         executePromptModule: async () => ({ kind: "succeeded", content: "thought", durationMs: 1 }),
         recordPromptModuleDefinitions: async () => { throw new TraceWriteFencedError("stale lease"); },
@@ -494,6 +801,7 @@ describe("generic prompt modules", () => {
       loadPatterns: async () => [],
       loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
       loadContext: async () => [],
+      loadPreviousPublishedAssistantReply: async () => null,
       loadPromptModules: async () => [moduleDefinition("attributed", { key: "attributed" })],
       executePromptModule: async () => ({ kind: "succeeded", content: "ready thought", durationMs: 1 }),
       recordPromptModuleDefinitions: async () => {},
@@ -567,6 +875,7 @@ describe("generic prompt modules", () => {
           loadPatterns: async () => [],
           loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
           loadContext: async () => [],
+          loadPreviousPublishedAssistantReply: async () => null,
           loadPromptModules: async () => [moduleDefinition("outcome", { key: "outcome" })],
           executePromptModule: async () => ({ kind: "succeeded", content: "module thought", durationMs: 1 }),
           recordPromptModuleDefinitions: async () => {},

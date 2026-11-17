@@ -73,6 +73,8 @@ import {
   buildMarker,
   buildPodActionScript,
   createShutdownController,
+  evaluateExpectedHttpPromptModuleTrace,
+  expectedHttpPromptModuleFromEnvironment,
   fingerprint,
   planCleanupDecision,
   planRetainedScenarioDecision,
@@ -113,6 +115,10 @@ const evidence = {
 const failures = [];
 /** Secrets of this run: never allowed into any log, error, or evidence. */
 const secrets = [];
+const expectedHttpPromptModule = expectedHttpPromptModuleFromEnvironment(process.env);
+if (expectedHttpPromptModule !== null) {
+  secrets.push(expectedHttpPromptModule.id, expectedHttpPromptModule.definitionFingerprint);
+}
 const shutdown = createShutdownController();
 
 /** The marker of this run, set before the send (used by cleanup/recovery). */
@@ -307,7 +313,17 @@ async function preflight() {
   }
 
   // Database linkage preflight (read-only, parameterized pod-side).
-  const db = await workerPodAction({ action: "preflight", smokePrefix: SMOKE_PREFIX });
+  const db = await workerPodAction({
+    action: "preflight",
+    smokePrefix: SMOKE_PREFIX,
+    ...(expectedHttpPromptModule === null ? {} : { expectedHttpModule: expectedHttpPromptModule }),
+  });
+  if (expectedHttpPromptModule !== null) {
+    evidence.preflight.expectedHttpPromptModule = { required: true };
+    if (db.expectedHttpModuleConfigured !== true) {
+      throw new Error("the expected HTTP prompt module is not enabled with every-turn activation; refusing before send");
+    }
+  }
   evidence.preflight.database = {
     tablesOk: db.tablesOk,
     clientKeyIndexed: db.clientKeyIndexed,
@@ -387,6 +403,7 @@ async function preflight() {
     chat: 1,
     decisions: db.enabledPatterns > 0 ? 1 : 0,
     promptModuleDecisions: db.enabledPromptModules > 0 ? 1 : 0,
+    ...(expectedHttpPromptModule === null ? {} : { expectedHttpPromptModule: "required on the published attempt" }),
     relationshipExtraction: db.relationshipEnabledQuestions > 0 ? 1 : 0,
     memoryExtraction: "recorded after completion",
     note: "actual request-boundary counts are reported after the turn; retries may increase calls",
@@ -810,6 +827,19 @@ async function cleanupPhase() {
   await persistOwnershipRecord("retain", reason);
 }
 
+function recordExpectedHttpPromptModuleResult(trace) {
+  if (expectedHttpPromptModule === null) return;
+  const result = evaluateExpectedHttpPromptModuleTrace(trace);
+  evidence.provider.expectedHttpPromptModule = {
+    required: true,
+    passed: result.passed,
+    result: result.reason,
+  };
+  if (!result.passed) {
+    failures.push(`required HTTP prompt-module trace verification failed (${result.reason}); all scenario history remains retained`);
+  }
+}
+
 async function verifyRetainedScenario() {
   if (sentMarker === null) {
     evidence.retention = { mode: "no-scenario-to-retain", reason: "no marker was generated before setup failed" };
@@ -836,6 +866,7 @@ async function verifyRetainedScenario() {
       failures.push("configuration-invariance check failed after the journey: provisioned configuration changed or was unavailable");
     }
     await persistOwnershipRecord(probe.message === null ? "no-scenario-persisted" : "retained-unverified", reason);
+    recordExpectedHttpPromptModuleResult(null);
     return;
   }
 
@@ -858,7 +889,9 @@ async function verifyRetainedScenario() {
       messageId: probe.message.id,
       turnId: probe.turn.id,
       startedAt: scenarioStartedAt ?? new Date().toISOString(),
+      ...(expectedHttpPromptModule === null ? {} : { expectedHttpModule: expectedHttpPromptModule }),
     });
+  recordExpectedHttpPromptModuleResult(state?.expectedHttpModuleTrace ?? null);
 
   if (state !== null) {
     evidence.journey.persistedAssociation = {

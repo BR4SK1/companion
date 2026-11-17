@@ -571,6 +571,9 @@ describe("worker trace CLI rendering: generic prompt modules", () => {
       position: 2,
       decisionDescription: "Use when a supplementary status note is relevant.",
       definitionHash: "a".repeat(64),
+      activationMode: "model_gated",
+      outputKind: "thoughts",
+      executionMode: "function",
       fallbackAvailable: true,
       decisionState: "responded",
       decisionModel: "decision-model",
@@ -593,6 +596,7 @@ describe("worker trace CLI rendering: generic prompt modules", () => {
     }]);
     const text = lines.join("\n");
     assert.ok(text.includes("applicability:"));
+    assert.ok(text.includes("execution mode: function"));
     assert.ok(text.includes("decision: state=responded, choice=include, selected=true"));
     assert.ok(text.includes("execution: timed_out, ordinal=0, ms=5000, failure=execution_timeout"));
     assert.ok(text.includes("output ready=true, fallback: available=true, selected=true, used=true"));

@@ -337,6 +337,13 @@ try {
       "SELECT CASE WHEN to_regclass('public.prompt_module') IS NULL THEN 0"
       + " ELSE (SELECT count(*) FROM prompt_module WHERE enabled) END",
     );
+    if (SMOKE_INPUT.expectedHttpModule !== undefined) {
+      out.expectedHttpModuleConfigured = await scalar(
+        "SELECT EXISTS (SELECT 1 FROM prompt_module WHERE id = $1 AND enabled"
+        + " AND execution_mode = 'http_post' AND activation_mode = 'every_turn')",
+        [SMOKE_INPUT.expectedHttpModule.id],
+      );
+    }
     // The chat identity is required runtime configuration: a full turn
     // cannot publish without it, so a smoke run must fail fast here with a
     // clear reason instead of a failed turn mid-journey.
@@ -622,7 +629,7 @@ try {
       [SMOKE_INPUT.turnId],
     );
     out.promptModuleDecisionRequests = await scalar(
-      "SELECT count(DISTINCT attempt_id) FROM trace_attempt_prompt_module WHERE attempt_id IN (SELECT id FROM trace_attempt WHERE turn_id = $1) AND decision_state <> 'not_requested'",
+      "SELECT count(DISTINCT attempt_id) FROM trace_attempt_prompt_module WHERE attempt_id IN (SELECT id FROM trace_attempt WHERE turn_id = $1) AND decision_state IN ('requested', 'responded', 'failed', 'invalid')",
       [SMOKE_INPUT.turnId],
     );
     out.memoryProviderCalls = await scalar(
@@ -679,6 +686,42 @@ try {
       "SELECT count(*) FROM conversation_message WHERE turn_id = $1",
       [SMOKE_INPUT.turnId],
     );
+    if (SMOKE_INPUT.expectedHttpModule !== undefined) {
+      const publishedAttemptCount = await scalar(
+        "SELECT count(*) FROM trace_attempt WHERE turn_id = $1 AND outcome = 'published'",
+        [SMOKE_INPUT.turnId],
+      );
+      const moduleRows = await client.query(
+        \`SELECT module.execution_mode, module.activation_mode, module.decision_state,
+                module.selected, module.execution_state, module.output_ready,
+                module.fallback_selected, module.fallback_used, module.included,
+                module.execution_ordinal,
+                module.function_hash = $3 AS definition_fingerprint_matches,
+                association.message_position,
+                chat.attempt_id = attempt.id AS chat_belongs_to_attempt,
+                message.chunk AS attributed_message_chunk
+         FROM trace_attempt AS attempt
+         JOIN trace_attempt_prompt_module AS module
+           ON module.attempt_id = attempt.id
+         LEFT JOIN trace_attempt_prompt_module_chat_message AS association
+           ON association.attempt_id = module.attempt_id
+          AND association.module_id = module.module_id
+         LEFT JOIN trace_attempt_chat AS chat
+           ON chat.id = association.chat_id
+          AND chat.attempt_id = attempt.id
+         LEFT JOIN trace_attempt_chat_message AS message
+           ON message.chat_id = chat.id
+          AND message.position = association.message_position
+         WHERE attempt.turn_id = $1 AND attempt.outcome = 'published'
+           AND module.module_id = $2\`,
+        [SMOKE_INPUT.turnId, SMOKE_INPUT.expectedHttpModule.id,
+          SMOKE_INPUT.expectedHttpModule.definitionFingerprint],
+      );
+      out.expectedHttpModuleTrace = {
+        publishedAttemptCount,
+        modules: moduleRows.rows,
+      };
+    }
     out.configurationFingerprint = await configurationFingerprint();
   } else if (SMOKE_INPUT.action === "delete-queued") {
     // Atomic guarded delete of this run's own still-unassigned message —
@@ -1118,7 +1161,10 @@ try {
   }
 } catch (error) {
   out.ok = false;
-  out.error = String(error && error.message ? error.message : error).split("\\n", 1)[0];
+  out.error = SMOKE_INPUT.expectedHttpModule !== undefined
+    && (SMOKE_INPUT.action === "preflight" || SMOKE_INPUT.action === "retained-state")
+    ? "expected_http_prompt_module_check_failed"
+    : String(error && error.message ? error.message : error).split("\\n", 1)[0];
 } finally {
   await client.end();
 }
@@ -1131,6 +1177,62 @@ console.log("SMOKE_JSON:" + JSON.stringify(out));
  * and booleans this script itself produced).
  */
 const TEST_CONFIGURATION_FINGERPRINT_KEY = "0".repeat(64);
+
+/**
+ * Optional operator-supplied expectation for one provisioned HTTP module.
+ * Both values are treated as private run inputs and must never be logged.
+ */
+export function expectedHttpPromptModuleFromEnvironment(environment) {
+  const id = environment.E2E_DEPLOYED_EXPECT_HTTP_MODULE_ID;
+  const definitionFingerprint = environment.E2E_DEPLOYED_EXPECT_HTTP_MODULE_FINGERPRINT;
+  if (id === undefined && definitionFingerprint === undefined) return null;
+  if (
+    typeof id !== "string" ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id) ||
+    typeof definitionFingerprint !== "string" ||
+    !/^[a-f0-9]{64}$/.test(definitionFingerprint)
+  ) {
+    throw new Error("expected_http_prompt_module_configuration_invalid");
+  }
+  return { id, definitionFingerprint };
+}
+
+/** Validate only content-free trace metadata; result reasons are safe to report. */
+export function evaluateExpectedHttpPromptModuleTrace(trace) {
+  if (trace === null || typeof trace !== "object") return { passed: false, reason: "trace_missing" };
+  if (trace.publishedAttemptCount !== 1) {
+    return {
+      passed: false,
+      reason: trace.publishedAttemptCount > 1 ? "published_attempt_ambiguous" : "published_attempt_missing",
+    };
+  }
+  if (!Array.isArray(trace.modules) || trace.modules.length === 0) {
+    return { passed: false, reason: "module_trace_missing" };
+  }
+  if (trace.modules.length !== 1) return { passed: false, reason: "module_trace_ambiguous" };
+  const module = trace.modules[0];
+  if (module.definition_fingerprint_matches !== true) return { passed: false, reason: "definition_mismatch" };
+  if (module.execution_mode !== "http_post") return { passed: false, reason: "execution_mode_mismatch" };
+  if (module.activation_mode !== "every_turn" || module.decision_state !== "not_required" || module.selected !== true) {
+    return { passed: false, reason: "every_turn_activation_missing" };
+  }
+  if (module.execution_state !== "succeeded" || module.output_ready !== true || !Number.isInteger(module.execution_ordinal)) {
+    return { passed: false, reason: "execution_not_succeeded" };
+  }
+  if (module.fallback_selected !== false || module.fallback_used !== false) {
+    return { passed: false, reason: "fallback_used" };
+  }
+  if (module.included !== true) return { passed: false, reason: "output_not_included" };
+  if (
+    !Number.isInteger(module.message_position) ||
+    module.message_position < 0 ||
+    module.chat_belongs_to_attempt !== true ||
+    module.attributed_message_chunk !== "prompt_module"
+  ) {
+    return { passed: false, reason: "prompt_module_attribution_missing" };
+  }
+  return { passed: true, reason: "verified" };
+}
 
 export function buildPodActionScript(payload) {
   const input = {

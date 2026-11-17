@@ -49,6 +49,8 @@ import {
   buildPodActionScript,
   buildQueuedAtomicDelete,
   createShutdownController,
+  evaluateExpectedHttpPromptModuleTrace,
+  expectedHttpPromptModuleFromEnvironment,
   fingerprint,
   planCleanupDecision,
   planRetainedScenarioDecision,
@@ -891,13 +893,84 @@ test("the pod-side script embeds exactly the builder statements (no drift)", () 
   assert.ok(POD_ACTION_SCRIPT_BODY.includes(buildQueuedAtomicDelete("m1", MARKER).sql));
 });
 
+test("optional expected HTTP prompt-module configuration is private, paired, and format checked", () => {
+  assert.equal(expectedHttpPromptModuleFromEnvironment({}), null);
+  const expected = {
+    E2E_DEPLOYED_EXPECT_HTTP_MODULE_ID: "123e4567-e89b-42d3-a456-426614174000",
+    E2E_DEPLOYED_EXPECT_HTTP_MODULE_FINGERPRINT: "a".repeat(64),
+  };
+  assert.deepEqual(expectedHttpPromptModuleFromEnvironment(expected), {
+    id: expected.E2E_DEPLOYED_EXPECT_HTTP_MODULE_ID,
+    definitionFingerprint: expected.E2E_DEPLOYED_EXPECT_HTTP_MODULE_FINGERPRINT,
+  });
+  assert.throws(
+    () => expectedHttpPromptModuleFromEnvironment({ E2E_DEPLOYED_EXPECT_HTTP_MODULE_ID: expected.E2E_DEPLOYED_EXPECT_HTTP_MODULE_ID }),
+    /expected_http_prompt_module_configuration_invalid/,
+  );
+  assert.throws(
+    () => expectedHttpPromptModuleFromEnvironment({
+      E2E_DEPLOYED_EXPECT_HTTP_MODULE_ID: "private-module-id",
+      E2E_DEPLOYED_EXPECT_HTTP_MODULE_FINGERPRINT: "private-fingerprint",
+    }),
+    (error) => error.message === "expected_http_prompt_module_configuration_invalid"
+      && !error.message.includes("private-module-id"),
+  );
+});
+
+test("expected HTTP prompt-module trace validation fails closed with content-free reasons", () => {
+  const validModule = {
+    definition_fingerprint_matches: true,
+    execution_mode: "http_post",
+    activation_mode: "every_turn",
+    decision_state: "not_required",
+    selected: true,
+    execution_state: "succeeded",
+    output_ready: true,
+    execution_ordinal: 0,
+    fallback_selected: false,
+    fallback_used: false,
+    included: true,
+    message_position: 3,
+    chat_belongs_to_attempt: true,
+    attributed_message_chunk: "prompt_module",
+  };
+  const validTrace = { publishedAttemptCount: 1, modules: [validModule] };
+  assert.deepEqual(evaluateExpectedHttpPromptModuleTrace(validTrace), { passed: true, reason: "verified" });
+  const cases = [
+    [null, "trace_missing"],
+    [{ publishedAttemptCount: 0, modules: [] }, "published_attempt_missing"],
+    [{ publishedAttemptCount: 2, modules: [validModule] }, "published_attempt_ambiguous"],
+    [{ publishedAttemptCount: 1, modules: [] }, "module_trace_missing"],
+    [{ publishedAttemptCount: 1, modules: [validModule, validModule] }, "module_trace_ambiguous"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, definition_fingerprint_matches: false }] }, "definition_mismatch"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, execution_mode: "function" }] }, "execution_mode_mismatch"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, activation_mode: "model_gated" }] }, "every_turn_activation_missing"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, decision_state: "requested" }] }, "every_turn_activation_missing"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, selected: false }] }, "every_turn_activation_missing"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, execution_state: "failed" }] }, "execution_not_succeeded"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, output_ready: false }] }, "execution_not_succeeded"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, fallback_selected: true }] }, "fallback_used"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, fallback_used: true }] }, "fallback_used"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, included: false }] }, "output_not_included"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, message_position: null }] }, "prompt_module_attribution_missing"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, chat_belongs_to_attempt: false }] }, "prompt_module_attribution_missing"],
+    [{ publishedAttemptCount: 1, modules: [{ ...validModule, attributed_message_chunk: "conversation" }] }, "prompt_module_attribution_missing"],
+  ];
+  for (const [fixture, reason] of cases) {
+    const result = evaluateExpectedHttpPromptModuleTrace(fixture);
+    assert.equal(result.passed, false);
+    assert.equal(result.reason, reason);
+    assert.doesNotMatch(JSON.stringify(result), /private|endpoint|response|module-id/i);
+  }
+});
+
 test("generated pod scripts parse for every action and leak no marker into SQL", async (t) => {
   const actions = [
     { action: "configuration-fingerprint" },
     { action: "marker-check", marker: MARKER },
-    { action: "preflight", smokePrefix: "e2e-deployed-smoke-" },
+    { action: "preflight", smokePrefix: "e2e-deployed-smoke-", expectedHttpModule: { id: "123e4567-e89b-42d3-a456-426614174000", definitionFingerprint: "a".repeat(64) } },
     { action: "probe", marker: MARKER },
-    { action: "retained-state", marker: MARKER, messageId: "m1", turnId: "t1", startedAt: "2026-11-15T12:00:00.000Z" },
+    { action: "retained-state", marker: MARKER, messageId: "m1", turnId: "t1", startedAt: "2026-11-15T12:00:00.000Z", expectedHttpModule: { id: "123e4567-e89b-42d3-a456-426614174000", definitionFingerprint: "a".repeat(64) } },
     { action: "delete-queued", messageId: "m1", marker: MARKER },
     { action: "delete-full-turn", turnId: "t1", messageId: "m1", marker: MARKER },
     { action: "post-state", smokePrefix: "e2e-deployed-smoke-" },
@@ -920,7 +993,43 @@ test("retained-state pod action reports conversation, trace, memory, and config 
   await withDisposablePostgres(t, async ({ client: db, databaseUrl }) => {
     const marker = buildMarker();
     const seeded = await seedCompletedTurn(db, marker);
-    await seedTraceChainForTurn(db, seeded);
+    const trace = await seedTraceChainForTurn(db, seeded);
+    const expectedHttpModule = {
+      id: randomUUID(),
+      definitionFingerprint: "d".repeat(64),
+    };
+    await db.query(
+      `INSERT INTO prompt_module
+         (id, module_key, decision_description, function_definition, enabled,
+          activation_mode, output_kind, execution_mode, http_endpoint_setting,
+          http_response_text_field, http_field_max_bytes, http_prior_message_limit,
+          http_request_max_bytes, http_response_max_bytes)
+       VALUES ($1, 'smoke_http_fixture', 'Synthetic disposable HTTP module', NULL,
+          true, 'every_turn', 'thoughts', 'http_post', 'WORKER_TEST_ENDPOINT',
+          'responseText', 512, 8, 8192, 16384)`,
+      [expectedHttpModule.id],
+    );
+    await db.query(
+      `INSERT INTO trace_attempt_prompt_module
+         (attempt_id, module_id, module_key, position, decision_description,
+          function_hash, fallback_available, decision_state, selected, execution_state,
+          execution_ordinal, output_ready, fallback_selected, included,
+          activation_mode, output_kind, execution_mode)
+       VALUES ($1, $2, 'smoke_http_fixture', 0, 'Synthetic disposable HTTP module',
+          $3, false, 'not_required', true, 'succeeded', 0, true, false, true,
+          'every_turn', 'thoughts', 'http_post')`,
+      [trace.attemptId, expectedHttpModule.id, expectedHttpModule.definitionFingerprint],
+    );
+    await db.query(
+      "UPDATE trace_attempt_chat_message SET role = 'system', chunk = 'prompt_module' WHERE chat_id = $1 AND position = 0",
+      [trace.chatId],
+    );
+    await db.query(
+      `INSERT INTO trace_attempt_prompt_module_chat_message
+         (attempt_id, module_id, chat_id, message_position)
+       VALUES ($1, $2, $3, 0)`,
+      [trace.attemptId, expectedHttpModule.id, trace.chatId],
+    );
     const beforeMessages = await db.query("SELECT count(*)::int AS n FROM conversation_message");
     const beforeTurns = await db.query("SELECT count(*)::int AS n FROM conversation_turn");
     const markerCheck = await runPodScript(databaseUrl, buildPodActionScript({
@@ -931,7 +1040,9 @@ test("retained-state pod action reports conversation, trace, memory, and config 
     const preflight = await runPodScript(databaseUrl, buildPodActionScript({
       action: "preflight",
       smokePrefix: "e2e-deployed-smoke-",
+      expectedHttpModule,
     }));
+    assert.equal(preflight.expectedHttpModuleConfigured, true);
     assert.equal(preflight.leftoverSmokeRows, 1, "completed retained history is recognized but does not block future unique runs");
     assert.equal(preflight.unsettledSmokeRows, 0);
     const script = buildPodActionScript({
@@ -940,6 +1051,7 @@ test("retained-state pod action reports conversation, trace, memory, and config 
       messageId: seeded.userId,
       turnId: seeded.turnId,
       startedAt: new Date().toISOString(),
+      expectedHttpModule,
     });
     const result = await runPodScript(databaseUrl, script);
     assert.equal(result.message.id, seeded.userId);
@@ -952,6 +1064,12 @@ test("retained-state pod action reports conversation, trace, memory, and config 
     assert.equal(result.decisionRequests, 1);
     assert.equal(result.chatRequests, 1);
     assert.equal(result.providerRequestsObserved, 2);
+    assert.deepEqual(evaluateExpectedHttpPromptModuleTrace(result.expectedHttpModuleTrace), {
+      passed: true,
+      reason: "verified",
+    });
+    assert.doesNotMatch(JSON.stringify(result.expectedHttpModuleTrace), new RegExp(expectedHttpModule.id));
+    assert.doesNotMatch(JSON.stringify(result.expectedHttpModuleTrace), new RegExp(expectedHttpModule.definitionFingerprint));
     assert.match(result.configurationFingerprint, /^[a-f0-9]{64}$/);
     assert.equal((await db.query("SELECT count(*)::int AS n FROM conversation_message")).rows[0].n, beforeMessages.rows[0].n);
     assert.equal((await db.query("SELECT count(*)::int AS n FROM conversation_turn")).rows[0].n, beforeTurns.rows[0].n);
