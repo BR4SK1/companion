@@ -67,27 +67,32 @@ function safeResult(result: PromptModuleRunResult): PromptModuleRunResult {
   return result;
 }
 
+function emptySelection(moduleId: string, selected: boolean | null) {
+  return {
+    moduleId,
+    choice: null,
+    selected,
+    confidence: null,
+    probabilities: null,
+  } as const;
+}
+
 /**
- * Runs the optional independent module decision batch and selected functions.
- * Any decision or function failure degrades to omitted module context; it never
- * rejects ordinary chat. A database trace fencing error remains fatal at the
- * composition edge to preserve lease correctness.
+ * Records real model-gated outcomes independently from every-turn activation.
+ * A failed or unusable model batch only suppresses model-gated modules; it
+ * cannot suppress a module whose configured activation does not require a
+ * provider decision. Selected modules still execute in their configured order.
  */
 export async function runPromptModules(
   deps: PromptModuleRuntimeDeps,
-): Promise<readonly { readonly moduleId: string; readonly content: string }[]> {
+): Promise<readonly { readonly moduleId: string; readonly content: string; readonly outputKind: PromptModuleDefinition["outputKind"] }[]> {
   const modules = [...deps.modules].sort((a, b) =>
     a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
   );
   if (modules.length === 0) return [];
 
-  const request = parseDecisionsRequest(buildPromptModuleDecisionRequest({
-    model: deps.decisionModel,
-    modules,
-    state: deps.state,
-  }));
-  // The trace snapshot of criteria and function hashes is written before the
-  // optional model decision request. DB code itself is never copied to trace.
+  const gatedModules = modules.filter((module) => module.activationMode === "model_gated");
+  const everyTurnModules = modules.filter((module) => module.activationMode === "every_turn");
   await deps.recordDefinitions({
     turnId: deps.turnId,
     leaseOwner: deps.leaseOwner,
@@ -95,142 +100,164 @@ export async function runPromptModules(
     modules,
   });
 
-  const decisionStartedAt = performance.now();
-  let response: ReturnType<typeof parseDecisionsExchange> | undefined;
-  let decisionFailure: PromptModuleDecisionTrace["failureKind"] = null;
-  try {
-    response = parseDecisionsExchange(request, await deps.callDecisions(request));
-  } catch (error) {
-    decisionFailure = error instanceof OpenRouterTransportError
-      ? "decision_transport"
-      : "decision_invalid";
-  }
+  const selected = new Set<string>();
+  if (gatedModules.length > 0) {
+    const decisionStartedAt = performance.now();
+    let request: DecisionsRequest | undefined;
+    let response: ReturnType<typeof parseDecisionsExchange> | undefined;
+    let failure: PromptModuleDecisionTrace["failureKind"] = null;
+    try {
+      request = parseDecisionsRequest(buildPromptModuleDecisionRequest({
+        model: deps.decisionModel,
+        modules: gatedModules,
+        state: deps.state,
+      }));
+      response = parseDecisionsExchange(request, await deps.callDecisions(request));
+    } catch (error) {
+      failure = error instanceof OpenRouterTransportError
+        ? "decision_transport"
+        : "decision_invalid";
+    }
 
-  if (response !== undefined) {
-    const rawSelections = modules.map((module) => {
-      const answer = promptModuleDecisionAnswer(response!, module.id);
-      return { module, answer };
-    });
-    const selections: PromptModuleDecisionTrace["selections"][number][] = [];
-    let unusable = false;
-    for (const { module, answer } of rawSelections) {
-      try {
-        const selected = selectPromptModule(answer);
-        selections.push({
-          moduleId: module.id,
-          choice: answer.choice,
-          selected,
-          confidence: answer.confidence ?? null,
-          probabilities: answer.probabilities ?? null,
+    if (response !== undefined && request !== undefined) {
+      const selections: PromptModuleDecisionTrace["selections"][number][] = [];
+      let unusable = false;
+      for (const module of gatedModules) {
+        let answer: ReturnType<typeof promptModuleDecisionAnswer>;
+        try {
+          answer = promptModuleDecisionAnswer(response, module.id);
+        } catch {
+          unusable = true;
+          selections.push(emptySelection(module.id, null));
+          continue;
+        }
+        try {
+          const include = selectPromptModule(answer);
+          if (include) selected.add(module.id);
+          selections.push({
+            moduleId: module.id,
+            choice: answer.choice,
+            selected: include,
+            confidence: answer.confidence ?? null,
+            probabilities: answer.probabilities ?? null,
+          });
+        } catch {
+          unusable = true;
+          selections.push({
+            moduleId: module.id,
+            choice: answer.choice,
+            selected: null,
+            confidence: answer.confidence ?? null,
+            probabilities: answer.probabilities ?? null,
+          });
+        }
+      }
+      if (unusable) {
+        failure = "decision_unusable";
+        selected.clear();
+        await deps.recordDecision({
+          turnId: deps.turnId,
+          leaseOwner: deps.leaseOwner,
+          result: {
+            state: "invalid",
+            decisionModel: request.model,
+            responseModel: response.model,
+            responseProvider: response.provider ?? null,
+            durationMs: elapsed(decisionStartedAt),
+            failureKind: failure,
+            selections: selections.map((entry) => ({ ...entry, selected: null })),
+          },
         });
-      } catch {
-        unusable = true;
-        selections.push({
-          moduleId: module.id,
-          choice: answer.choice,
-          selected: null,
-          confidence: answer.confidence ?? null,
-          probabilities: answer.probabilities ?? null,
+        log(deps, `decision=failed reason=${failure} modules=${gatedModules.length}; gated modules omitted`);
+      } else {
+        await deps.recordDecision({
+          turnId: deps.turnId,
+          leaseOwner: deps.leaseOwner,
+          result: {
+            state: "responded",
+            decisionModel: request.model,
+            responseModel: response.model,
+            responseProvider: response.provider ?? null,
+            durationMs: elapsed(decisionStartedAt),
+            failureKind: null,
+            selections,
+          },
         });
       }
-    }
-    if (unusable) {
-      decisionFailure = "decision_unusable";
+    } else {
       await deps.recordDecision({
         turnId: deps.turnId,
         leaseOwner: deps.leaseOwner,
         result: {
-          state: "invalid",
-          decisionModel: request.model,
-          responseModel: response.model,
-          responseProvider: response.provider ?? null,
+          state: failure === "decision_transport" ? "failed" : "invalid",
+          decisionModel: request?.model ?? null,
+          responseModel: null,
+          responseProvider: null,
           durationMs: elapsed(decisionStartedAt),
-          failureKind: decisionFailure,
-          // A malformed choice invalidates this independent batch: retain raw
-          // returned choices for explanation but never treat any as selected.
-          selections: selections.map((selection) => ({ ...selection, selected: null })),
+          failureKind: failure ?? "decision_invalid",
+          selections: gatedModules.map((module) => emptySelection(module.id, null)),
         },
       });
-      log(deps, `decision=failed reason=${decisionFailure} modules=${modules.length}; all omitted`);
-      return [];
+      log(deps, `decision=failed reason=${failure ?? "decision_invalid"} modules=${gatedModules.length}; gated modules omitted`);
     }
+  }
 
+  if (everyTurnModules.length > 0) {
     await deps.recordDecision({
       turnId: deps.turnId,
       leaseOwner: deps.leaseOwner,
       result: {
-        state: "responded",
-        decisionModel: request.model,
-        responseModel: response.model,
-        responseProvider: response.provider ?? null,
-        durationMs: elapsed(decisionStartedAt),
+        state: "not_required",
+        decisionModel: null,
+        responseModel: null,
+        responseProvider: null,
+        durationMs: null,
         failureKind: null,
-        selections,
+        selections: everyTurnModules.map((module) => emptySelection(module.id, true)),
       },
     });
-    const selected = new Set(selections.filter((entry) => entry.selected === true).map((entry) => entry.moduleId));
-    const outputs: { moduleId: string; content: string }[] = [];
-    let executionOrdinal = 0;
-    for (const module of modules) {
-      if (!selected.has(module.id)) {
-        log(deps, `module=${module.key} decision=skipped execution=not_selected included=false`);
-        continue;
-      }
-      const currentExecutionOrdinal = executionOrdinal++;
-      const executionStartedAt = performance.now();
-      let rawExecution: PromptModuleRunResult;
-      try {
-        rawExecution = await deps.execute({
-          module,
-          context: { ...deps.context, turnId: deps.turnId },
-        });
-      } catch {
-        rawExecution = { kind: "failed", durationMs: elapsed(executionStartedAt) };
-      }
-      const execution = safeResult(rawExecution);
-      const fallbackUsed = execution.kind !== "succeeded" && module.fallbackContent !== null;
-      const content = execution.kind === "succeeded"
-        ? execution.content
-        : fallbackUsed
-          ? module.fallbackContent!
-          : null;
-      const trace: PromptModuleExecutionTrace = {
-        moduleId: module.id,
-        executionOrdinal: currentExecutionOrdinal,
-        state: execution.kind,
-        durationMs: execution.durationMs,
-        outputReady: content !== null,
-        fallbackSelected: fallbackUsed,
-      };
-      await deps.recordExecution({ turnId: deps.turnId, leaseOwner: deps.leaseOwner, result: trace });
-      if (content !== null) outputs.push({ moduleId: module.id, content });
-      log(
-        deps,
-        `module=${module.key} decision=selected execution=${execution.kind} ms=${execution.durationMs} fallback_ready=${fallbackUsed} output_ready=${content !== null}`,
-      );
-    }
-    return outputs;
+    for (const module of everyTurnModules) selected.add(module.id);
   }
 
-  await deps.recordDecision({
-    turnId: deps.turnId,
-    leaseOwner: deps.leaseOwner,
-    result: {
-      state: decisionFailure === "decision_transport" ? "failed" : "invalid",
-      decisionModel: request.model,
-      responseModel: null,
-      responseProvider: null,
-      durationMs: elapsed(decisionStartedAt),
-      failureKind: decisionFailure,
-      selections: modules.map((module) => ({
-        moduleId: module.id,
-        choice: null,
-        selected: null,
-        confidence: null,
-        probabilities: null,
-      })),
-    },
-  });
-  log(deps, `decision=failed reason=${decisionFailure} modules=${modules.length}; all omitted`);
-  return [];
+  const outputs: { moduleId: string; content: string; outputKind: PromptModuleDefinition["outputKind"] }[] = [];
+  let executionOrdinal = 0;
+  for (const module of modules) {
+    if (!selected.has(module.id)) {
+      log(deps, `module=${module.key} activation=${module.activationMode} execution=not_selected included=false`);
+      continue;
+    }
+    const currentExecutionOrdinal = executionOrdinal++;
+    const executionStartedAt = performance.now();
+    let rawExecution: PromptModuleRunResult;
+    try {
+      rawExecution = await deps.execute({
+        module,
+        context: { ...deps.context, turnId: deps.turnId },
+      });
+    } catch {
+      rawExecution = { kind: "failed", durationMs: elapsed(executionStartedAt) };
+    }
+    const execution = safeResult(rawExecution);
+    const fallbackUsed = execution.kind !== "succeeded" && module.fallbackContent !== null;
+    const content = execution.kind === "succeeded"
+      ? execution.content
+      : fallbackUsed
+        ? module.fallbackContent!
+        : null;
+    const trace: PromptModuleExecutionTrace = {
+      moduleId: module.id,
+      executionOrdinal: currentExecutionOrdinal,
+      state: execution.kind,
+      durationMs: execution.durationMs,
+      outputReady: content !== null,
+      fallbackSelected: fallbackUsed,
+    };
+    await deps.recordExecution({ turnId: deps.turnId, leaseOwner: deps.leaseOwner, result: trace });
+    if (content !== null) outputs.push({ moduleId: module.id, content, outputKind: module.outputKind });
+    log(
+      deps,
+      `module=${module.key} activation=${module.activationMode} execution=${execution.kind} ms=${execution.durationMs} fallback_ready=${fallbackUsed} output_ready=${content !== null}`,
+    );
+  }
+  return outputs;
 }

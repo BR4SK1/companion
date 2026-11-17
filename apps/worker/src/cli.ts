@@ -206,6 +206,7 @@ export function renderPromptModules(
     lines.push(`    ${String(module.position)}: ${module.moduleKey} (id=${module.moduleId})`);
     lines.push(`      applicability: ${JSON.stringify(module.decisionDescription)}`);
     lines.push(`      definition sha256: ${module.definitionHash}`);
+    lines.push(`      activation: ${module.activationMode}; output kind: ${module.outputKind}; execution mode: ${module.executionMode}`);
     lines.push(
       `      decision: state=${module.decisionState}, choice=${module.decisionChoice ?? "(none)"}, selected=${module.selected ?? "(unknown)"}, model=${module.responseModel ?? module.decisionModel ?? "(n/a)"}, ms=${module.decisionMs ?? "(n/a)"}`,
     );
@@ -223,7 +224,7 @@ export function renderPromptModules(
       `      prompt inclusion: ${module.included ? `chat message position ${String(module.chatMessagePosition)}` : "omitted"}`,
     );
   }
-  lines.push("    function source, credentials, and module output are not duplicated here; included output appears only in the normal chat request trace.");
+  lines.push("    function source, HTTP configuration, credentials, and module output are not duplicated here; included output appears only in the normal chat request trace.");
   return lines;
 }
 

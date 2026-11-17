@@ -8,6 +8,7 @@ import type {
   PromptModuleDefinition,
   PromptModuleRunResult,
 } from "./types.ts";
+import { executeHttpPromptModule } from "./http-post.ts";
 
 interface ChildResponse {
   readonly nonce: string;
@@ -24,6 +25,16 @@ export async function executePromptModule(input: {
   readonly module: PromptModuleDefinition;
   readonly context: PromptModuleContext;
 }): Promise<PromptModuleRunResult> {
+  if (input.module.executionMode === "http_post") {
+    return await executeHttpPromptModule(input);
+  }
+  if (
+    input.module.executionMode !== "function" ||
+    input.module.functionDefinition === null ||
+    input.module.httpConfig !== null
+  ) {
+    return { kind: "failed", durationMs: 0 };
+  }
   const startedAt = performance.now();
   const nonce = randomUUID();
   const childPath = fileURLToPath(new URL("./executor-child.ts", import.meta.url));

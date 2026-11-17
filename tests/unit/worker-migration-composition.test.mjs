@@ -32,6 +32,8 @@ test("worker startup and migration-only command share the complete ordered schem
       "0020_companion_time_day_start_hour",
       "0018_generic_prompt_modules",
       "0019_prompt_module_chat_attribution",
+      "0022_prompt_module_activation_modes",
+      "0023_prompt_module_http_post",
     ],
   );
   assert.equal(new Set(workerMigrations.map(({ id }) => id)).size, workerMigrations.length);

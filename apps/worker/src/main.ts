@@ -600,6 +600,8 @@ async function main(): Promise<void> {
                 turnId,
                 limit: config.contextMessageLimit,
               }),
+            loadPreviousPublishedAssistantReply: (turnId) =>
+              store.getPreviousPublishedAssistantReply(turnId),
             recordSnapshot: (snapshot) =>
               recordTraced("snapshot", work.turn.id, () =>
                 store.recordAttemptSnapshot({

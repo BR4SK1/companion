@@ -38,6 +38,45 @@ function fakePool() {
 }
 
 describe("prompt module trace persistence", () => {
+  it("loads activation and output settings with compatible defaults supplied by the schema", async () => {
+    const statements = [];
+    const pool = {
+      query: async (sql) => {
+        statements.push(String(sql));
+        return { rows: [{
+          id: moduleId,
+          module_key: "every_turn_module",
+          decision_description: "criterion",
+          function_definition: "(context) => context.turnId",
+          execution_mode: "function",
+          http_endpoint_setting: null,
+          http_scope_setting: null,
+          http_scope_field: null,
+          http_turn_id_field: null,
+          http_local_datetime_field: null,
+          http_previous_assistant_field: null,
+          http_user_message_field: null,
+          http_prior_conversation_field: null,
+          http_response_text_field: null,
+          http_field_max_bytes: null,
+          http_prior_message_limit: null,
+          http_request_max_bytes: null,
+          http_response_max_bytes: null,
+          fallback_content: null,
+          timeout_ms: 5000,
+          position: 2,
+          activation_mode: "every_turn",
+          output_kind: "authoritative_context",
+        }] };
+      },
+    };
+    const store = createPromptModuleStore(pool);
+    const modules = await store.loadEnabled();
+    assert.equal(modules[0].activationMode, "every_turn");
+    assert.equal(modules[0].outputKind, "authoritative_context");
+    assert.match(statements[0], /activation_mode, output_kind/);
+  });
+
   it("loads typed trace rows with deterministic tie ordering and persisted message positions", async () => {
     const pool = fakePool();
     const store = createPromptModuleStore(pool);
@@ -53,6 +92,9 @@ describe("prompt module trace persistence", () => {
             position: 7,
             decision_description: "criterion",
             function_hash: "a".repeat(64),
+            activation_mode: "model_gated",
+            output_kind: "thoughts",
+            execution_mode: "function",
             fallback_available: false,
             decision_state: "responded",
             decision_model: "decision-model",
@@ -83,6 +125,7 @@ describe("prompt module trace persistence", () => {
     assert.equal(result[0].moduleId, moduleId);
     assert.equal(result[0].outputReady, true);
     assert.equal(result[0].included, true);
+    assert.equal(result[0].executionMode, "function");
     assert.equal(result[0].chatMessagePosition, 1);
     assert.deepEqual(result[0].probabilities, [{ optionId: "include", value: 0.9 }]);
     const traceQuery = clientQueries.find(({ sql }) => sql.includes("FROM trace_attempt_prompt_module AS module"));
@@ -123,6 +166,98 @@ describe("prompt module trace persistence", () => {
       pool.statements.some(({ sql }) => sql.includes("trace_attempt_prompt_module")),
       false,
     );
+  });
+
+  it("records every-turn activation without a provider result and attributes its output exactly", async () => {
+    const pool = fakePool();
+    const modules = createPromptModuleStore(pool);
+    const module = {
+      id: moduleId,
+      key: "every_turn_module",
+      decisionDescription: "criterion",
+      functionDefinition: "(context) => context.turnId",
+      executionMode: "function",
+      httpConfig: null,
+      definitionHash: "b".repeat(64),
+      fallbackContent: null,
+      timeoutMs: 5000,
+      position: 0,
+      activationMode: "every_turn",
+      outputKind: "authoritative_context",
+    };
+    await modules.recordDefinitions({
+      turnId: "turn-every",
+      leaseOwner: "lease-every",
+      decisionModel: "unused-model",
+      modules: [module],
+    });
+    await modules.recordDecision({
+      turnId: "turn-every",
+      leaseOwner: "lease-every",
+      result: {
+        state: "not_required",
+        decisionModel: null,
+        responseModel: null,
+        responseProvider: null,
+        durationMs: null,
+        failureKind: null,
+        selections: [{
+          moduleId,
+          choice: null,
+          selected: true,
+          confidence: null,
+          probabilities: null,
+        }],
+      },
+    });
+    await modules.recordExecution({
+      turnId: "turn-every",
+      leaseOwner: "lease-every",
+      result: {
+        moduleId,
+        executionOrdinal: 0,
+        state: "succeeded",
+        durationMs: 2,
+        outputReady: true,
+        fallbackSelected: false,
+      },
+    });
+    const conversation = createConversationStore(pool, {
+      onPromptModuleChatMessagesRecorded: (client, association) =>
+        modules.recordChatAttribution(client, association),
+    });
+    await conversation.recordChatRequest({
+      turnId: "turn-every",
+      leaseOwner: "lease-every",
+      payload: {
+        request: {
+          model: "chat-model",
+          messages: [
+            { role: "system", content: "identity" },
+            { role: "system", content: "authoritative context" },
+            { role: "user", content: "hello" },
+          ],
+        },
+        messageSources: [null, null, "00000000-0000-4000-8000-000000000004"],
+        messageChunks: ["identity", "prompt_module", "conversation"],
+        messagePromptModuleIds: [null, moduleId, null],
+        identityRevision: 1,
+      },
+    });
+    const decisionWrite = pool.statements.find(({ sql }) =>
+      sql.includes("SET decision_state = $3"),
+    );
+    assert.ok(decisionWrite);
+    assert.equal(decisionWrite.values[2], "not_required");
+    assert.equal(decisionWrite.values[3], null);
+    assert.equal(decisionWrite.values[9], null);
+    const executionWrite = pool.statements.find(({ sql }) =>
+      sql.includes("SET execution_state = $3"),
+    );
+    assert.match(executionWrite.sql, /'not_required'/);
+    assert.ok(pool.statements.some(({ sql, values }) =>
+      sql.includes("INSERT INTO trace_attempt_prompt_module_chat_message") && values[1] === moduleId,
+    ));
   });
 
   it("keeps generated output ready but not included until the atomic chat request association", async () => {
