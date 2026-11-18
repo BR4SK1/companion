@@ -328,6 +328,16 @@ async function insertTestTurn(pool) {
   return turnRow.rows[0].id;
 }
 
+/** Simulate twelve hours of elapsed database time between serialized attempts. */
+async function expireArticleIngestionWindow(pool) {
+  await pool.query(
+    `UPDATE memory_operation
+     SET started_at = clock_timestamp() - interval '13 hours'
+     WHERE kind = 'article_ingestion'
+       AND (detail LIKE '%feedsAttempted=%' OR detail LIKE '%feed_reserved=true%')`,
+  );
+}
+
 /** Poll until the SQL returns at least one row; bounded, for cross-attempt visibility. */
 async function waitForRow(pool, sql, params = []) {
   for (let attempt = 0; attempt < 400; attempt += 1) {
@@ -389,11 +399,14 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       "0005_message_timing",
       "0006_conversation_thread_order",
       "0003_memory_work",
+      "0004_memory_semantic_shadow",
+      "0021_memory_operation_turn_attribution",
       "0007_article_work",
       "0008_article_share_and_evidence",
       "0009_article_observation_claim",
       "0016_authoritative_temporal_context",
       "0017_trace_attempt_temporal_context",
+      "0020_companion_time_day_start_hour",
     ]);
     const tables = await pool.query(
       `SELECT table_name FROM information_schema.tables
@@ -556,13 +569,12 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       pool,
       callLlm: llm,
       log: (message) => logs.push(message),
-      pollIntervalMs: 3_600_000,
       transport,
       resolveFeedHost: FAKE_RESOLVER,
     });
     try {
-      // The runtime keeps polling while unprovisioned: the startup attempt
-      // (and the awaited manual one) log the rollout line and fetch nothing.
+      // Startup and the awaited manual attempt both preserve the rollout
+      // no-op while the article configuration is absent.
       const before = await runtime.runOnce();
       assert.equal(before.status, "not_configured");
       assert.deepEqual(transport.seenUrls, []);
@@ -623,6 +635,72 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     assert.equal(llm.calls.generation, 0);
     const items = await pool.query(`SELECT count(*)::int AS n FROM article_item`);
     assert.equal(items.rows[0].n, 0);
+  });
+
+  it("reserves one durable 12-hour fetch slot across restarts and manual runs", async () => {
+    await provisionArticleConfig(pool);
+    const llm = makeArticleLlm();
+    const transport = makeFeedTransport({ xml: buildFeedXml() });
+    const reservationAtHostValidation = [];
+    const runtime = startArticleRuntime({
+      pool,
+      callLlm: llm,
+      log: () => {},
+      transport,
+      resolveFeedHost: async (url) => {
+        const latest = await pool.query(
+          `SELECT detail, finished_at FROM memory_operation
+           WHERE kind = 'article_ingestion'
+           ORDER BY started_at DESC LIMIT 1`,
+        );
+        reservationAtHostValidation.push(latest.rows[0]);
+        return FAKE_RESOLVER();
+      },
+    });
+    try {
+      // runOnce queues after startup. Startup reserves and fetches once;
+      // the manual call inside that same 12-hour window is rate-limited.
+      const withinWindow = await runtime.runOnce();
+      assert.equal(withinWindow.status, "rate_limited");
+      assert.equal(transport.seenUrls.length, 1);
+      assert.equal(reservationAtHostValidation.length, 1);
+      assert.match(reservationAtHostValidation[0].detail, /feed_reserved=true/);
+      assert.equal(reservationAtHostValidation[0].finished_at, null);
+
+      const operation = await pool.query(
+        `SELECT started_at, finished_at, detail FROM memory_operation
+         WHERE kind = 'article_ingestion'`,
+      );
+      assert.equal(operation.rows.length, 1);
+      assert.ok(operation.rows[0].started_at instanceof Date);
+      assert.ok(operation.rows[0].finished_at instanceof Date);
+      assert.match(operation.rows[0].detail, /feedsAttempted=1/);
+    } finally {
+      await runtime.close();
+    }
+
+    // A second runtime sees the same durable trace and cannot immediately
+    // fetch again after a restart.
+    const afterRestartTransport = makeFeedTransport({ xml: buildFeedXml() });
+    const restarted = startArticleRuntime({
+      pool,
+      callLlm: makeArticleLlm(),
+      log: () => {},
+      transport: afterRestartTransport,
+      resolveFeedHost: FAKE_RESOLVER,
+    });
+    try {
+      const manual = await restarted.runOnce();
+      assert.equal(manual.status, "rate_limited");
+      assert.deepEqual(afterRestartTransport.seenUrls, []);
+      const operationCount = await pool.query(
+        `SELECT count(*)::int AS count FROM memory_operation
+         WHERE kind = 'article_ingestion'`,
+      );
+      assert.equal(operationCount.rows[0].count, 1);
+    } finally {
+      await restarted.close();
+    }
   });
 
   // --- Ingestion pipeline -----------------------------------------------------
@@ -737,6 +815,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       "A quiet essay on daily brewing habits and what they reveal.",
       "An edited summary that must not replace the stored excerpt.",
     );
+    await expireArticleIngestionWindow(pool);
     const second = await runIngestionAttempt(deps, "test");
     assert.equal(second.status, "ok");
     assert.equal(second.result.itemsFetched, 2);
@@ -795,6 +874,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     // review now accepting, the same item reaches the accepted state and its
     // fact is written.
     const accepting = makeArticleLlm();
+    await expireArticleIngestionWindow(pool);
     const secondSummary = await runIngestionAttempt(
       {
         pool,
@@ -863,6 +943,9 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     // claim row to be durably visible makes B's observation deterministic.
     const attemptA = runIngestionAttempt(depsA, "test");
     await waitForRow(pool, `SELECT 1 FROM article_reaction WHERE state = 'generating'`);
+    // This test isolates the reaction claim lease from the new fetch cadence:
+    // simulate its next 12-hour fetch slot before the second worker runs.
+    await expireArticleIngestionWindow(pool);
     const summaryB = await runIngestionAttempt(depsB, "test");
     assert.equal(summaryB.status, "ok");
     assert.equal(summaryB.result.skippedClaims, 1);
@@ -941,6 +1024,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       transport: makeFeedTransport({ xml: buildFeedXml() }),
       resolveFeedHost: FAKE_RESOLVER,
     };
+    await expireArticleIngestionWindow(pool);
     const summaryB = await runIngestionAttempt(depsB, "test");
     assert.equal(summaryB.status, "ok");
     assert.equal(summaryB.result.generated, 1);
@@ -985,6 +1069,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       transport: makeFeedTransport({ xml: buildFeedXml() }),
       resolveFeedHost: FAKE_RESOLVER,
     };
+    await expireArticleIngestionWindow(pool);
     const summaryB = await runIngestionAttempt(depsB, "test");
     assert.equal(summaryB.status, "ok");
     assert.equal(summaryB.result.generated, 1);
@@ -1105,8 +1190,10 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       `SELECT i.feed_id FROM article_reaction r JOIN article_item i ON i.id = r.item_id`,
     );
     assert.deepEqual([...new Set(reacted.rows.map((row) => row.feed_id))], ["feed-a"]);
-    // Re-enabling the feed makes its item a candidate again.
+    // Re-enabling the feed makes its item a candidate again, after the next
+    // source-fetch slot becomes due.
     await pool.query(`UPDATE article_feed SET enabled = true WHERE id = 'feed-disabled'`);
+    await expireArticleIngestionWindow(pool);
     const second = await runIngestionAttempt(
       {
         pool,
@@ -1193,6 +1280,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
            lease_expires_at = now() - interval '1 hour', last_error = 'crashed'`,
     );
     const failing = makeArticleLlm({ unusableReview: true });
+    await expireArticleIngestionWindow(pool);
     const retried = await runIngestionAttempt(
       {
         pool,
@@ -1210,7 +1298,8 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       `SELECT state, attempt_count FROM article_reaction`,
     );
     assert.equal(afterRetry.rows[0].attempt_count, 2);
-    // At the cap the row is never selected again, on any later attempt.
+    // At the cap the row is never selected again, even in a later 12-hour slot.
+    await expireArticleIngestionWindow(pool);
     const later = await runIngestionAttempt(
       {
         pool,
@@ -1263,9 +1352,47 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     assert.ok(logs.every((message) => !/persistence failed/.test(message)));
   });
 
-  // --- Feed bounding and runtime scheduling ------------------------------------
+  // --- Feed cadence and runtime scheduling ------------------------------------
 
-  it("caps feeds per run and rotates the starting position across runs", async () => {
+  it("serializes concurrent worker attempts through the durable reservation", async () => {
+    await provisionArticleConfig(pool);
+    const transportA = makeFeedTransport({ xml: buildFeedXml() });
+    const transportB = makeFeedTransport({ xml: buildFeedXml() });
+    const [summaryA, summaryB] = await Promise.all([
+      runIngestionAttempt(
+        {
+          pool,
+          callLlm: makeArticleLlm(),
+          log: () => {},
+          transport: transportA,
+          resolveFeedHost: FAKE_RESOLVER,
+        },
+        "replica-a",
+      ),
+      runIngestionAttempt(
+        {
+          pool,
+          callLlm: makeArticleLlm(),
+          log: () => {},
+          transport: transportB,
+          resolveFeedHost: FAKE_RESOLVER,
+        },
+        "replica-b",
+      ),
+    ]);
+    assert.deepEqual(
+      [summaryA.status, summaryB.status].sort(),
+      ["ok", "rate_limited"],
+    );
+    assert.equal(transportA.seenUrls.length + transportB.seenUrls.length, 1);
+    const reservations = await pool.query(
+      `SELECT count(*)::int AS count FROM memory_operation
+       WHERE kind = 'article_ingestion'`,
+    );
+    assert.equal(reservations.rows[0].count, 1);
+  });
+
+  it("fetches one shuffled feed per due slot and rate-limits within the window", async () => {
     await provisionArticleConfig(pool);
     for (let i = 1; i <= 9; i += 1) {
       await pool.query(
@@ -1274,65 +1401,64 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
         [`feed-${String(i)}`, `https://feeds.example.com/f${String(i)}.xml`, i],
       );
     }
-    // Ten enabled feeds (feed-a plus these nine): one run attempts at most
-    // MAX_FEEDS_PER_RUN, in position order from the rotation start.
-    const llm = makeArticleLlm();
-    const transport = makeFeedTransport({ xml: buildFeedXml() });
-    const deps = { pool, callLlm: llm, log: () => {}, transport, resolveFeedHost: FAKE_RESOLVER };
-    const first = await runIngestionAttempt(deps, "test");
-    assert.equal(first.status, "ok");
-    assert.equal(first.feedsAvailable, 10);
-    assert.equal(first.result.feedsAttempted, MAX_FEEDS_PER_RUN);
-    // Rotation: the next run starts past the attempted feeds and wraps, so
-    // the capped tail feeds AND the head feeds rotate through over
-    // successive runs — no enabled feed is starved by the cap.
-    const second = await runIngestionAttempt(deps, "test", { feedStartIndex: 8 });
-    assert.equal(second.result.feedsAttempted, MAX_FEEDS_PER_RUN);
     const expectedUrls = [
       "https://feeds.example.com/tea.xml",
       ...Array.from({ length: 9 }, (_, i) => `https://feeds.example.com/f${String(i + 1)}.xml`),
     ];
-    const rotated = [
-      expectedUrls[8], expectedUrls[9],
-      ...expectedUrls.slice(0, MAX_FEEDS_PER_RUN - 2),
-    ];
-    assert.deepEqual(
-      transport.seenUrls,
-      [...expectedUrls.slice(0, MAX_FEEDS_PER_RUN), ...rotated],
-    );
-  });
-
-  it("coalesces interval ticks into at most one queued attempt", async (t) => {
-    await provisionArticleConfig(pool);
-    await pool.query(`UPDATE article_behavior SET max_generations_per_run = 1`);
-    const llm = makeArticleLlm({ gated: true });
     const transport = makeFeedTransport({ xml: buildFeedXml() });
-    // Virtual time for the runtime's interval: ticks only fire when this
-    // test advances them. Real timers stay available for the wait helpers.
-    t.mock.timers.enable({ apis: ["setInterval"] });
+    const reservationsAtHostValidation = [];
     const runtime = startArticleRuntime({
       pool,
-      callLlm: llm,
+      callLlm: makeArticleLlm(),
       log: () => {},
-      pollIntervalMs: 60_000,
       transport,
-      resolveFeedHost: FAKE_RESOLVER,
+      resolveFeedHost: async (url) => {
+        const latest = await pool.query(
+          `SELECT detail, finished_at FROM memory_operation
+           WHERE kind = 'article_ingestion'
+           ORDER BY started_at DESC LIMIT 1`,
+        );
+        reservationsAtHostValidation.push(latest.rows[0]);
+        return FAKE_RESOLVER();
+      },
     });
     try {
-      // The startup attempt runs immediately and stalls inside its gated
-      // provider call.
-      await waitForRow(pool, `SELECT 1 FROM article_reaction WHERE state = 'generating'`);
-      // Five interval ticks fire while the attempt runs. They must coalesce
-      // into at most ONE queued follow-up attempt, not one attempt per tick.
-      for (let i = 0; i < 5; i += 1) t.mock.timers.tick(60_000);
-      llm.releaseGate();
-      // The gated attempt completes, then exactly the one coalesced attempt
-      // runs (its fetch is the second and last).
-      for (let i = 0; i < 400 && transport.seenUrls.length < 2; i += 1) {
-        await new Promise((resolve) => setTimeout(resolve, 5));
+      // The startup run chooses one feed. A manual run in the same 12-hour
+      // window is explicitly rate-limited and performs no second fetch.
+      const withinWindow = await runtime.runOnce();
+      assert.equal(withinWindow.status, "rate_limited");
+      assert.equal(transport.seenUrls.length, 1);
+      assert.equal(MAX_FEEDS_PER_RUN, 1);
+      assert.equal(reservationsAtHostValidation.length, 1);
+      assert.match(reservationsAtHostValidation[0].detail, /feed_reserved=true/);
+      assert.equal(reservationsAtHostValidation[0].finished_at, null);
+
+      // Advance only the disposable test database's recorded fetch instant to
+      // model twelve hours passing, then let the same runtime continue its
+      // in-memory shuffled cycle. Every source is seen once before the cycle
+      // can repeat; no ordering assumption is made about Math.random().
+      for (let index = 1; index < expectedUrls.length; index += 1) {
+        await expireArticleIngestionWindow(pool);
+        const next = await runtime.runOnce();
+        assert.equal(next.status, "ok");
+        assert.equal(next.result.feedsAttempted, 1);
       }
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      assert.equal(transport.seenUrls.length, 2);
+      assert.equal(transport.seenUrls.length, expectedUrls.length);
+      assert.equal(new Set(transport.seenUrls).size, expectedUrls.length);
+      assert.deepEqual(new Set(transport.seenUrls), new Set(expectedUrls));
+      assert.equal(reservationsAtHostValidation.length, expectedUrls.length);
+      assert.ok(reservationsAtHostValidation.every(
+        (reservation) => reservation.detail.includes("feed_reserved=true") && reservation.finished_at === null,
+      ));
+
+      const traces = await pool.query(
+        `SELECT detail, started_at, finished_at FROM memory_operation
+         WHERE kind = 'article_ingestion' ORDER BY started_at`,
+      );
+      assert.equal(traces.rows.length, expectedUrls.length);
+      assert.ok(traces.rows.every((trace) => trace.started_at instanceof Date));
+      assert.ok(traces.rows.every((trace) => trace.finished_at instanceof Date));
+      assert.ok(traces.rows.every((trace) => /feedsAttempted=1/.test(trace.detail)));
     } finally {
       await runtime.close();
     }
