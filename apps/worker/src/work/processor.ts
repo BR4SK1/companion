@@ -75,6 +75,7 @@ import {
 } from "../articles/share.ts";
 import type { ArticleMemoryCandidate } from "../articles/types.ts";
 import type { RelationshipExtractionItem } from "../relationship/types.ts";
+import { mainReplyMaxTokensForBaseTierOrdinal } from "../relationship/runtime.ts";
 import { OpenRouterTransportError } from "@companion/openrouter/transport";
 import type {
   ChatReasoningEffort,
@@ -212,8 +213,27 @@ export interface TurnProcessorDeps {
     readonly turnId: string;
     readonly reactionId: string;
   }) => Promise<void>;
-  /** Optional database-configured relationship context; failures degrade to no context. */
-  readonly loadRelationshipContext?: (turnId: string, referenceTime: Date) => Promise<string | null>;
+  /**
+   * Optional database-configured relationship context; failures degrade
+   * to no context. Returns the rendered chunk plus the configured base
+   * familiarity tier ordinal (0-based) so the main reply output budget
+   * can be derived from familiarity specifically. A plain string/null
+   * return is also accepted (legacy injected callers): it carries no
+   * ordinal, so no tier-derived budget applies. When this loader is
+   * absent in production wiring, the composition edge supplies the
+   * disabled-relationship budget (first tier) through the same loader.
+   */
+  readonly loadRelationshipContext?: (
+    turnId: string,
+    referenceTime: Date,
+  ) => Promise<
+    | string
+    | null
+    | {
+        readonly context: string | null;
+        readonly baseTierOrdinal: number;
+      }
+  >;
   /** Optional configured scheduled/applied routine state; failures degrade to no context. */
   readonly loadRoutineContext?: (turnId: string, referenceTime: Date) => Promise<string | null>;
   /** Enabled prompt modules are loaded afresh for each attempt. */
@@ -632,11 +652,20 @@ export async function processTurnWork(
 
   // Relationship context is independently optional and degrading, like the
   // other domain-owned context loaders. It contains only runtime-configured
-  // labels, thresholds, prompts, and answer-bank content.
+  // labels, thresholds, prompts, and answer-bank content. The loaded base
+  // tier ordinal (when the loader supplies one) drives the main reply
+  // output budget below; a legacy string/null return carries no ordinal.
   let relationshipChunk: string | null = null;
+  let relationshipBaseTierOrdinal: number | undefined;
   if (deps.loadRelationshipContext !== undefined) {
     try {
-      relationshipChunk = await deps.loadRelationshipContext(work.turn.id, attemptReferenceTime);
+      const loaded = await deps.loadRelationshipContext(work.turn.id, attemptReferenceTime);
+      if (typeof loaded === "string" || loaded === null) {
+        relationshipChunk = loaded;
+      } else {
+        relationshipChunk = loaded.context;
+        relationshipBaseTierOrdinal = loaded.baseTierOrdinal;
+      }
     } catch {
       console.warn(
         `[RELATIONSHIP] context load failed for turn ${work.turn.id}; continuing without relationship context`,
@@ -746,12 +775,29 @@ export async function processTurnWork(
       ? temporal.promptText
       : `${temporal.promptText}\n\nRecent temporal memory:\n${temporalChunk}`;
 
+  // Main reply output budget: when the relationship loader supplied a
+  // base tier ordinal, the budget is 500 + 100 per successive base tier
+  // (first tier / disabled relationship = 500). The ordinal tracks
+  // familiarity (base tier), never the transient effective tier. An
+  // explicit static `deps.maxTokens` override still applies when no
+  // ordinal was supplied; when neither is present no `max_tokens` is
+  // sent (legacy injected callers). The resolved value flows into the
+  // assembled request below, so the chat trace records the exact
+  // `max_tokens` sent. No post-generation truncation is applied, and
+  // other LLM tasks (decisions, memory, articles) keep their own caps.
+  const resolvedMaxTokens =
+    relationshipBaseTierOrdinal !== undefined
+      ? mainReplyMaxTokensForBaseTierOrdinal(relationshipBaseTierOrdinal)
+      : deps.maxTokens;
+
   // The assembled prompt is the single source of truth for the wire request
   // and its trace metadata: chunk classification and source linkage are
   // index-aligned by construction. When a chat reasoning effort is
   // configured, main chat sends it with reasoning content excluded
   // (`exclude: true`), so the visible reply carries no reasoning text;
-  // without configuration, no reasoning options are sent.
+  // without configuration, no reasoning options are sent. Reasoning
+  // tokens count against `max_tokens` on OpenRouter, so a high reasoning
+  // effort can consume part of the reply budget above.
   const assemblePrompt = (modules: readonly PromptModulePromptOutput[]) =>
     buildChatPrompt({
       model: deps.chatModel,
@@ -775,7 +821,7 @@ export async function processTurnWork(
       ...(routineChunk !== null ? { routine: routineChunk } : {}),
       ...(modules.length > 0 ? { promptModules: modules } : {}),
       ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
-      ...(deps.maxTokens !== undefined ? { maxTokens: deps.maxTokens } : {}),
+      ...(resolvedMaxTokens !== undefined ? { maxTokens: resolvedMaxTokens } : {}),
     });
   let { request: chatRequest, messages: assembledMessages } = assemblePrompt(promptModuleChunks);
   const alignedChatTrace = () => ({

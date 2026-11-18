@@ -6,6 +6,8 @@ import {
   relationshipDayStreaksForDays,
   summarizeRelationship,
   renderRelationshipContext,
+  mainReplyMaxTokensForBaseTierOrdinal,
+  mainReplyMaxTokensForSummary,
 } from "../../apps/worker/src/relationship/runtime.ts";
 import {
   createRelationshipStore,
@@ -451,5 +453,97 @@ describe("relationship conversation integration", () => {
     assert.deepEqual(events, ["chat", "extract"]);
     assert.equal(result.reply, "assistant reply");
     assert.equal(result.relationshipAnswers.length, 1);
+  });
+});
+
+describe("main reply output budget by base familiarity tier", () => {
+  it("is 500 at the first tier and adds 100 per successive tier", () => {
+    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(0), 500);
+    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(1), 600);
+    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(2), 700);
+    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(5), 1000);
+    assert.throws(() => mainReplyMaxTokensForBaseTierOrdinal(-1), RangeError);
+    assert.throws(() => mainReplyMaxTokensForBaseTierOrdinal(0.5), RangeError);
+  });
+
+  it("tracks the base tier ordinal, not the transient effective tier", () => {
+    // Familiarity 3/4 -> base tier-b (ordinal 1) with an active streak
+    // moving the effective tier up to tier-c; the budget must stay at
+    // the base-derived 600, not the effective-tier 700.
+    const summary = summarizeRelationship({
+      configuration,
+      firstConversationAt: new Date("2026-01-07T12:00:00.000Z"),
+      userActivityAt: [
+        new Date("2026-01-08T10:00:00.000Z"),
+        new Date("2026-01-09T10:00:00.000Z"),
+        new Date("2026-01-10T10:00:00.000Z"),
+      ],
+      now: new Date("2026-01-10T12:00:00.000Z"),
+      answers: [
+        { questionId: "q1", questionKey: "question-a", questionText: "Question A?", participant: "user", answer: "A", clarificationNeeded: false },
+        { questionId: "q1", questionKey: "question-a", questionText: "Question A?", participant: "assistant", answer: "B", clarificationNeeded: true },
+        { questionId: "q2", questionKey: "question-b", questionText: "Question B?", participant: "user", answer: "C", clarificationNeeded: false },
+      ],
+    });
+    assert.equal(summary.baseTier.key, "tier-b");
+    assert.equal(summary.baseTierOrdinal, 1);
+    assert.equal(summary.effectiveTier.key, "tier-c");
+    assert.equal(mainReplyMaxTokensForSummary(summary), 600);
+    assert.match(renderRelationshipContext(summary), /at most about 600 output tokens/);
+    assert.match(renderRelationshipContext(summary), /keep this reply concise/);
+  });
+
+  it("sends the tier-derived max_tokens on the actual chat request and traces it", async () => {
+    const requests = [];
+    const work = {
+      turn: { id: "turn-budget", status: "in_flight", attempt: 1 },
+      messages: [message("1", "user", "hello")],
+    };
+    const result = await processTurnWork(work, {
+      decisionModel: "fake-decision",
+      chatModel: "fake-chat",
+      callDecisions: async () => { throw new Error("not expected"); },
+      callChat: async (request) => { requests.push(request); return chatResponse("short reply"); },
+      loadPatterns: async () => [],
+      loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
+      loadContext: async () => [],
+      loadRelationshipContext: async () => ({ context: "RELATIONSHIP", baseTierOrdinal: 2 }),
+      recordChatRequest: async () => {},
+      recordChatOutcome: async () => {},
+    });
+    assert.equal(result.reply, "short reply");
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].max_tokens, 700);
+  });
+
+  it("uses 500 when relationship is disabled (first tier) and keeps an explicit static override when no ordinal is supplied", async () => {
+    const work = {
+      turn: { id: "turn-budget-disabled", status: "in_flight", attempt: 1 },
+      messages: [message("1", "user", "hello")],
+    };
+    const base = {
+      decisionModel: "fake-decision",
+      chatModel: "fake-chat",
+      callDecisions: async () => { throw new Error("not expected"); },
+      loadPatterns: async () => [],
+      loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
+      loadContext: async () => [],
+    };
+    let disabledRequest;
+    await processTurnWork(work, {
+      ...base,
+      callChat: async (request) => { disabledRequest = request; return chatResponse("reply"); },
+      loadRelationshipContext: async () => ({ context: null, baseTierOrdinal: 0 }),
+    });
+    assert.equal(disabledRequest.max_tokens, 500);
+
+    let overrideRequest;
+    await processTurnWork(work, {
+      ...base,
+      maxTokens: 1234,
+      callChat: async (request) => { overrideRequest = request; return chatResponse("reply"); },
+      loadRelationshipContext: async () => "legacy string context",
+    });
+    assert.equal(overrideRequest.max_tokens, 1234);
   });
 });

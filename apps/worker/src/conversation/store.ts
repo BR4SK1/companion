@@ -17,7 +17,13 @@
  * - `claimNextTurn` groups the entire unassigned trailing run of user
  *   messages into one new turn and leases it — one snapshot, not one message
  *   at a time. Messages ingested after the grouping SELECT are not part of
- *   the snapshot; they are grouped into the next turn.
+ *   the snapshot; they are grouped into the next turn. When engagement
+ *   session scoping is wired, the claim stops at the next recorded `gone`
+ *   boundary instead: it claims the first contiguous session in `seq`
+ *   order (a `gone` at the head starts the claim, a subsequent `gone`
+ *   ends it), leaving later sessions unassigned for the next claims —
+ *   see `selectFirstSessionBatch`. Existing/reclaimed turns are never
+ *   reassigned.
  * - While a turn is in flight with a valid lease, no other turn is claimed:
  *   processing is serialized, which keeps persisted reply order identical to
  *   turn order.
@@ -82,6 +88,13 @@ import type {
 } from "./types.ts";
 import type { PromptModuleTraceRecord } from "../prompt-modules/types.ts";
 import { IdentityConfigurationError } from "./types.ts";
+import type { EngagementState } from "../engagement/types.ts";
+import {
+  hasGoneAssessment,
+  latestGoneMessageId,
+  selectFirstSessionBatch,
+  selectSessionHistory,
+} from "../engagement/runtime.ts";
 
 /**
  * Thrown by the composition edge when a fenced trace write reports that the
@@ -245,7 +258,33 @@ export type UserMessageInsertedHook = (
  */
 export type UserMessageCommittedHook = (result: unknown) => void;
 
+/**
+ * Injected batch read of recorded engagement assessment states, used to
+ * scope model history (`getThreadContext` and
+ * `getPreviousPublishedAssistantReply`) to the current conversation
+ * session. The conversation domain does not query engagement tables
+ * directly; the composition edge wires the engagement store's
+ * `getAssessmentStatesForMessages` here only when engagement is
+ * provisioned. When absent (unprovisioned), both reads keep their
+ * existing behavior and no threshold is fabricated.
+ */
+export interface ConversationSessionAssessmentLoader {
+  getAssessmentStatesForMessages(
+    messageIds: readonly string[],
+  ): Promise<ReadonlyMap<string, EngagementState>>;
+}
+
 export interface ConversationStoreOptions {
+  /**
+   * Optional engagement session scoping for model history. When present,
+   * prior-turn context and the previous published reply are scoped to
+   * the current conversation: history starts at the latest recorded
+   * `gone` return message (see `engagement/runtime.ts`
+   * `selectSessionHistory`), and a `gone` anywhere in the current
+   * grouped turn empties prior context and nulls the previous reply.
+   * When absent, reads are unscoped (existing behavior).
+   */
+  readonly sessionAssessmentLoader?: ConversationSessionAssessmentLoader;
   /**
    * Tolerance for a client clock running ahead of the server clock when
    * accepting a client-reported send time, in milliseconds (see
@@ -757,9 +796,20 @@ export function createConversationStore(
         return { kind: "idle" };
       }
 
-      // 4. Group the entire unassigned trailing run of user messages into one
+      // 4. Group the unassigned trailing run of user messages into one
       //    new in-flight turn. Rows locked here are exactly the snapshot; a
       //    message ingested after this SELECT is grouped into the next turn.
+      //    When engagement session scoping is wired, the claim stops at
+      //    the next recorded `gone` boundary: only the first contiguous
+      //    session in seq order is claimed (a `gone` at the head starts
+      //    the claim, a subsequent `gone` ends it), so a backlog
+      //    accumulated across a return (downtime, routine unavailability)
+      //    never groups the old conversation and the return into one
+      //    prompt. Later sessions stay unassigned (turn_id IS NULL) and
+      //    are claimed next, in order; no user record is dropped or
+      //    reassigned, and reclaimed turns above are untouched. Without
+      //    the loader (unprovisioned) the entire run is claimed, as
+      //    before.
       const pending = await client.query<MessageRow>(
         `SELECT ${MESSAGE_COLUMNS} FROM conversation_message
          WHERE turn_id IS NULL AND role = 'user'
@@ -776,6 +826,18 @@ export function createConversationStore(
       if (params.canStartNewTurn !== undefined &&
           !(await params.canStartNewTurn(client))) {
         return { kind: "idle" };
+      }
+      // Session batch: the first contiguous session of the locked
+      // backlog. Recorded assessments are committed at ingest, so the
+      // batch read through the (pool-backed) loader is stable here
+      // under the claim/ingest advisory lock held above.
+      const loader = options?.sessionAssessmentLoader;
+      let batchRows = pending.rows;
+      if (loader !== undefined) {
+        const states = await loader.getAssessmentStatesForMessages(
+          pending.rows.map((row) => row.id),
+        );
+        batchRows = [...selectFirstSessionBatch(pending.rows, states)];
       }
       const turnId = randomUUID();
       const turn = await client.query<TurnRow>(
@@ -799,13 +861,13 @@ export function createConversationStore(
         `UPDATE conversation_message
          SET turn_id = $1
          WHERE turn_id IS NULL AND seq = ANY($2::bigint[])`,
-        [turnId, pending.rows.map((row) => Number(row.seq))],
+        [turnId, batchRows.map((row) => Number(row.seq))],
       );
       return {
         kind: "claimed",
         work: {
           turn: mapTurn(turnRow),
-          messages: pending.rows.map(mapMessage),
+          messages: batchRows.map(mapMessage),
         },
       };
     });
@@ -2145,9 +2207,48 @@ export function createConversationStore(
    * on every attempt of the same turn, including after a lease reclaim,
    * and is unaffected by messages ingested after the claim.
    */
+  async function getCurrentTurnUserMessageIds(
+    turnId: string,
+  ): Promise<readonly string[]> {
+    const result = await pool.query<{ id: string }>(
+      `SELECT id FROM conversation_message
+       WHERE turn_id = $1 AND role = 'user'
+       ORDER BY seq ASC`,
+      [turnId],
+    );
+    return result.rows.map((row) => row.id);
+  }
+
   async function getPreviousPublishedAssistantReply(turnId: string): Promise<string | null> {
-    const result = await pool.query<{ content: string }>(
-      `SELECT reply.content
+    const loader = options?.sessionAssessmentLoader;
+    if (loader === undefined) {
+      const result = await pool.query<{ content: string }>(
+        `SELECT reply.content
+         FROM conversation_turn AS current_turn
+         JOIN conversation_turn AS prior_turn
+           ON prior_turn.thread_order < current_turn.thread_order
+          AND prior_turn.status = 'completed'
+         JOIN conversation_message AS reply
+           ON reply.turn_id = prior_turn.id AND reply.role = 'assistant'
+         WHERE current_turn.id = $1
+         ORDER BY prior_turn.thread_order DESC, reply.seq DESC
+         LIMIT 1`,
+        [turnId],
+      );
+      return result.rows[0]?.content ?? null;
+    }
+    // Session-scoped: the previous reply is only in the current session
+    // when no recorded `gone` starts a new conversation at or before
+    // this turn. A `gone` in the current grouped turn, or in any turn
+    // after the reply's turn and before the current turn (including a
+    // failed turn whose reply never published), means the reply
+    // predates the new conversation and must not be exposed.
+    const currentIds = await getCurrentTurnUserMessageIds(turnId);
+    const result = await pool.query<{
+      content: string;
+      prior_thread_order: string;
+    }>(
+      `SELECT reply.content, prior_turn.thread_order AS prior_thread_order
        FROM conversation_turn AS current_turn
        JOIN conversation_turn AS prior_turn
          ON prior_turn.thread_order < current_turn.thread_order
@@ -2159,7 +2260,26 @@ export function createConversationStore(
        LIMIT 1`,
       [turnId],
     );
-    return result.rows[0]?.content ?? null;
+    const row = result.rows[0];
+    if (row === undefined) return null;
+    const afterIdsResult = await pool.query<{ id: string }>(
+      `SELECT m.id
+       FROM conversation_message AS m
+       JOIN conversation_turn AS t ON t.id = m.turn_id
+       WHERE m.role = 'user'
+         AND t.thread_order > $2
+         AND t.thread_order < (SELECT thread_order FROM conversation_turn WHERE id = $1)
+       ORDER BY t.thread_order ASC, m.seq ASC`,
+      [turnId, row.prior_thread_order],
+    );
+    const afterIds = afterIdsResult.rows.map((after) => after.id);
+    const states = await loader.getAssessmentStatesForMessages([
+      ...currentIds,
+      ...afterIds,
+    ]);
+    if (hasGoneAssessment(currentIds, states)) return null;
+    if (latestGoneMessageId(afterIds, states) !== null) return null;
+    return row.content;
   }
 
   async function getThreadContext(params: ThreadContextParams): Promise<
@@ -2199,7 +2319,21 @@ export function createConversationStore(
        LIMIT $2`,
       [params.turnId, params.limit],
     );
-    return result.rows.map(mapMessage).reverse();
+    const messages = result.rows.map(mapMessage).reverse();
+    const loader = options?.sessionAssessmentLoader;
+    if (loader === undefined) return messages;
+    // Session scoping: slice the bounded prior-turn window to the
+    // current conversation (see engagement/runtime.ts). The boundary
+    // uses recorded assessments only, so retries/reclaims read the same
+    // slice, and messages without assessments never slice. The current
+    // turn's own messages are checked for a `gone` return that empties
+    // prior history entirely.
+    const currentIds = await getCurrentTurnUserMessageIds(params.turnId);
+    const states = await loader.getAssessmentStatesForMessages([
+      ...messages.map((message) => message.id),
+      ...currentIds,
+    ]);
+    return selectSessionHistory(messages, states, currentIds);
   }
 
   /**
