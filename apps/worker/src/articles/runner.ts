@@ -31,7 +31,7 @@ import { withTransaction, type PostgresPool } from "@companion/postgres";
 
 import { recordMemoryOperation } from "../memory/runtime.ts";
 
-import { loadArticleConfiguration } from "./config.ts";
+import { loadArticleConfiguration, resolveArticleModel } from "./config.ts";
 import {
   ArticleConfigError,
   ArticleConfigurationInvalidError,
@@ -41,7 +41,7 @@ import {
 } from "./errors.ts";
 import {
   articleSourceKey,
-  articleTaskPresets,
+  articleTaskPresetsWithReasoningEffort,
   ARTICLE_REACTION_GENERATION_PROMPT_VERSION,
   ARTICLE_REACTION_REVIEW_PROMPT_VERSION,
   parseReactionReview,
@@ -65,6 +65,7 @@ import type {
   ArticleIngestionSummary,
   ArticleRuntimeLlmCaller,
 } from "./types.ts";
+import type { ReasoningEffort } from "../memory/llm.ts";
 
 /** Re-exported for callers that associate the caller shape with the runtime. */
 export type { ArticleRuntimeLlmCaller };
@@ -136,6 +137,18 @@ export interface ArticleRuntimeDeps {
    * shared OpenRouter transport; tests inject fakes.
    */
   readonly callLlm: ArticleRuntimeLlmCaller;
+  /**
+   * Optional model override (`WORKER_ARTICLE_MODEL`): takes precedence
+   * over the database-owned `article_behavior.model` without mutating
+   * the database. Unset uses the database model.
+   */
+  readonly modelOverride?: string;
+  /**
+   * Optional reasoning-effort override
+   * (`WORKER_ARTICLE_REASONING_EFFORT`) applied to every article task
+   * preset. Unset keeps the preset defaults.
+   */
+  readonly reasoningEffortOverride?: ReasoningEffort;
   readonly log?: (message: string) => void;
   readonly leaseMs?: number;
   /**
@@ -500,11 +513,21 @@ export async function runIngestionAttempt(
     return { status: "invalid", result };
   }
 
+  // The effective model is the environment override when set, otherwise
+  // the database-owned model; the override never mutates the database.
+  const effectiveModel = resolveArticleModel(
+    config.behavior.model,
+    deps.modelOverride,
+  );
+  const presets = articleTaskPresetsWithReasoningEffort(
+    deps.reasoningEffortOverride,
+  );
+
   let ingestionTraceId: string;
   try {
     const slot = await reserveArticleIngestionSlot(pool, {
       reason,
-      model: config.behavior.model,
+      model: effectiveModel,
       promptVersion: ARTICLE_REACTION_GENERATION_PROMPT_VERSION,
     });
     if (slot.status === "rate_limited") {
@@ -588,7 +611,7 @@ export async function runIngestionAttempt(
       result.candidatesAttempted += 1;
       try {
         const generatedAt = new Date();
-        const generation = await deps.callLlm(config.behavior.model, {
+        const generation = await deps.callLlm(effectiveModel, {
           systemPrompt: config.prompts.reaction_generation.systemPrompt,
           userMessage: renderArticleReactionInput({
             sourceName: candidate.feedId,
@@ -597,7 +620,7 @@ export async function runIngestionAttempt(
             url: candidate.url,
             publishedAt: candidate.publishedAt?.toISOString() ?? null,
           }),
-          taskPreset: articleTaskPresets.generation,
+          taskPreset: presets.generation,
         });
         result.llmCalls += 1;
         const reaction = parseReactionText(generation.text, config.behavior.maxReactionChars);
@@ -608,7 +631,7 @@ export async function runIngestionAttempt(
             state: "failed",
             reaction: null,
             lastError: "empty generation output",
-            model: config.behavior.model,
+            model: effectiveModel,
             generatedAt,
             reviewedAt: null,
           })) {
@@ -620,7 +643,7 @@ export async function runIngestionAttempt(
         }
 
         const reviewedAt = new Date();
-        const review = await deps.callLlm(config.behavior.model, {
+        const review = await deps.callLlm(effectiveModel, {
           systemPrompt: config.prompts.reaction_review.systemPrompt,
           userMessage: renderArticleReviewInput(
             {
@@ -632,7 +655,7 @@ export async function runIngestionAttempt(
             },
             reaction,
           ),
-          taskPreset: articleTaskPresets.review,
+          taskPreset: presets.review,
           responseFormat: REVIEW_RESPONSE_FORMAT,
         });
         result.llmCalls += 1;
@@ -644,7 +667,7 @@ export async function runIngestionAttempt(
             state: "failed",
             reaction: null,
             lastError: "unusable review output",
-            model: config.behavior.model,
+            model: effectiveModel,
             generatedAt,
             reviewedAt,
           })) {
@@ -662,7 +685,7 @@ export async function runIngestionAttempt(
             state: "rejected",
             reaction: null,
             lastError: verdict.reason,
-            model: config.behavior.model,
+            model: effectiveModel,
             generatedAt,
             reviewedAt,
           })) {
@@ -682,7 +705,7 @@ export async function runIngestionAttempt(
           state: "accepted",
           reaction,
           lastError: null,
-          model: config.behavior.model,
+          model: effectiveModel,
           generatedAt,
           reviewedAt,
           fact: {
@@ -707,7 +730,7 @@ export async function runIngestionAttempt(
           state: "failed",
           reaction: null,
           lastError: category,
-          model: config.behavior.model,
+          model: effectiveModel,
           generatedAt: new Date(),
           reviewedAt: null,
         }).catch(() => false)) {
@@ -727,6 +750,12 @@ export async function runIngestionAttempt(
       pool,
       timezone: deps.timezone,
       callLlm: deps.callLlm,
+      ...(deps.modelOverride !== undefined
+        ? { modelOverride: deps.modelOverride }
+        : {}),
+      ...(deps.reasoningEffortOverride !== undefined
+        ? { reasoningEffortOverride: deps.reasoningEffortOverride }
+        : {}),
       log,
     });
     if (outcome.status === "skipped") {

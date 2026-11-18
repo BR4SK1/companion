@@ -23,6 +23,7 @@ describe("memory configuration", () => {
     assert.equal(config.temporalContextEnabled, true);
     assert.equal(config.temporalSummariesEnabled, true);
     assert.equal(config.model, "z-ai/glm-5.3-flash");
+    assert.equal(config.reasoningEffort, undefined);
     assert.equal(config.recallLimit, 8);
     assert.equal(config.recallMaxChars, 12_000);
     assert.equal(config.embeddingBaseUrl, "http://127.0.0.1:5113");
@@ -62,6 +63,19 @@ describe("memory configuration", () => {
     assert.equal(
       loadMemoryConfig({ WORKER_MEMORY_PROFILE_SUMMARIES_ENABLED: "1" }).profileSummariesEnabled,
       false,
+    );
+  });
+
+  it("parses the model and reasoning-effort overrides, rejecting bad efforts", () => {
+    const config = loadMemoryConfig({
+      WORKER_MEMORY_MODEL: "meta/muse-ember",
+      WORKER_MEMORY_REASONING_EFFORT: "high",
+    });
+    assert.equal(config.model, "meta/muse-ember");
+    assert.equal(config.reasoningEffort, "high");
+    assert.throws(
+      () => loadMemoryConfig({ WORKER_MEMORY_REASONING_EFFORT: "ultra" }),
+      MemoryConfigError,
     );
   });
 

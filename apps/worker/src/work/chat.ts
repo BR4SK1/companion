@@ -46,6 +46,7 @@
 
 import {
   parseChatRequest,
+  type ChatReasoning,
   type ChatRequest,
 } from "@companion/openrouter/chat";
 import type {
@@ -102,6 +103,12 @@ export interface BuildChatRequestParams {
   readonly promptModules?: readonly PromptModulePromptOutput[];
   readonly temperature?: number;
   readonly maxTokens?: number;
+  /**
+   * Optional OpenRouter reasoning options, passed through to the chat
+   * contract unchanged. The assembly adds no default: callers that omit
+   * it send no reasoning options.
+   */
+  readonly reasoning?: ChatReasoning;
 }
 
 /** An optional section contributes a chunk only when it is non-empty. */
@@ -188,6 +195,18 @@ export function buildChatPrompt(
       ? { temperature: params.temperature }
       : {}),
     ...(params.maxTokens !== undefined ? { max_tokens: params.maxTokens } : {}),
+    ...(params.reasoning !== undefined
+      ? {
+          reasoning: {
+            ...(params.reasoning.effort !== undefined
+              ? { effort: params.reasoning.effort }
+              : {}),
+            ...(params.reasoning.exclude !== undefined
+              ? { exclude: params.reasoning.exclude }
+              : {}),
+          },
+        }
+      : {}),
   });
   return { request, messages };
 }

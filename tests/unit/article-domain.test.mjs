@@ -30,6 +30,7 @@ import {
   MAX_REACTION_CHARS,
   articleSourceKey,
   articleTaskPresets,
+  articleTaskPresetsWithReasoningEffort,
   parseArticleInterestConsolidation,
   parseReactionReview,
   parseReactionText,
@@ -38,6 +39,10 @@ import {
   renderArticleReviewInput,
 } from "../../apps/worker/src/articles/prompts.ts";
 import { buildMemoryLlmRequestBody } from "../../apps/worker/src/memory/llm.ts";
+import {
+  loadArticleLlmOverrides,
+  resolveArticleModel,
+} from "../../apps/worker/src/articles/config.ts";
 import {
   ArticleConfigError,
   ArticleConfigurationInvalidError,
@@ -911,6 +916,47 @@ describe("reaction prompt envelopes", () => {
     assert.equal(articleTaskPresets.generation.maxTokens > 0, true);
     assert.equal(articleTaskPresets.review.maxTokens > 0, true);
     assert.equal(articleTaskPresets.generation.maxTokens <= MAX_ARTICLE_INPUT_CHARS * 2, true);
+    assert.equal(articleTaskPresets.generation.reasoningEffort, "low");
+    assert.equal(articleTaskPresets.review.reasoningEffort, "low");
+    assert.equal(articleTaskPresets.consolidation.reasoningEffort, "low");
+  });
+
+  it("applies a reasoning-effort override to every article preset", () => {
+    const presets = articleTaskPresetsWithReasoningEffort("high");
+    assert.equal(presets.generation.reasoningEffort, "high");
+    assert.equal(presets.review.reasoningEffort, "high");
+    assert.equal(presets.consolidation.reasoningEffort, "high");
+    // Unset preserves the low defaults.
+    assert.equal(
+      articleTaskPresetsWithReasoningEffort().generation.reasoningEffort,
+      "low",
+    );
+  });
+
+  it("prefers the env model override over the database model", () => {
+    // Distinct values: the runner (generation/review) and the
+    // consolidation path both resolve through this helper, so both take
+    // the override; the database model is only the fallback.
+    assert.equal(
+      resolveArticleModel("db/model", "env/model"),
+      "env/model",
+    );
+    assert.equal(resolveArticleModel("db/model", undefined), "db/model");
+    assert.equal(resolveArticleModel("db/model"), "db/model");
+  });
+
+  it("parses article LLM env overrides, rejecting bad efforts", () => {
+    assert.deepEqual(loadArticleLlmOverrides({}), {});
+    assert.deepEqual(
+      loadArticleLlmOverrides({
+        WORKER_ARTICLE_MODEL: "meta/muse-ember",
+        WORKER_ARTICLE_REASONING_EFFORT: "high",
+      }),
+      { model: "meta/muse-ember", reasoningEffort: "high" },
+    );
+    assert.throws(() =>
+      loadArticleLlmOverrides({ WORKER_ARTICLE_REASONING_EFFORT: "ultra" }),
+    );
   });
 });
 

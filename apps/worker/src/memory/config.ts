@@ -10,6 +10,7 @@
  */
 
 import { MIN_LEASE_SECONDS } from "../work/timing.ts";
+import { isReasoningEffort, type ReasoningEffort } from "./llm.ts";
 
 export class MemoryConfigError extends Error {
   constructor(message: string) {
@@ -50,6 +51,20 @@ function optionalString(env: Record<string, string | undefined>, name: string, f
   return value === undefined || value.length === 0 ? fallback : value;
 }
 
+function optionalReasoningEffort(
+  env: Record<string, string | undefined>,
+  name: string,
+): ReasoningEffort | undefined {
+  const value = env[name];
+  if (value === undefined || value.length === 0) return undefined;
+  if (!isReasoningEffort(value)) {
+    throw new MemoryConfigError(
+      `${name} must be one of none, minimal, low, medium, high, xhigh, max: ${value}`,
+    );
+  }
+  return value;
+}
+
 /** Feature flags preserve the source polarity: ingest/profiles/autopromote
  *  default off (`= 'true'`), recall/temporal context default on (`!== 'false'`).
  *  The v1 profile-sheet generator gets its own flag and also defaults off:
@@ -69,6 +84,13 @@ export interface MemoryConfig {
   readonly temporalSummariesEnabled: boolean;
   /** Model id for every memory LLM task. */
   readonly model: string;
+  /**
+   * Optional reasoning-effort override for every memory LLM task
+   * (including relationship extraction, which shares this model and the
+   * fact-extraction preset). Unset preserves the per-task defaults
+   * (`high`, `max` for consolidation).
+   */
+  readonly reasoningEffort?: ReasoningEffort;
   readonly openrouterBaseUrl: string;
   /** Internal service address only; this cannot enable, disable, or redirect shadow outputs. */
   readonly embeddingBaseUrl: string;
@@ -161,6 +183,10 @@ export function loadMemoryConfig(
     DEFAULTS.profilesGenerateHour,
     { integer: true, minimum: 0, maximum: 23 },
   );
+  const reasoningEffort = optionalReasoningEffort(
+    env,
+    "WORKER_MEMORY_REASONING_EFFORT",
+  );
   return {
     enabled: env["WORKER_MEMORY_ENABLED"] !== "false",
     ingestEnabled: env["WORKER_MEMORY_INGEST_ENABLED"] === "true",
@@ -171,6 +197,7 @@ export function loadMemoryConfig(
     temporalContextEnabled: env["WORKER_MEMORY_TEMPORAL_CONTEXT_ENABLED"] !== "false",
     temporalSummariesEnabled: env["WORKER_MEMORY_TEMPORAL_SUMMARIES_ENABLED"] !== "false",
     model: optionalString(env, "WORKER_MEMORY_MODEL", DEFAULTS.model),
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
     openrouterBaseUrl: optionalString(
       env,
       "WORKER_MEMORY_OPENROUTER_BASE_URL",

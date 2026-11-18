@@ -8,7 +8,7 @@
  * and the bounded task presets. Nothing here invents policy content.
  */
 
-import type { TaskPreset } from "../memory/llm.ts";
+import type { ReasoningEffort, TaskPreset } from "../memory/llm.ts";
 import type { FeedArticle } from "./types.ts";
 
 export const ARTICLE_REACTION_GENERATION_PROMPT_VERSION = "article-reaction-generation-v1";
@@ -43,6 +43,26 @@ export const articleTaskPresets: Readonly<{
     reasoningEffort: "low",
   },
 };
+
+/**
+ * The article task presets with an optional configured reasoning-effort
+ * override (`WORKER_ARTICLE_REASONING_EFFORT`) applied to every task.
+ * Without an override the presets keep their defaults (`low`).
+ */
+export function articleTaskPresetsWithReasoningEffort(
+  reasoningEffort?: ReasoningEffort,
+): Readonly<{
+  generation: TaskPreset;
+  review: TaskPreset;
+  consolidation: TaskPreset;
+}> {
+  if (reasoningEffort === undefined) return articleTaskPresets;
+  return {
+    generation: { ...articleTaskPresets.generation, reasoningEffort },
+    review: { ...articleTaskPresets.review, reasoningEffort },
+    consolidation: { ...articleTaskPresets.consolidation, reasoningEffort },
+  };
+}
 
 export interface ArticlePromptInput {
   readonly sourceName: string;

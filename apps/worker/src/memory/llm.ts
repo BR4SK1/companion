@@ -14,12 +14,20 @@
  *    `response_format`;
  * 2. a 400 response that names both reasoning and max_tokens falls back to
  *    `reasoning: { effort: "low" }` (`reasoningClampFallback`), because some
- *    models clamp requested reasoning budgets.
+ *    models clamp requested reasoning budgets. This fallback never applies
+ *    to a request that already asks for `high` effort: silently downgrading
+ *    a targeted high preset to low would defeat the preset, so a high
+ *    request that the provider rejects on reasoning/max_tokens fails
+ *    visibly instead of retrying at low.
  *
- * Task presets carry the reasoning-effort and thinking knobs:
- * GLM 5.3 Flash reasoning tokens count against max_tokens on OpenRouter, so
- * every cap covers reasoning plus visible output or the model returns empty
- * content (finishReason "length").
+ * Task presets carry the reasoning-effort and thinking knobs: reasoning
+ * tokens count against max_tokens on OpenRouter, so every cap covers
+ * reasoning plus visible output or the model returns empty content
+ * (finishReason "length"). When a reasoning-effort override is configured
+ * (see `MemoryConfig.reasoningEffort`, from
+ * `WORKER_MEMORY_REASONING_EFFORT`), every preset uses it; without an
+ * override each task keeps its own default (`high`, `max` for
+ * consolidation).
  */
 
 import { postJson, OpenRouterTransportError } from "@companion/openrouter/transport";
@@ -32,6 +40,24 @@ export type ReasoningEffort =
   | "high"
   | "xhigh"
   | "max";
+
+/** Every reasoning effort accepted by the configured env knobs. */
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+export function isReasoningEffort(value: unknown): value is ReasoningEffort {
+  return (
+    typeof value === "string" &&
+    (REASONING_EFFORTS as readonly string[]).includes(value)
+  );
+}
 
 export interface TaskPreset {
   readonly maxTokens: number;
@@ -258,6 +284,11 @@ export function createMemoryLlmCaller(
       !result.ok &&
       result.status === 400 &&
       activeBody.reasoning !== undefined &&
+      // High-effort requests never silently downgrade to low (see the
+      // module comment): only non-high presets get the clamp fallback.
+      // The preset — not the possibly max_tokens-overwritten body — is
+      // the targeted effort.
+      input.taskPreset.reasoningEffort !== "high" &&
       result.body !== null &&
       isReasoningClampError(result.body)
     ) {
@@ -318,54 +349,59 @@ export interface MemoryTaskPresets {
  * Task presets with the pipeline's fixed operating points. The two
  * output-token caps are configuration (see `MemoryConfig`); the rest are
  * fixed values (see the module comment: reasoning tokens count against
- * max_tokens on GLM 5.3 Flash, so every cap covers reasoning plus visible
- * output).
+ * max_tokens, so every cap covers reasoning plus visible output). A
+ * configured reasoning-effort override replaces every task's effort;
+ * without one, each task keeps its default (`high`, `max` for
+ * consolidation).
  */
 export function taskPresets(config: {
   readonly observationMaxOutputTokens: number;
   readonly profileMaxOutputTokens: number;
+  readonly reasoningEffort?: ReasoningEffort;
 }): MemoryTaskPresets {
+  const effort = (fallback: ReasoningEffort): ReasoningEffort =>
+    config.reasoningEffort ?? fallback;
   return {
     temporalSummaryLeaf: {
       maxTokens: 4000,
       honorMaxTokens: true,
       temperature: 0.3,
-      reasoningEffort: "high",
+      reasoningEffort: effort("high"),
       thinking: { enabled: false, budgetTokens: 0 },
     },
     temporalSummaryAggregate: {
       maxTokens: 12000,
       honorMaxTokens: true,
       temperature: 0.5,
-      reasoningEffort: "high",
+      reasoningEffort: effort("high"),
       thinking: { enabled: true, budgetTokens: 0 },
     },
     profileSummary: {
       maxTokens: 4000,
       honorMaxTokens: true,
       temperature: 0.3,
-      reasoningEffort: "high",
+      reasoningEffort: effort("high"),
       thinking: { enabled: false, budgetTokens: 0 },
     },
     memoryFactExtraction: {
       maxTokens: 8000,
       honorMaxTokens: true,
       temperature: 0.1,
-      reasoningEffort: "high",
+      reasoningEffort: effort("high"),
       thinking: { enabled: false, budgetTokens: 0 },
     },
     memoryObservationConsolidation: {
       maxTokens: config.observationMaxOutputTokens,
       honorMaxTokens: true,
       temperature: 0.1,
-      reasoningEffort: "max",
+      reasoningEffort: effort("max"),
       thinking: { enabled: false, budgetTokens: 0 },
     },
     memoryProfileV2: {
       maxTokens: config.profileMaxOutputTokens,
       honorMaxTokens: true,
       temperature: 0.4,
-      reasoningEffort: "high",
+      reasoningEffort: effort("high"),
       thinking: { enabled: false, budgetTokens: 0 },
     },
   };

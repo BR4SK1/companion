@@ -9,12 +9,18 @@
  */
 
 import { MIN_LEASE_SECONDS } from "./work/timing.ts";
+import { isReasoningEffort, type ReasoningEffort } from "./memory/llm.ts";
 
 export interface OpenRouterWorkerConfig {
   readonly apiKey: string;
   readonly chatUrl: string;
   readonly decisionsUrl: string;
   readonly chatModel: string;
+  /**
+   * Optional reasoning-effort override for main chat. Unset preserves the
+   * legacy behavior: no reasoning options are sent.
+   */
+  readonly chatReasoningEffort?: ReasoningEffort;
   readonly decisionModel: string;
   readonly chatTimeoutMs: number;
   readonly decisionTimeoutMs: number;
@@ -137,6 +143,20 @@ function optionalNumber(
   return value;
 }
 
+function optionalReasoningEffort(
+  env: Record<string, string | undefined>,
+  name: string,
+): ReasoningEffort | undefined {
+  const value = env[name];
+  if (value === undefined || value.length === 0) return undefined;
+  if (!isReasoningEffort(value)) {
+    throw new WorkerConfigError(
+      `${name} must be one of none, minimal, low, medium, high, xhigh, max: ${value}`,
+    );
+  }
+  return value;
+}
+
 function promptModuleCredentials(
   env: Record<string, string | undefined>,
 ): Readonly<Record<string, string>> {
@@ -208,6 +228,10 @@ export function loadWorkerConfig(
   const databaseUrl = requireString(env, "WORKER_DATABASE_URL");
   const apiKey = requireString(env, "OPENROUTER_API_KEY");
   const chatModel = requireString(env, "WORKER_CHAT_MODEL");
+  const chatReasoningEffort = optionalReasoningEffort(
+    env,
+    "WORKER_CHAT_REASONING_EFFORT",
+  );
   const decisionModel = requireString(env, "WORKER_DECISION_MODEL");
   // The private HTTP API has no unauthenticated mode: without a configured
   // service credential the worker must fail at startup, not serve openly.
@@ -224,6 +248,7 @@ export function loadWorkerConfig(
         DEFAULT_DECISIONS_URL,
       ),
       chatModel,
+      ...(chatReasoningEffort !== undefined ? { chatReasoningEffort } : {}),
       decisionModel,
       chatTimeoutMs: optionalNumber(
         env,

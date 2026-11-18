@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 
 import {
   buildMemoryLlmRequestBody,
+  createMemoryLlmCaller,
   modelSupportsThinking,
   taskPresets,
   __internal,
@@ -36,6 +37,23 @@ describe("memory task presets", () => {
     for (const preset of Object.values(presets)) {
       assert.equal(preset.honorMaxTokens, true);
     }
+  });
+
+  it("applies a configured reasoning-effort override to every task", () => {
+    const presets = taskPresets({
+      observationMaxOutputTokens: 12000,
+      profileMaxOutputTokens: 8000,
+      reasoningEffort: "high",
+    });
+    for (const preset of Object.values(presets)) {
+      assert.equal(preset.reasoningEffort, "high");
+    }
+    // Without an override, consolidation keeps its max default.
+    const defaults = taskPresets({
+      observationMaxOutputTokens: 12000,
+      profileMaxOutputTokens: 8000,
+    });
+    assert.equal(defaults.memoryObservationConsolidation.reasoningEffort, "max");
   });
 
   it("takes the consolidation and profile output caps from configuration", () => {
@@ -161,5 +179,95 @@ describe("memory llm fallback classifiers", () => {
     assert.equal(isReasoningClampError("reasoning too large for max_tokens"), true);
     assert.equal(isReasoningClampError("reasoning unsupported"), false);
     assert.equal(isReasoningClampError("max_tokens too small"), false);
+  });
+});
+
+describe("memory llm reasoning-clamp fallback gating", () => {
+  function fakeFetchWithClampError(seenBodies) {
+    return async (_url, init) => {
+      seenBodies.push(JSON.parse(init.body));
+      if (seenBodies.length === 1) {
+        return {
+          ok: false,
+          status: 400,
+          text: async () => "reasoning exceeds the max_tokens budget",
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({
+            model: "meta/muse-ember",
+            choices: [
+              { message: { content: "ok" }, finish_reason: "stop" },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1 },
+          }),
+      };
+    };
+  }
+
+  it("does not silently downgrade a high preset to low", async () => {
+    const seenBodies = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fakeFetchWithClampError(seenBodies);
+    try {
+      const callLlm = createMemoryLlmCaller({
+        url: "https://openrouter.ai/api/v1/chat/completions",
+        apiKey: "test-key",
+        model: "meta/muse-ember",
+        timeoutMs: 1000,
+      });
+      await assert.rejects(
+        callLlm({
+          systemPrompt: "sys",
+          userMessage: "user",
+          taskPreset: {
+            maxTokens: 1000,
+            honorMaxTokens: true,
+            temperature: 0.1,
+            reasoningEffort: "high",
+            thinking: { enabled: false, budgetTokens: 0 },
+          },
+        }),
+      );
+      // Exactly one attempt: no low-effort retry was sent.
+      assert.equal(seenBodies.length, 1);
+      assert.deepEqual(seenBodies[0].reasoning, { effort: "high" });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("still retries a non-high preset at low", async () => {
+    const seenBodies = [];
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = fakeFetchWithClampError(seenBodies);
+    try {
+      const callLlm = createMemoryLlmCaller({
+        url: "https://openrouter.ai/api/v1/chat/completions",
+        apiKey: "test-key",
+        model: "meta/muse-ember",
+        timeoutMs: 1000,
+      });
+      const result = await callLlm({
+        systemPrompt: "sys",
+        userMessage: "user",
+        taskPreset: {
+          maxTokens: 1000,
+          honorMaxTokens: true,
+          temperature: 0.1,
+          reasoningEffort: "medium",
+          thinking: { enabled: false, budgetTokens: 0 },
+        },
+      });
+      assert.equal(result.text, "ok");
+      assert.equal(result.reasoningClampFallback, true);
+      assert.equal(seenBodies.length, 2);
+      assert.deepEqual(seenBodies[1].reasoning, { effort: "low" });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

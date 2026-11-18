@@ -64,6 +64,56 @@ describe("chat request contract", () => {
     });
     assert.equal(parsed.temperature, 0.7);
     assert.equal(parsed.max_tokens, 512);
+    assert.equal(parsed.reasoning, undefined);
+  });
+
+  it("preserves optional reasoning exactly as supplied, with no default", () => {
+    const parsed = parseChatRequest({
+      ...baseRequest,
+      reasoning: { effort: "high", exclude: true },
+    });
+    assert.deepEqual(parsed.reasoning, { effort: "high", exclude: true });
+    const effortOnly = parseChatRequest({
+      ...baseRequest,
+      reasoning: { effort: "low" },
+    });
+    assert.deepEqual(effortOnly.reasoning, { effort: "low" });
+    const excludeOnly = parseChatRequest({
+      ...baseRequest,
+      reasoning: { exclude: false },
+    });
+    assert.deepEqual(excludeOnly.reasoning, { exclude: false });
+  });
+
+  it("rejects malformed reasoning without coercion", () => {
+    assertContractError(
+      () => parseChatRequest({ ...baseRequest, reasoning: {} }),
+      "reasoning",
+      "at least one",
+    );
+    assertContractError(
+      () =>
+        parseChatRequest({
+          ...baseRequest,
+          reasoning: { effort: "ultra" },
+        }),
+      "reasoning.effort",
+      "unexpected effort",
+    );
+    assertContractError(
+      () =>
+        parseChatRequest({
+          ...baseRequest,
+          reasoning: { effort: "high", exclude: "true" },
+        }),
+      "reasoning.exclude",
+      "expected a boolean",
+    );
+    assertContractError(
+      () => parseChatRequest({ ...baseRequest, reasoning: "high" }),
+      "reasoning",
+      "expected an object",
+    );
   });
 
   it("rejects missing model, empty messages, and unknown roles", () => {

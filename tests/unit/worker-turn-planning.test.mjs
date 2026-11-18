@@ -385,6 +385,30 @@ describe("worker configuration", () => {
     // requires its service credential.
     assert.equal(config.http.host, "0.0.0.0");
     assert.equal(config.http.port, 8080);
+    // No chat reasoning effort is configured by default (legacy).
+    assert.equal(config.openrouter.chatReasoningEffort, undefined);
+  });
+
+  it("parses the chat reasoning effort and rejects unsupported values", () => {
+    assert.equal(
+      loadWorkerConfig({
+        ...validEnv,
+        WORKER_CHAT_REASONING_EFFORT: "high",
+      }).openrouter.chatReasoningEffort,
+      "high",
+    );
+    assert.throws(
+      () =>
+        loadWorkerConfig({
+          ...validEnv,
+          WORKER_CHAT_REASONING_EFFORT: "ultra",
+        }),
+      (error) => {
+        assert.ok(error instanceof WorkerConfigError);
+        assert.ok(error.message.includes("WORKER_CHAT_REASONING_EFFORT"));
+        return true;
+      },
+    );
   });
 
   it("reports the offending variable for missing required values", () => {
