@@ -1,0 +1,21 @@
+{
+  "name": "@companion/config-manager",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone local Companion configuration manager: loopback-only review and edit of DB-backed configuration for one server-side fixed environment (non-production or production). Local operator tool only; never deployed, no deployment trigger.",
+  "scripts": {
+    "start": "node --experimental-strip-types src/main.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@companion/postgres": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "pnpm@10.18.1"
+}
