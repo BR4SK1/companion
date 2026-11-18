@@ -21,6 +21,16 @@ importers:
         specifier: ^7.0.2
         version: 7.0.2
 
+  apps/config-manager:
+    dependencies:
+      '@companion/postgres':
+        specifier: workspace:*
+        version: link:../../libraries/postgres
+    devDependencies:
+      '@types/node':
+        specifier: ^22
+        version: 22.20.5
+
   apps/web:
     dependencies:
       '@emotion/cache':

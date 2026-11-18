@@ -10,7 +10,7 @@
   "scripts": {
     "prepare": "husky",
     "test:unit": "node --experimental-strip-types --test \"tests/unit/**/*.test.mjs\"",
-    "typecheck": "tsc -p libraries/openrouter && tsc -p libraries/postgres && tsc -p apps/worker"
+    "typecheck": "tsc -p libraries/openrouter && tsc -p libraries/postgres && tsc -p apps/worker && tsc -p apps/config-manager"
   },
   "devDependencies": {
     "@commitlint/cli": "21.2.4",
