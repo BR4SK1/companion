@@ -204,6 +204,20 @@ describe("prompt assembly: selected and unselected pattern guidance", () => {
     const assembled = buildChatPrompt(params);
     const request = buildChatRequest(params);
     assert.deepEqual(request, assembled.request);
+    // The generic assembly adds no reasoning default.
+    assert.equal(request.reasoning, undefined);
+  });
+
+  it("passes explicit reasoning through unchanged", () => {
+    const { request } = buildChatPrompt({
+      model: "chat-model",
+      identity: "IDENTITY",
+      history: [],
+      turnMessages: [message(1, "user", "hi")],
+      guidance: null,
+      reasoning: { effort: "high", exclude: true },
+    });
+    assert.deepEqual(request.reasoning, { effort: "high", exclude: true });
   });
 });
 
@@ -298,6 +312,31 @@ describe("processor: fail-closed identity configuration", () => {
     await processTurnWork(work, processorDeps);
     assert.equal(sent.messages[0].role, "system");
     assert.equal(sent.messages[0].content, "IDENTITY");
+  });
+
+  it("sends no reasoning when no chat effort is configured (legacy)", async () => {
+    let sent;
+    const { deps: processorDeps } = deps({
+      callChat: async (request) => {
+        sent = request;
+        return chatResponse("reply");
+      },
+    });
+    await processTurnWork(work, processorDeps);
+    assert.equal(sent.reasoning, undefined);
+  });
+
+  it("sends the configured chat reasoning effort with reasoning excluded", async () => {
+    let sent;
+    const { deps: processorDeps } = deps({
+      chatReasoningEffort: "high",
+      callChat: async (request) => {
+        sent = request;
+        return chatResponse("reply");
+      },
+    });
+    await processTurnWork(work, processorDeps);
+    assert.deepEqual(sent.reasoning, { effort: "high", exclude: true });
   });
 });
 

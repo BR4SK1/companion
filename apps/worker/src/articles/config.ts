@@ -20,6 +20,7 @@
 import type { PostgresPool } from "@companion/postgres";
 
 import { promptContentHash } from "../memory/prompts.ts";
+import { isReasoningEffort, type ReasoningEffort } from "../memory/llm.ts";
 import {
   ArticleConfigurationInvalidError,
   ArticleConfigurationMissingError,
@@ -71,6 +72,55 @@ export const DEFAULT_DECISION_MAX_CANDIDATES = 3;
 export interface ArticleConfigPromptVersions {
   readonly generation: string;
   readonly review: string;
+}
+
+/**
+ * Optional environment overrides for the article LLM model and reasoning
+ * effort (`WORKER_ARTICLE_MODEL`, `WORKER_ARTICLE_REASONING_EFFORT`), as
+ * supplied through Helm `worker.env`. When set, the model override takes
+ * precedence over the database-owned `article_behavior.model` without
+ * mutating the database or changing enablement/other policy; when unset,
+ * the database model and the code preset effort apply.
+ */
+export interface ArticleLlmOverrides {
+  readonly model?: string;
+  readonly reasoningEffort?: ReasoningEffort;
+}
+
+/**
+ * Parse the article LLM environment overrides. An unset or empty value
+ * means no override (legacy behavior). An unsupported reasoning effort
+ * is a configuration error, not a silent default.
+ */
+export function loadArticleLlmOverrides(
+  env: Record<string, string | undefined>,
+): ArticleLlmOverrides {
+  const model = env["WORKER_ARTICLE_MODEL"];
+  const effortRaw = env["WORKER_ARTICLE_REASONING_EFFORT"];
+  const effort: ReasoningEffort | undefined =
+    effortRaw !== undefined && effortRaw.length > 0
+      ? (effortRaw as ReasoningEffort)
+      : undefined;
+  if (effort !== undefined && !isReasoningEffort(effort)) {
+    throw new ArticleConfigurationInvalidError(
+      `WORKER_ARTICLE_REASONING_EFFORT must be one of none, minimal, low, medium, high, xhigh, max: ${effortRaw ?? ""}`,
+    );
+  }
+  return {
+    ...(model !== undefined && model.length > 0 ? { model } : {}),
+    ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+  };
+}
+
+/**
+ * Resolve the effective article model: the environment override when
+ * set, otherwise the database-owned model.
+ */
+export function resolveArticleModel(
+  databaseModel: string,
+  override?: string,
+): string {
+  return override ?? databaseModel;
 }
 
 function boundedPositiveInt(value: number, hardMax: number, fallback: number, field: string): number {

@@ -48,6 +48,7 @@ import { startRoutineRuntime } from "./routine/runtime-loop.ts";
 import { loadMemoryConfig } from "./memory/config.ts";
 import { createMemoryLlmCaller, taskPresets } from "./memory/llm.ts";
 import { startArticleRuntime } from "./articles/runner.ts";
+import { loadArticleLlmOverrides } from "./articles/config.ts";
 import {
   loadArticleShareContext,
   recordArticleShareInclusion,
@@ -445,9 +446,16 @@ async function main(): Promise<void> {
     // tables takes effect on the next scheduled attempt without a restart. The
     // OpenRouter endpoint and credential are environment configuration,
     // available regardless of provisioning state.
+    const articleLlmOverrides = loadArticleLlmOverrides(process.env);
     articleRuntime = startArticleRuntime({
       pool,
       timezone: temporalSettings.timezone,
+      ...(articleLlmOverrides.model !== undefined
+        ? { modelOverride: articleLlmOverrides.model }
+        : {}),
+      ...(articleLlmOverrides.reasoningEffort !== undefined
+        ? { reasoningEffortOverride: articleLlmOverrides.reasoningEffort }
+        : {}),
       callLlm: (model, input) =>
         createMemoryLlmCaller({
           url: `${memoryConfig.openrouterBaseUrl}/chat/completions`,
@@ -561,6 +569,12 @@ async function main(): Promise<void> {
           processTurnWork(work, {
             decisionModel: config.openrouter.decisionModel,
             chatModel: config.openrouter.chatModel,
+            ...(config.openrouter.chatReasoningEffort !== undefined
+              ? {
+                  chatReasoningEffort:
+                    config.openrouter.chatReasoningEffort,
+                }
+              : {}),
             leaseOwner,
             temporalSettings,
             callDecisions: (request) =>

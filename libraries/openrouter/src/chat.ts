@@ -13,6 +13,10 @@
  *   text-only scope and are rejected explicitly rather than silently dropped.
  * - `temperature` (finite number) and `max_tokens` (integer >= 1) are
  *   optional and are never invented or defaulted.
+ * - `reasoning` is optional and typed as OpenRouter's reasoning options
+ *   (`effort` and/or `exclude`); it stays optional and is never invented
+ *   or defaulted by this contract — callers that want reasoning must set
+ *   it explicitly.
  * - Responses require `model` and at least one choice whose message role is
  *   `assistant` with string `content`. `id`, `finish_reason`, and `usage`
  *   are optional and stay optional: they are read through presence checks,
@@ -88,14 +92,79 @@ export interface ChatRequestMessage {
   readonly content: string;
 }
 
+/** OpenRouter reasoning effort levels accepted by the chat contract. */
+export type ChatReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+/**
+ * OpenRouter `reasoning` options for a chat request. Both fields are
+ * optional in the type but at least one must be present in a request:
+ * `effort` sets the reasoning budget level and `exclude: true` asks the
+ * provider not to return reasoning content in the response. An absent
+ * `reasoning` field means no reasoning options are sent — this contract
+ * never invents a default.
+ */
+export interface ChatReasoning {
+  readonly effort?: ChatReasoningEffort;
+  readonly exclude?: boolean;
+}
+
 export interface ChatRequest {
   readonly model: string;
   readonly messages: readonly ChatRequestMessage[];
   readonly temperature?: number;
   readonly max_tokens?: number;
+  readonly reasoning?: ChatReasoning;
 }
 
 const CHAT_ROLES: readonly ChatRole[] = ["system", "user", "assistant"];
+
+const CHAT_REASONING_EFFORTS: readonly ChatReasoningEffort[] = [
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+function parseReasoning(value: unknown): ChatReasoning {
+  const record = expectObject(value, "reasoning");
+  const hasEffort = record.effort !== undefined;
+  const hasExclude = record.exclude !== undefined;
+  if (!hasEffort && !hasExclude) {
+    fail("reasoning", "expected at least one of effort or exclude");
+  }
+  let effort: ChatReasoningEffort | undefined;
+  if (hasEffort) {
+    const raw = expectString(record.effort, "reasoning.effort");
+    if (!CHAT_REASONING_EFFORTS.includes(raw as ChatReasoningEffort)) {
+      fail(
+        "reasoning.effort",
+        `unexpected effort ${JSON.stringify(raw)}; expected one of ${CHAT_REASONING_EFFORTS.map((level) => JSON.stringify(level)).join(", ")}`,
+      );
+    }
+    effort = raw as ChatReasoningEffort;
+  }
+  let exclude: boolean | undefined;
+  if (hasExclude) {
+    if (typeof record.exclude !== "boolean") {
+      fail("reasoning.exclude", "expected a boolean");
+    }
+    exclude = record.exclude;
+  }
+  return {
+    ...(effort !== undefined ? { effort } : {}),
+    ...(exclude !== undefined ? { exclude } : {}),
+  };
+}
 
 function parseRequestMessage(
   index: number,
@@ -123,8 +192,8 @@ function parseRequestMessage(
 /**
  * Validate an untyped chat request against the published schema. Throws
  * `ChatContractError` on the first violation. Optional request fields
- * (`temperature`, `max_tokens`) stay optional and are not invented when
- * absent.
+ * (`temperature`, `max_tokens`, `reasoning`) stay optional and are not
+ * invented when absent.
  */
 export function parseChatRequest(value: unknown): ChatRequest {
   const record = expectObject(value, "request");
@@ -154,6 +223,9 @@ export function parseChatRequest(value: unknown): ChatRequest {
             return parsed;
           })(),
         }
+      : {}),
+    ...(record.reasoning !== undefined
+      ? { reasoning: parseReasoning(record.reasoning) }
       : {}),
   };
 }

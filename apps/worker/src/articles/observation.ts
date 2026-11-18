@@ -47,12 +47,14 @@ import {
   ARTICLE_INTEREST_CONSOLIDATION_PROMPT_VERSION,
   ARTICLE_INTEREST_CONSOLIDATION_RESPONSE_FORMAT,
   articleInterestConsolidationEnvelopeChars,
-  articleTaskPresets,
+  articleTaskPresetsWithReasoningEffort,
   parseArticleInterestConsolidation,
   renderArticleInterestConsolidationFactBlock,
   renderArticleInterestConsolidationInput,
   type ArticleConsolidationFactInput,
 } from "./prompts.ts";
+import { resolveArticleModel } from "./config.ts";
+import type { ReasoningEffort } from "../memory/llm.ts";
 import type { ArticleRuntimeLlmCaller } from "./types.ts";
 
 /** Bounded fact set per consolidation run. */
@@ -79,6 +81,17 @@ export interface ArticleObservationDeps {
   /** Startup-captured authoritative zone; omitted only by direct domain callers/tests. */
   readonly timezone?: string | null;
   readonly callLlm: ArticleRuntimeLlmCaller;
+  /**
+   * Optional model override (`WORKER_ARTICLE_MODEL`): takes precedence
+   * over the database-owned model without mutating the database.
+   */
+  readonly modelOverride?: string;
+  /**
+   * Optional reasoning-effort override
+   * (`WORKER_ARTICLE_REASONING_EFFORT`) applied to the consolidation
+   * preset. Unset keeps the preset default.
+   */
+  readonly reasoningEffortOverride?: ReasoningEffort;
   readonly log?: (message: string) => void;
   /** Claim lease duration; tests shorten it to exercise recovery. */
   readonly consolidationLeaseMs?: number;
@@ -304,12 +317,17 @@ export async function runArticleObservationConsolidation(
           `article observation source is ${String(source.length)} characters; reduce the bounded selector`,
         );
       }
-      const result = await deps.callLlm(await loadModel(pool), {
-        systemPrompt,
-        userMessage: source,
-        taskPreset: articleTaskPresets.consolidation,
-        responseFormat: ARTICLE_INTEREST_CONSOLIDATION_RESPONSE_FORMAT,
-      });
+      const result = await deps.callLlm(
+        resolveArticleModel(await loadModel(pool), deps.modelOverride),
+        {
+          systemPrompt,
+          userMessage: source,
+          taskPreset: articleTaskPresetsWithReasoningEffort(
+            deps.reasoningEffortOverride,
+          ).consolidation,
+          responseFormat: ARTICLE_INTEREST_CONSOLIDATION_RESPONSE_FORMAT,
+        },
+      );
       assertCompleteResponse(result.finishReason, "Article interest consolidation");
 
       const candidates = parseArticleInterestConsolidation(result.text);
@@ -471,7 +489,8 @@ export async function runArticleObservationConsolidation(
   }
 }
 
-/** The consolidation model is the article behavior row's model. */
+/** The consolidation model is the article behavior row's model, unless an
+ * environment override takes precedence (see `resolveArticleModel`). */
 async function loadModel(pool: PostgresPool): Promise<string> {
   const result = await pool.query<{ model: string }>(
     `SELECT model FROM article_behavior WHERE id = 'behavior'`,

@@ -77,6 +77,7 @@ import type { ArticleMemoryCandidate } from "../articles/types.ts";
 import type { RelationshipExtractionItem } from "../relationship/types.ts";
 import { OpenRouterTransportError } from "@companion/openrouter/transport";
 import type {
+  ChatReasoningEffort,
   ChatRequest,
   ChatResponse,
 } from "@companion/openrouter/chat";
@@ -106,6 +107,13 @@ import {
 export interface TurnProcessorDeps {
   readonly decisionModel: string;
   readonly chatModel: string;
+  /**
+   * Optional reasoning effort for main chat, from
+   * `WORKER_CHAT_REASONING_EFFORT`. When set, chat sends
+   * `reasoning: { effort, exclude: true }`; when unset (legacy behavior)
+   * no reasoning options are sent.
+   */
+  readonly chatReasoningEffort?: ChatReasoningEffort;
   /** Current lease owner for fenced prompt-module trace writes. */
   readonly leaseOwner?: string;
   /** Injectable wall-clock source for deterministic attempt-context tests. */
@@ -740,10 +748,21 @@ export async function processTurnWork(
 
   // The assembled prompt is the single source of truth for the wire request
   // and its trace metadata: chunk classification and source linkage are
-  // index-aligned by construction.
+  // index-aligned by construction. When a chat reasoning effort is
+  // configured, main chat sends it with reasoning content excluded
+  // (`exclude: true`), so the visible reply carries no reasoning text;
+  // without configuration, no reasoning options are sent.
   const assemblePrompt = (modules: readonly PromptModulePromptOutput[]) =>
     buildChatPrompt({
       model: deps.chatModel,
+      ...(deps.chatReasoningEffort !== undefined
+        ? {
+            reasoning: {
+              effort: deps.chatReasoningEffort,
+              exclude: true,
+            } as const,
+          }
+        : {}),
       history,
       turnMessages: work.messages,
       identity: identity.content,

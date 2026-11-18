@@ -89,6 +89,19 @@ application re-verifies at runtime:
   equal the web deployment's `WEB_WORKER_TOKEN`. The example must be copied
   to a local version-control-excluded location and filled in before
   enabling the deployables.
+  Six model/reasoning knobs are plain non-secret `worker.env` values (no
+  dedicated chart values are needed, and no image rebuild is required to
+  change them — a Helm upgrade rolls the worker): `WORKER_CHAT_MODEL` +
+  `WORKER_CHAT_REASONING_EFFORT`, `WORKER_MEMORY_MODEL` +
+  `WORKER_MEMORY_REASONING_EFFORT` (memory, including relationship
+  extraction), and `WORKER_ARTICLE_MODEL` +
+  `WORKER_ARTICLE_REASONING_EFFORT` (the article model override takes
+  precedence over the database-owned `article_behavior.model` without
+  mutating it). Efforts are one of `none`, `minimal`, `low`, `medium`,
+  `high`, `xhigh`, `max`; unset reasoning knobs preserve the worker's
+  legacy defaults (chat: no reasoning options; memory: per-task efforts;
+  articles: database model and `low` presets). See the worker's
+  [environment table](../../../apps/worker/README.md).
 
 Template boundary details:
 
