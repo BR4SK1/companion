@@ -58,13 +58,51 @@ export function relationshipDayStreaks(input: {
   });
 }
 
+/**
+ * Main reply output budget (provider `max_tokens`) by configured base
+ * familiarity tier ordinal: 500 tokens at the first tier (ordinal 0,
+ * also the value when relationship is disabled) plus 100 tokens per
+ * successive tier. The ordinal is the tier's index in the configured
+ * ordered tier list — not the transient effective tier, which can move
+ * one tier up or down on streak/missed-day signals — so the budget
+ * tracks familiarity specifically.
+ *
+ * This is a provider cap, not a post-generation truncator: no reply
+ * text is cut by the application. Reasoning tokens, when a reasoning
+ * effort is configured for main chat, count against the same
+ * `max_tokens` on OpenRouter, so operators using a high reasoning
+ * effort should verify visible output is not starved at the lower
+ * budgets. Other LLM tasks (memory, articles, decisions) keep their
+ * own presets and are unaffected.
+ */
+export const MAIN_REPLY_MAX_TOKENS_BASE = 500;
+export const MAIN_REPLY_MAX_TOKENS_PER_TIER = 100;
+
+export function mainReplyMaxTokensForBaseTierOrdinal(ordinal: number): number {
+  if (!Number.isInteger(ordinal) || ordinal < 0) {
+    throw new RangeError(
+      `base tier ordinal must be a non-negative integer, got ${String(ordinal)}`,
+    );
+  }
+  return MAIN_REPLY_MAX_TOKENS_BASE + ordinal * MAIN_REPLY_MAX_TOKENS_PER_TIER;
+}
+
+export function mainReplyMaxTokensForSummary(
+  summary: Pick<RelationshipSummary, "baseTierOrdinal">,
+): number {
+  return mainReplyMaxTokensForBaseTierOrdinal(summary.baseTierOrdinal);
+}
+
 export function selectRelationshipTiers(input: {
   readonly familiarity: number;
   readonly timeKnownDays: number;
   readonly activeDayStreak: number;
   readonly missedDayStreak: number;
   readonly configuration: RelationshipConfiguration;
-}): Pick<RelationshipSummary, "baseTier" | "effectiveTier" | "tierMovement"> {
+}): Pick<
+  RelationshipSummary,
+  "baseTier" | "baseTierOrdinal" | "effectiveTier" | "tierMovement"
+> {
   const tiers = input.configuration.tiers;
   let baseIndex = 0;
   for (let i = 0; i < tiers.length; i += 1) {
@@ -89,6 +127,7 @@ export function selectRelationshipTiers(input: {
   const effectiveTier = tiers[effectiveIndex]!;
   return {
     baseTier,
+    baseTierOrdinal: baseIndex,
     effectiveTier,
     tierMovement: effectiveIndex < baseIndex
       ? "down"
@@ -164,6 +203,7 @@ export function renderRelationshipContext(summary: RelationshipSummary): string 
     `Base tier: ${summary.baseTier.label}. Effective tier: ${summary.effectiveTier.label} (${summary.tierMovement}).`,
     `Tier prompt: ${summary.effectiveTier.prompt}`,
     `Behavioral guidance: ${summary.effectiveTier.behavioralGuidance}`,
+    `Reply length: keep this reply concise, aiming for at most about ${String(mainReplyMaxTokensForSummary(summary))} output tokens.`,
     `Clarification guidance: ${summary.clarificationGuidance}`,
   ];
   const clarificationAnswers = summary.answers.filter((answer) => answer.clarificationNeeded);

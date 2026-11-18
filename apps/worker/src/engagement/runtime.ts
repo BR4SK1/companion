@@ -172,3 +172,161 @@ export function assessMessage(
     retainedLull: state === "lull",
   };
 }
+
+/**
+ * Session scoping of model history (decision + chat + snapshot +
+ * prompt-module context) to the current conversation.
+ *
+ * A recorded `gone` assessment starts a new conversation: the message
+ * carrying it is the return message after the configured `gone` silence,
+ * so model history for its turn and every later turn begins at that
+ * message. The boundary is the RECORDED assessment state at the return
+ * message — never the effective state (`stateAt`) at processing time.
+ * The effective state floors at the last assessment, so the return
+ * message permanently reads `gone` as a floor until a subsequent
+ * message lifts it; using that floor as the boundary would reset
+ * history on every turn after a return. Here only the return message
+ * itself (the one whose recorded state is `gone`) is the boundary, and
+ * subsequent turns include the new conversation's own prior messages
+ * from that message onward instead of repeatedly resetting.
+ *
+ * Missing entries (no recorded assessment: pre-engagement history,
+ * unprovisioned stretches, assistant messages) are never `gone`, so a
+ * deployment without engagement provisioning — or history written
+ * before it was provisioned — keeps the existing unbounded behavior.
+ * No threshold is fabricated here: `gone` is whatever the recorded
+ * assessment says, snapshot with its own bands at ingest time.
+ */
+
+export type AssessmentStateMap = ReadonlyMap<
+  string,
+  EngagementState | null | undefined
+>;
+
+/** True when the recorded assessment state is exactly `gone`. */
+export function isGoneState(
+  state: EngagementState | null | undefined,
+): boolean {
+  return state === "gone";
+}
+
+/**
+ * The id of the latest message, in the given chronological order, whose
+ * recorded assessment is `gone`; null when none of the ids is recorded
+ * `gone`. Later ids win, so callers pass oldest-first order.
+ */
+export function latestGoneMessageId(
+  orderedMessageIds: readonly string[],
+  assessmentStates: AssessmentStateMap,
+): string | null {
+  let latest: string | null = null;
+  for (const id of orderedMessageIds) {
+    if (assessmentStates.get(id) === "gone") latest = id;
+  }
+  return latest;
+}
+
+/**
+ * Whether any of the given message ids is recorded `gone`.
+ */
+export function hasGoneAssessment(
+  messageIds: readonly string[],
+  assessmentStates: AssessmentStateMap,
+): boolean {
+  return messageIds.some((id) => assessmentStates.get(id) === "gone");
+}
+
+export interface SessionHistoryMessage {
+  readonly id: string;
+}
+
+/**
+ * Select the current-session slice of prior-turn history (oldest first).
+ *
+ * - Any `gone` in the current turn's grouped messages empties the
+ *   history: grouped messages before the `gone` one in the same turn
+ *   are still sent as turn messages by the processor, but no earlier
+ *   conversation leaks in. This is deliberately ANY (not last-only as
+ *   in `getAssessmentForTurn`'s turn-engagement read): for history
+ *   scoping a mixed turn must not leak, even when its last message
+ *   carries no assessment.
+ * - Otherwise the slice starts at the latest `gone` in the history,
+ *   inclusive (that return message and everything after it, including
+ *   its assistant reply and follow-ups).
+ * - With no `gone` anywhere the history is returned unchanged.
+ */
+export function selectSessionHistory<T extends SessionHistoryMessage>(
+  history: readonly T[],
+  assessmentStates: AssessmentStateMap,
+  currentTurnMessageIds: readonly string[] = [],
+): readonly T[] {
+  if (hasGoneAssessment(currentTurnMessageIds, assessmentStates)) return [];
+  const boundaryId = latestGoneMessageId(
+    history.map((message) => message.id),
+    assessmentStates,
+  );
+  if (boundaryId === null) return history;
+  const start = history.findIndex((message) => message.id === boundaryId);
+  return start < 0 ? history : history.slice(start);
+}
+
+/**
+ * Whether the given history message belongs to the current session:
+ * at or after the latest recorded `gone` in the history, and no `gone`
+ * in the current turn (which would start a new session the history
+ * message predates). Messages with no recorded assessment are not
+ * boundaries and never exclude a message by themselves.
+ */
+export function isInCurrentSession(
+  messageId: string,
+  orderedHistoryIds: readonly string[],
+  assessmentStates: AssessmentStateMap,
+  currentTurnMessageIds: readonly string[] = [],
+): boolean {
+  if (hasGoneAssessment(currentTurnMessageIds, assessmentStates)) return false;
+  const boundaryId = latestGoneMessageId(orderedHistoryIds, assessmentStates);
+  if (boundaryId === null) return true;
+  const messageIndex = orderedHistoryIds.indexOf(messageId);
+  const boundaryIndex = orderedHistoryIds.indexOf(boundaryId);
+  return messageIndex >= boundaryIndex;
+}
+
+/**
+ * The length of the first contiguous session in a pending backlog
+ * (oldest first): messages up to, but not including, the first `gone`
+ * after the head. A `gone` at the head starts the claim (it is
+ * included, and the claim runs until the next `gone`); a `gone`
+ * anywhere later ends the claim (it starts the next claim). With no
+ * later `gone` the whole backlog is one session. Used by
+ * `claimNextTurn` so a backlog accumulated across a `gone` return
+ * (worker downtime, routine unavailability) never groups the old
+ * conversation and the return into one turn's prompt. Remaining
+ * messages stay unassigned and are claimed next, in order.
+ */
+export function firstSessionBatchLength(
+  orderedPendingIds: readonly string[],
+  assessmentStates: AssessmentStateMap,
+): number {
+  for (let i = 1; i < orderedPendingIds.length; i += 1) {
+    const id = orderedPendingIds[i];
+    if (id !== undefined && assessmentStates.get(id) === "gone") return i;
+  }
+  return orderedPendingIds.length;
+}
+
+/**
+ * The first contiguous session of a pending backlog, in order. See
+ * `firstSessionBatchLength`.
+ */
+export function selectFirstSessionBatch<T extends SessionHistoryMessage>(
+  pending: readonly T[],
+  assessmentStates: AssessmentStateMap,
+): readonly T[] {
+  return pending.slice(
+    0,
+    firstSessionBatchLength(
+      pending.map((message) => message.id),
+      assessmentStates,
+    ),
+  );
+}

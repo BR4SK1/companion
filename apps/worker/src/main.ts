@@ -208,6 +208,14 @@ async function main(): Promise<void> {
         ? {
             onUserMessageInserted: (tx, inserted) =>
               engagementStore.onUserMessageInserted(tx, inserted),
+            // Model-history session scoping: decision/chat/snapshot and
+            // prompt-module context start at the latest recorded `gone`
+            // return message. Only wired when engagement is provisioned;
+            // unprovisioned keeps existing unscoped behavior.
+            sessionAssessmentLoader: {
+              getAssessmentStatesForMessages: (messageIds) =>
+                engagementStore.getAssessmentStatesForMessages(messageIds),
+            },
           }
         : {}),
       onPromptModuleChatMessagesRecorded: (client, association) =>
@@ -666,13 +674,26 @@ async function main(): Promise<void> {
                 }),
               ),
             loadMemoryContext,
+            // Always wired so the main reply output budget is always
+            // resolved: enabled relationship derives it from the base
+            // familiarity tier ordinal (500 at the first tier, +100 per
+            // successive tier); a disabled relationship is the first
+            // tier (500). Answer extraction stays conditional on the
+            // store and its LLM caller being provisioned.
+            loadRelationshipContext: async (_turnId, referenceTime) => {
+              if (provisionedRelationshipStore === undefined) {
+                return { context: null, baseTierOrdinal: 0 };
+              }
+              const summary =
+                await provisionedRelationshipStore.getSummary(referenceTime);
+              return {
+                context: renderRelationshipContext(summary),
+                baseTierOrdinal: summary.baseTierOrdinal,
+              };
+            },
             ...(provisionedRelationshipStore !== undefined &&
                 provisionedRelationshipCallLlm !== undefined
               ? {
-                  loadRelationshipContext: async (_turnId, referenceTime) =>
-                    renderRelationshipContext(
-                      await provisionedRelationshipStore.getSummary(referenceTime),
-                    ),
                   extractRelationshipAnswers: (input: {
                     readonly userText: string;
                     readonly assistantText: string;

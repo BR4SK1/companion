@@ -63,6 +63,8 @@ export interface RelationshipSummary {
   readonly eligibleSlotsPerParticipant: number;
   readonly familiarity: number;
   readonly baseTier: RelationshipTier;
+  /** Index of `baseTier` in the configured ordered tier list (0-based). */
+  readonly baseTierOrdinal: number;
   readonly effectiveTier: RelationshipTier;
   readonly tierMovement: "up" | "down" | "locked";
   readonly answers: readonly RelationshipAnswer[];

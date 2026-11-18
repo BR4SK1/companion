@@ -19,6 +19,12 @@ import {
   assessMessage,
   stateAt,
   deeperEngagementState,
+  selectSessionHistory,
+  isInCurrentSession,
+  latestGoneMessageId,
+  hasGoneAssessment,
+  firstSessionBatchLength,
+  selectFirstSessionBatch,
 } from "../../apps/worker/src/engagement/runtime.ts";
 import { validateEngagementBands } from "../../apps/worker/src/engagement/bands.ts";
 import { EngagementBandsError } from "../../apps/worker/src/engagement/bands.ts";
@@ -296,6 +302,156 @@ describe("engagement band configuration", () => {
     assert.throws(
       () => validateEngagementBands({ lullMs: Number.NaN, idleMs: 20, goneMs: 30 }),
       EngagementBandsError,
+    );
+  });
+});
+describe("session history scoping (recorded gone starts a new conversation)", () => {
+  const history = [
+    { id: "old-user-1" },
+    { id: "old-assistant-1" },
+    { id: "gone-user" },
+    { id: "new-assistant-1" },
+    { id: "followup-user" },
+    { id: "new-assistant-2" },
+  ];
+  const states = new Map([
+    ["old-user-1", "engaged"],
+    ["gone-user", "gone"],
+    ["followup-user", "engaged"],
+  ]);
+
+  it("slices history from the recorded gone return message, inclusive", () => {
+    assert.deepEqual(
+      selectSessionHistory(history, states).map((m) => m.id),
+      ["gone-user", "new-assistant-1", "followup-user", "new-assistant-2"],
+    );
+  });
+
+  it("does not repeatedly reset on follow-up turns in the new conversation", () => {
+    // The return message's recorded gone is the only boundary: a later
+    // turn whose history already starts at the return message keeps the
+    // new conversation's own prior messages instead of emptying again.
+    const newHistory = selectSessionHistory(history, states);
+    assert.deepEqual(
+      selectSessionHistory(newHistory, states).map((m) => m.id),
+      newHistory.map((m) => m.id),
+    );
+  });
+
+  it("empties prior history when any grouped current-turn message is gone", () => {
+    assert.deepEqual(selectSessionHistory(history, states, ["gone-user"]), []);
+    // Any, not last-only: a mixed grouped turn with an earlier gone and
+    // an unassessed last message must not leak earlier conversation.
+    assert.deepEqual(
+      selectSessionHistory(history, states, ["gone-user", "unassessed"]),
+      [],
+    );
+  });
+
+  it("keeps history unchanged with no gone, missing, or non-gone states", () => {
+    assert.deepEqual(selectSessionHistory(history, new Map()), history);
+    assert.deepEqual(
+      selectSessionHistory(history, new Map([["old-user-1", "idle"], ["followup-user", "lull"]])),
+      history,
+    );
+    // Pre-existing/unprovisioned: absence is never gone.
+    assert.equal(latestGoneMessageId(history.map((m) => m.id), new Map()), null);
+    assert.equal(hasGoneAssessment(["unknown"], new Map()), false);
+  });
+
+  it("uses the latest gone when several returns exist", () => {
+    const multi = new Map(states);
+    multi.set("followup-user", "gone");
+    assert.equal(
+      latestGoneMessageId(history.map((m) => m.id), multi),
+      "followup-user",
+    );
+    assert.deepEqual(
+      selectSessionHistory(history, multi).map((m) => m.id),
+      ["followup-user", "new-assistant-2"],
+    );
+  });
+
+  it("distinguishes the boundary from the post-return effective floor", () => {
+    // stateAt floors at gone after the return, but session scoping must
+    // key on the recorded return message only: a message assessed
+    // engaged after the return is inside the new session, not a boundary.
+    const afterReturn = new Map(states);
+    afterReturn.set("followup-user", "engaged");
+    assert.equal(
+      isInCurrentSession("followup-user", history.map((m) => m.id), afterReturn),
+      true,
+    );
+    assert.equal(
+      isInCurrentSession("old-user-1", history.map((m) => m.id), afterReturn),
+      false,
+    );
+    assert.equal(
+      isInCurrentSession("gone-user", history.map((m) => m.id), afterReturn),
+      true,
+    );
+    // A gone in the current turn puts every prior message outside.
+    assert.equal(
+      isInCurrentSession("new-assistant-2", history.map((m) => m.id), afterReturn, ["gone-user"]),
+      false,
+    );
+  });
+});
+
+describe("claim batch selection (first contiguous session)", () => {
+  const pending = [
+    { id: "pre-1" },
+    { id: "pre-2" },
+    { id: "gone-return" },
+    { id: "follow-1" },
+    { id: "follow-2" },
+    { id: "gone-return-2" },
+    { id: "follow-3" },
+  ];
+  const states = new Map([
+    ["pre-1", "engaged"],
+    ["gone-return", "gone"],
+    ["follow-1", "engaged"],
+    ["follow-2", "engaged"],
+    ["gone-return-2", "gone"],
+  ]);
+
+  it("stops the first claim before the return, leaving the return for the next claim", () => {
+    assert.equal(firstSessionBatchLength(pending.map((m) => m.id), states), 2);
+    assert.deepEqual(
+      selectFirstSessionBatch(pending, states).map((m) => m.id),
+      ["pre-1", "pre-2"],
+    );
+    // Next claim on the remainder starts at the gone head and runs to
+    // the following gone; the last claim takes the tail.
+    const rest = pending.slice(2);
+    assert.deepEqual(
+      selectFirstSessionBatch(rest, states).map((m) => m.id),
+      ["gone-return", "follow-1", "follow-2"],
+    );
+    assert.deepEqual(
+      selectFirstSessionBatch(rest.slice(3), states).map((m) => m.id),
+      ["gone-return-2", "follow-3"],
+    );
+  });
+
+  it("claims the whole backlog with no gone, missing, or non-gone states", () => {
+    assert.equal(firstSessionBatchLength(pending.map((m) => m.id), new Map()), pending.length);
+    assert.equal(
+      firstSessionBatchLength(
+        pending.map((m) => m.id),
+        new Map([["pre-1", "idle"], ["gone-return", "lull"]]),
+      ),
+      pending.length,
+    );
+    assert.equal(firstSessionBatchLength([], states), 0);
+  });
+
+  it("includes a gone at the head and ends at the next gone", () => {
+    const headGone = [{ id: "gone-return" }, { id: "follow-1" }, { id: "gone-return-2" }, { id: "follow-3" }];
+    assert.deepEqual(
+      selectFirstSessionBatch(headGone, states).map((m) => m.id),
+      ["gone-return", "follow-1"],
     );
   });
 });

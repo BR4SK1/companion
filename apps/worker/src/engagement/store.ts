@@ -238,10 +238,33 @@ export function createEngagementStore(
     };
   }
 
+  async function getAssessmentStatesForMessages(
+    messageIds: readonly string[],
+  ): Promise<ReadonlyMap<string, EngagementState>> {
+    const uniqueIds = [...new Set(messageIds)];
+    if (uniqueIds.length === 0) return new Map();
+    const result = await pool.query<{
+      message_id: string;
+      state: string;
+    }>(
+      `SELECT message_id, state
+       FROM engagement_message_assessment
+       WHERE message_id = ANY($1::uuid[])`,
+      [uniqueIds],
+    );
+    return new Map(
+      result.rows.map((row) => [
+        row.message_id,
+        row.state as EngagementState,
+      ]),
+    );
+  }
+
   return {
     onUserMessageInserted,
     getAssessmentForMessage,
     getAssessmentForTurn,
     getSummary,
+    getAssessmentStatesForMessages,
   };
 }

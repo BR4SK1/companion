@@ -197,4 +197,18 @@ export interface EngagementStore {
    * Null state when no user message has ever been ingested.
    */
   readonly getSummary: (observedAt: Date) => Promise<EngagementSummary>;
+
+  /**
+   * Batch read of recorded assessment states for the given user message
+   * ids. Messages without a recorded assessment (pre-engagement history,
+   * assistant messages, unknown ids) are simply absent from the returned
+   * map — absence is never a state and never `gone`. Used by the
+   * conversation store to scope model history to the current session:
+   * the latest recorded `gone` assessment starts a new conversation.
+   * The recorded state is trusted as written (bands snapshot), never
+   * recomputed from current configuration or processing time.
+   */
+  readonly getAssessmentStatesForMessages: (
+    messageIds: readonly string[],
+  ) => Promise<ReadonlyMap<string, EngagementState>>;
 }
