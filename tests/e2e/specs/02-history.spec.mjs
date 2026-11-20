@@ -120,6 +120,14 @@ test("configured local-day dividers mark the seeded dates", async ({ page }) => 
 test("scrolling up shows jump-to-latest and returns to the newest message", async ({ page }) => {
   await page.goto("/");
   const log = page.getByRole("log", { name: "Conversation" });
+  // Wait for the automatic backfill to settle before scrolling: the "Load
+  // earlier messages" control is offered exactly when the bounded walk has
+  // stopped (see the header comment and walkToBottom). Scrolling while the
+  // walk is still in flight raced against its merges — each one re-pins
+  // the reader to the bottom because they are still "following" — so the
+  // upward scroll was lost before the jump-to-latest affordance could
+  // appear.
+  await expect(page.getByRole("button", { name: "Load earlier messages" })).toBeVisible();
   await expect(log.getByText(`e2e-history-user-${String(HISTORY_TURNS)}`, { exact: true })).toBeVisible();
 
   // Scroll away from the bottom: the reader must not be dragged along.

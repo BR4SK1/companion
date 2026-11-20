@@ -31,9 +31,10 @@ set the deployed-smoke configuration fingerprint covers):
 | `article_feed`, `article_behavior`, `article_prompt` | feeds, limits, reaction prompts |
 
 Full stored prompt visibility: every prompt field is returned verbatim in
-`GET /api/config` and rendered in full in the browser (`<pre>` blocks) —
-never truncated, sampled, or masked. The registry names them as
-`promptFields` per table.
+`GET /api/config` and rendered in full in the browser as the labelled
+textarea for that field — never truncated, sampled, or masked, and without
+a duplicate read-only copy. The registry names them as `promptFields` per
+table.
 
 Excluded by design (the manager cannot read or write them):
 
@@ -64,6 +65,38 @@ retarget a running process. The listener binds loopback only
 
 The UI and `GET /api/health` display the bound environment label so the
 operator always sees what they are editing.
+
+## Browser UI
+
+The index page is a fixed dark theme (no light-mode variant) with a clear
+hierarchy: table sections, row cards headed by their row's primary-key
+values (for example `kind: fact_extraction · version: mock-v1` for
+`memory_prompt`), and responsive, explicitly labelled fields with a
+visible `:focus-visible` outline. Server-managed fields (`updated_at`,
+`revision`) are display-only — they render as read-only output, never as
+an editable control, so they can never be submitted as edits. There is no
+create or delete UI; the page edits the rows returned by `GET /api/config`
+only.
+
+A sticky top header stays in view while scrolling through the tables. It
+contains the environment context, the production warning (on a production
+binding), the typed confirmation field, and the **Review diff** and
+**Apply edits** actions, and it remains compact on narrow and short
+screens. Review results live in a bounded, scrollable disclosure panel
+inside that header (`<details>` with a summary naming the last result
+state and a `<pre>` holding the JSON response), so a preview or apply
+result is visible from the header controls even when the operator has
+scrolled deep into the tables; the panel opens automatically when a
+request starts and reports progress, completion, or failure.
+
+Request feedback is announced through a polite, atomic live region
+(`#status`) and the header's `aria-busy` state. While a preview or apply
+request is in flight, both actions (and the confirmation field) are
+disabled and duplicate clicks are ignored, so a second apply cannot be
+submitted concurrently with the first. None of this changes the HTTP
+contract: routes, payloads, validation, typed confirmation, and the
+optimistic-concurrency (`baseHash` / `409`) safeguards are server-side
+and unchanged.
 
 ## Review, diff, confirmation, conflicts
 

@@ -31,25 +31,46 @@ run-owned directory until cleanup is verified; remove only that exact directory
 when no recovery marker or owned resource remains.
 
 The stack requires the existing `WORKER_MEMORY_EMBEDDING_BASE_URL` environment
-setting to identify the approved internal embedding service. Source it from
-private local infrastructure configuration; do not add its value to this
-README or any tracked fixture. For isolated maintenance/testing, set
-`E2E_RUNS_DIR` to a new task-owned directory so startup reconciliation and
-cleanup cannot inspect historical `.runs` entries.
+setting to identify the approved internal embedding service. For full runs,
+`scripts/test-e2e.mjs` resolves it without inventing a default: an explicitly
+inherited value takes precedence; otherwise the dedicated local-only
+`.private/e2e-local.json` supplies the host-local variant as
+`localEmbeddingBaseUrl` (documented LAN/host variant, never the in-cluster
+DNS). The runner validates an HTTP(S) origin with no credentials, path,
+query, or fragment, never prints the value, and injects the resolved value
+only into steps that read the host-local setting (`playwright`,
+`stack-ops`, `embedding-integration`). Direct local-only invocations
+(`pnpm --filter @companion/e2e test`) bypass the runner and therefore still
+require `WORKER_MEMORY_EMBEDDING_BASE_URL` to be set explicitly. Populate
+`localEmbeddingBaseUrl` in the JSON config from the approved private
+local-infrastructure source; do not add its value to this README or any
+tracked fixture. For isolated maintenance/testing, set `E2E_RUNS_DIR` to a
+new task-owned directory so startup reconciliation and cleanup cannot inspect
+historical `.runs` entries.
 
 ### Request scope: full E2E versus local-only
 
-An unqualified request to "run E2E" means a **full E2E run**: this disposable
-local stack **plus** deployed non-production validation, which includes the
+An unqualified request to "run E2E" means a **full E2E run**
+(`pnpm run test:e2e` from the repository root, `node scripts/test-e2e.mjs`):
+the complete inventory — the local candidate suites
+(format, lint, unit, typecheck, render checks, this disposable stack, the
+stack-ops and smoke-regression suites, and the non-database embedding
+check) **plus** deployed non-production validation, which includes the
 [guarded deployed smoke](#guarded-deployed-non-production-smoke), which may
-invoke external providers and incur charges. The command above runs only the
-local Playwright stack: chat/decision calls use a fake provider, while synthetic
-embedding requests use the configured embedding service. It
-never includes the deployed smoke, which runs only through its own documented
-command. A request explicitly scoped to local-only validation (for example
-"run the local e2e suite") covers exactly this local coverage and nothing
-deployed. The deployed smoke is also a valid request on its own, independent of
-a full E2E run.
+invoke external providers and incur charges. The full runner requires the
+exact candidate SHA (`SHIP_TARGET_SHA`/`SHIP_DEPLOYED_SHA`) with HEAD and a
+clean tree matching it, and proves the deployed candidate by resolving its
+immutable full-SHA tags at the fixed registry and verifying both digests
+against the live Deployment specs and pod runtimes, with the verified pods
+held in memory. It consults no handoff file and requires no reservation
+gate, and has no local-only, filtered, or skip mode. The command above
+(`pnpm --filter @companion/e2e test`) runs only the local Playwright stack:
+chat/decision calls use a fake provider, while synthetic embedding requests
+use the configured embedding service. It never includes the deployed smoke
+and never proves deployed exact-candidate validation. A request explicitly
+scoped to local-only validation (for example "run the local e2e suite")
+covers exactly this local coverage and nothing deployed. The deployed smoke
+is also a valid request on its own, independent of a full E2E run.
 
 The stack supervisor (`stack.mjs`, started by Playwright as its web server)
 uses these dependencies:
@@ -226,7 +247,17 @@ and may invoke configured external providers that incur charges.
 - Read-only preflight before anything is sent verifies the deployed image,
   the gate's non-production attestation/enablement, a free local forward port,
   scenario linkage, provisioned-configuration fingerprint, thread quiescence,
-  and no unsettled prior smoke marker. Completed intentionally retained runs
+  and no unsettled prior smoke marker. When the E2E runner invokes the
+  smoke it also pins it to the in-memory deployment verified at E2E start:
+  `E2E_DEPLOYED_EXPECT_WEB_POD`, `E2E_DEPLOYED_EXPECT_WORKER_POD`,
+  `E2E_DEPLOYED_EXPECT_WEB_POD_UID`, `E2E_DEPLOYED_EXPECT_WORKER_POD_UID`,
+  `E2E_DEPLOYED_EXPECT_WEB_IMAGE_ID`, and `E2E_DEPLOYED_EXPECT_WORKER_IMAGE_ID`
+  are all required together, and preflight refuses to send unless the live
+  pods in `companion-np` are exactly those pods (same names and UIDs) running
+  exactly those image digests. In E2E-pinned mode the worker pod-side actions
+  exec into the verified worker pod by name; standalone invocations without
+  those variables retain the original preflight behaviour and the Deployment
+  exec target. Partial or invalid pinning fails closed. Completed intentionally retained runs
   are allowed; each new exact marker is checked before send. Memory ingest/recall and an embedding
   endpoint must be configured with bounded convergence. Enabled relationship
   questions, cursor initialization/catch-up, and runnable consolidation or

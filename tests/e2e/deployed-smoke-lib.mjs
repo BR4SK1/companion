@@ -1182,6 +1182,67 @@ const TEST_CONFIGURATION_FINGERPRINT_KEY = "0".repeat(64);
  * Optional operator-supplied expectation for one provisioned HTTP module.
  * Both values are treated as private run inputs and must never be logged.
  */
+/** Extract the sha256 digest from a container imageID (repo@digest or docker-pullable://repo@digest). */
+export function digestFromImageId(imageId) {
+  const text = String(imageId ?? "");
+  const at = text.lastIndexOf("@");
+  if (at === -1) return null;
+  const digest = text.slice(at + 1);
+  return /^sha256:[0-9a-f]{64}$/.test(digest) ? digest : null;
+}
+
+/**
+ * Optional ship-runner pinning of this smoke to the exact deployed pods and
+ * image digests verified at deploy time. When any of the six
+ * E2E_DEPLOYED_EXPECT_* values is set, all six must be set and valid;
+ * partial or invalid pinning fails closed (never ignored). When none is
+ * set (standalone smoke invocation), the smoke retains its original
+ * preflight behaviour. Pod names, UIDs, and digests are not secrets.
+ */
+export function deployedPinFromEnvironment(environment) {
+  const webPod = environment.E2E_DEPLOYED_EXPECT_WEB_POD;
+  const workerPod = environment.E2E_DEPLOYED_EXPECT_WORKER_POD;
+  const webPodUid = environment.E2E_DEPLOYED_EXPECT_WEB_POD_UID;
+  const workerPodUid = environment.E2E_DEPLOYED_EXPECT_WORKER_POD_UID;
+  const webImageId = environment.E2E_DEPLOYED_EXPECT_WEB_IMAGE_ID;
+  const workerImageId = environment.E2E_DEPLOYED_EXPECT_WORKER_IMAGE_ID;
+  const values = [webPod, workerPod, webPodUid, workerPodUid, webImageId, workerImageId];
+  if (values.every((value) => value === undefined)) return null;
+  const podOk = (value) => typeof value === "string" && value.length > 0 && !/\s/.test(value);
+  const uidOk = (value) => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value);
+  if (!values.every((value) => typeof value === "string" && value.length > 0) ||
+    !podOk(webPod) || !podOk(workerPod) ||
+    !uidOk(webPodUid) || !uidOk(workerPodUid) ||
+    digestFromImageId(webImageId) === null || digestFromImageId(workerImageId) === null) {
+    throw new Error("deployed_pin_configuration_invalid");
+  }
+  return {
+    webPod,
+    workerPod,
+    webPodUid,
+    workerPodUid,
+    webDigest: digestFromImageId(webImageId),
+    workerDigest: digestFromImageId(workerImageId),
+  };
+}
+
+/**
+ * Verify preflight deployment evidence against a ship pin. Input is
+ * content-free (pod names, image IDs, namespace). Returns a content-free
+ * reason; never echoes pod names, image references, or digests in the
+ * reason beyond the fixed codes below.
+ */
+export function verifyDeployedPin(deployment, pin, namespace) {
+  if (namespace !== "companion-np") return { passed: false, reason: "namespace_not_pinned_non_production" };
+  if (deployment?.webPod !== pin.webPod) return { passed: false, reason: "web_pod_mismatch" };
+  if (deployment?.workerPod !== pin.workerPod) return { passed: false, reason: "worker_pod_mismatch" };
+  if (deployment?.webPodUid !== pin.webPodUid) return { passed: false, reason: "web_pod_uid_mismatch" };
+  if (deployment?.workerPodUid !== pin.workerPodUid) return { passed: false, reason: "worker_pod_uid_mismatch" };
+  if (digestFromImageId(deployment?.webImageId) !== pin.webDigest) return { passed: false, reason: "web_digest_mismatch" };
+  if (digestFromImageId(deployment?.workerImageId) !== pin.workerDigest) return { passed: false, reason: "worker_digest_mismatch" };
+  return { passed: true, reason: "verified" };
+}
+
 export function expectedHttpPromptModuleFromEnvironment(environment) {
   const id = environment.E2E_DEPLOYED_EXPECT_HTTP_MODULE_ID;
   const definitionFingerprint = environment.E2E_DEPLOYED_EXPECT_HTTP_MODULE_FINGERPRINT;

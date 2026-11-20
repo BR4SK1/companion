@@ -1,2 +1,4 @@
-# Run the full unit suite before the commit is created; any failing test blocks the commit.
-pnpm test:unit
+# Run the standard local gates before the commit is created; any failing gate blocks the commit.
+pnpm run format:check
+pnpm run lint
+pnpm run test:unit

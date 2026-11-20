@@ -9,13 +9,17 @@
   },
   "scripts": {
     "prepare": "husky",
+    "format:check": "prettier --check package.json pnpm-workspace.yaml AGENTS.md README.md",
+    "lint": "pnpm --filter @companion/web lint",
     "test:unit": "node --experimental-strip-types --test \"tests/unit/**/*.test.mjs\"",
+    "test:e2e": "node scripts/test-e2e.mjs",
     "typecheck": "tsc -p libraries/openrouter && tsc -p libraries/postgres && tsc -p apps/worker && tsc -p apps/config-manager"
   },
   "devDependencies": {
     "@commitlint/cli": "21.2.4",
     "@commitlint/config-conventional": "21.2.4",
     "husky": "9.1.7",
+    "prettier": "3.10.1",
     "typescript": "^7.0.2"
   }
 }

@@ -73,6 +73,7 @@ import {
   buildMarker,
   buildPodActionScript,
   createShutdownController,
+  deployedPinFromEnvironment,
   evaluateExpectedHttpPromptModuleTrace,
   expectedHttpPromptModuleFromEnvironment,
   fingerprint,
@@ -80,6 +81,7 @@ import {
   planRetainedScenarioDecision,
   redactText,
   sanitizeError,
+  verifyDeployedPin,
 } from "./deployed-smoke-lib.mjs";
 
 const NAMESPACE = process.env.E2E_DEPLOYED_NAMESPACE ?? "companion-np";
@@ -119,6 +121,10 @@ const expectedHttpPromptModule = expectedHttpPromptModuleFromEnvironment(process
 if (expectedHttpPromptModule !== null) {
   secrets.push(expectedHttpPromptModule.id, expectedHttpPromptModule.definitionFingerprint);
 }
+// Optional ship-runner pinning to the exact deployed pods/digests. When the
+// runner sets these, preflight must prove the live pods are those exact
+// pods running those exact digests in companion-np before anything is sent.
+const deployedPin = deployedPinFromEnvironment(process.env);
 const shutdown = createShutdownController();
 
 /** The marker of this run, set before the send (used by cleanup/recovery). */
@@ -191,9 +197,12 @@ async function kubectl(args, { input = undefined } = {}) {
  */
 async function workerPodAction(payload) {
   const script = buildPodActionScript({ ...payload, configurationFingerprintKey });
+  // Ship-pinned runs exec into the verified worker pod by name (the UID
+  // was proven in preflight); standalone runs keep the Deployment target.
+  const execTarget = deployedPin !== null ? `pod/${deployedPin.workerPod}` : "deploy/companion-worker";
   const result = await runCaptured(
     "kubectl",
-    ["exec", "-i", "-n", NAMESPACE, "deploy/companion-worker", "--",
+    ["exec", "-i", "-n", NAMESPACE, execTarget, "--",
       "sh", "-c", "cd /app/libraries/postgres && node -"],
     { input: `${script}\n`, timeoutMs: 120_000 },
   );
@@ -267,17 +276,30 @@ async function preflight() {
       `expected exactly one running web and worker pod in ${NAMESPACE}, found ${String(webPods.length)}/${String(workerPods.length)}`,
     );
   }
+  if (webPods[0].metadata.deletionTimestamp || workerPods[0].metadata.deletionTimestamp) {
+    throw new Error("a web or worker pod is terminating; refusing to send against a retiring pod");
+  }
   evidence.deployment = {
     namespace: NAMESPACE,
     webPod: webPods[0].metadata.name,
+    webPodUid: webPods[0].metadata.uid,
     webImage: webPods[0].spec.containers[0].image,
     webImageId: webPods[0].status.containerStatuses[0].imageID,
     workerPod: workerPods[0].metadata.name,
+    workerPodUid: workerPods[0].metadata.uid,
     workerImage: workerPods[0].spec.containers[0].image,
     workerImageId: workerPods[0].status.containerStatuses[0].imageID,
   };
   log(`web: ${evidence.deployment.webImage}`);
   log(`worker: ${evidence.deployment.workerImage}`);
+  if (deployedPin !== null) {
+    const pinResult = verifyDeployedPin(evidence.deployment, deployedPin, NAMESPACE);
+    evidence.preflight.deployedPin = { required: true, passed: pinResult.passed, reason: pinResult.reason };
+    if (!pinResult.passed) {
+      throw new Error(`deployed pod/digest pin verification failed (${pinResult.reason}) — refusing to send against an unverified deployment`);
+    }
+    log("deployed pod/digest pin verified");
+  }
 
   // Gate configuration: must be enabled, in the authorized non-production
   // attestation shape, and never exposed beyond the pod.
