@@ -67,7 +67,7 @@ function writeFile(file, content, mode) {
   if (mode !== undefined) fs.chmodSync(file, mode);
 }
 
-function makeShims(shimDir, logFile, { realRender = false } = {}) {
+function makeShims(shimDir, logFile, { realRender = false, nodeMissing = false } = {}) {
   const docker = `#!/bin/sh
 echo "docker $*" >> "${logFile}"
 case "$1" in
@@ -300,12 +300,33 @@ esac
 echo "unexpected kubectl call: $*" >&2
 exit 4
 `;
+  // Hermetic `node` shim for the early Node preflight. It deliberately
+  // does not log to logFile: the preflight runs before any docker /
+  // helm / kubectl call, so an empty calls.log still proves the
+  // failure happened before build/publish/Helm. The reported version
+  // is controlled by FAKE_NODE_VERSION (default: the candidate .nvmrc
+  // pin) so wrong-version fixtures stay hermetic even when the host
+  // Node differs. When nodeMissing is set, no shim is written and the
+  // missing-Node fixture runs with a PATH containing no `node`.
+  const node = `#!/bin/sh
+version="\${FAKE_NODE_VERSION:-22.23.4}"
+case "$1" in
+  --version) printf 'v%s\\n' "$version" ;;
+  *) printf '%s\\n' "$version" ;;
+esac
+exit 0
+`;
   writeFile(path.join(shimDir, "docker"), docker, 0o755);
   writeFile(path.join(shimDir, "helm"), helm, 0o755);
   writeFile(path.join(shimDir, "kubectl"), kubectl, 0o755);
+  if (!nodeMissing) {
+    writeFile(path.join(shimDir, "node"), node, 0o755);
+  }
 }
 
-function makeFixture({ identityOverrides = {}, valuesText = null, dirty = false, realRender = false } = {}) {
+function makeFixture(
+  { identityOverrides = {}, valuesText = null, dirty = false, realRender = false, nvmrcContent = "22.23.4\n", nodeMissing = false } = {},
+) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "ship-deploy-test-"));
   const repo = path.join(base, "repo");
   const shimDir = path.join(base, "shims");
@@ -334,6 +355,9 @@ function makeFixture({ identityOverrides = {}, valuesText = null, dirty = false,
   }
   writeFile(path.join(repo, "deploy/docker/Dockerfile.web"), "FROM scratch\n");
   writeFile(path.join(repo, "deploy/docker/Dockerfile.worker"), "FROM scratch\n");
+  if (nvmrcContent !== null) {
+    writeFile(path.join(repo, "tests/e2e/.nvmrc"), nvmrcContent);
+  }
   git(repo, ["add", "-A"]);
   git(repo, ["commit", "-q", "-m", "test: candidate"]);
   const sha = git(repo, ["rev-parse", "HEAD"]);
@@ -382,7 +406,7 @@ function makeFixture({ identityOverrides = {}, valuesText = null, dirty = false,
   ].join("\n");
   writeFile(path.join(repo, ".private/deploy/non-production-values.yaml"), valuesText ?? defaultValues);
   if (dirty) writeFile(path.join(repo, "dirty.txt"), "uncommitted dirty file that must not enter the build\n");
-  makeShims(shimDir, logFile, { realRender });
+  makeShims(shimDir, logFile, { realRender, nodeMissing });
   return { base, repo, shimDir, logFile, sha };
 }
 
@@ -393,6 +417,38 @@ function runShipDeploy(fixture, args, extraEnv = {}) {
     ...extraEnv,
   };
   return spawnSync("bash", [path.join(fixture.repo, "scripts/ship-deploy"), ...args], {
+    cwd: fixture.repo,
+    env,
+    encoding: "utf8",
+  });
+}
+
+function makeNoNodePath(base) {
+  const dir = path.join(base, "no-node-path");
+  fs.mkdirSync(dir, { recursive: true });
+  // Tools ship-deploy resolves before the Node preflight (provenance
+  // and script-location checks). `node` is deliberately absent so the
+  // preflight exercises the missing-executable failure, not a later
+  // tooling failure.
+  for (const tool of ["git", "cmp", "dirname", "basename"]) {
+    const probe = spawnSync("which", [tool], { encoding: "utf8" });
+    const src = (probe.stdout ?? "").trim().split("\n")[0];
+    assert.ok(src, `${tool} must be on the host PATH to build a no-node PATH`);
+    fs.symlinkSync(src, path.join(dir, tool));
+  }
+  return dir;
+}
+
+function runShipDeployWithPath(fixture, args, pathValue, extraEnv = {}) {
+  const probe = spawnSync("which", ["bash"], { encoding: "utf8" });
+  const bash = (probe.stdout ?? "").trim().split("\n")[0];
+  assert.ok(bash, "bash must be on the host PATH");
+  const env = {
+    ...process.env,
+    PATH: pathValue,
+    ...extraEnv,
+  };
+  return spawnSync(bash, [path.join(fixture.repo, "scripts/ship-deploy"), ...args], {
     cwd: fixture.repo,
     env,
     encoding: "utf8",
@@ -442,6 +498,87 @@ test("ship-deploy happy path deploys the exact candidate and prints only the suc
     assert.match(calls, /helm upgrade --install companion /);
     assert.match(calls, /web\.image\.digest=sha256:aaa/);
     assert.match(calls, /worker\.image\.digest=sha256:bbb/);
+    assertNoLock(fixture);
+  } finally {
+    fs.rmSync(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("ship-deploy blocks wrong Node.js before build/publish/Helm", () => {
+  const fixture = makeFixture();
+  try {
+    const result = runShipDeploy(fixture, [fixture.sha], { FAKE_NODE_VERSION: "20.11.0" });
+    assert.notEqual(result.status, 0, "wrong Node.js must fail");
+    assert.equal(result.stdout, "", "no success line on Node preflight failure");
+    assert.ok(!result.stderr.includes("SHIP_DEPLOYED_SHA="), "success line must not appear on stderr");
+    assert.match(result.stderr, /Node\.js version mismatch/);
+    assert.match(result.stderr, /20\.11\.0/);
+    assert.match(result.stderr, /22\.23\.4/);
+    assert.match(result.stderr, /tests\/e2e\/\.nvmrc/);
+    assert.match(result.stderr, /node --version/);
+    assert.equal(readCalls(fixture), "", "no docker/helm/kubectl shim should be called when Node.js is wrong");
+    assertNoLock(fixture);
+  } finally {
+    fs.rmSync(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("ship-deploy blocks missing Node.js before build/publish/Helm", () => {
+  const fixture = makeFixture({ nodeMissing: true });
+  try {
+    const noNodePath = makeNoNodePath(fixture.base);
+    const result = runShipDeployWithPath(fixture, [fixture.sha], `${fixture.shimDir}:${noNodePath}`);
+    assert.notEqual(result.status, 0, "missing Node.js must fail");
+    assert.equal(result.stdout, "", "no success line on Node preflight failure");
+    assert.ok(!result.stderr.includes("SHIP_DEPLOYED_SHA="), "success line must not appear on stderr");
+    assert.match(result.stderr, /Node\.js not found on PATH/);
+    assert.match(result.stderr, /22\.23\.4/);
+    assert.match(result.stderr, /tests\/e2e\/\.nvmrc/);
+    assert.match(result.stderr, /node --version/);
+    assert.equal(readCalls(fixture), "", "no docker/helm/kubectl shim should be called when Node.js is missing");
+    assertNoLock(fixture);
+  } finally {
+    fs.rmSync(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("ship-deploy blocks missing or invalid candidate .nvmrc before build/publish/Helm", () => {
+  const missing = makeFixture({ nvmrcContent: null });
+  try {
+    const result = runShipDeploy(missing, [missing.sha]);
+    assert.notEqual(result.status, 0, "missing candidate .nvmrc must fail");
+    assert.equal(result.stdout, "", "no success line on missing .nvmrc");
+    assert.match(result.stderr, /missing required path: tests\/e2e\/\.nvmrc/);
+    assert.equal(readCalls(missing), "", "no docker/helm/kubectl shim should be called when .nvmrc is missing");
+    assertNoLock(missing);
+  } finally {
+    fs.rmSync(missing.base, { recursive: true, force: true });
+  }
+  const invalid = makeFixture({ nvmrcContent: "not-a-version\n" });
+  try {
+    const result = runShipDeploy(invalid, [invalid.sha]);
+    assert.notEqual(result.status, 0, "invalid candidate .nvmrc must fail");
+    assert.equal(result.stdout, "", "no success line on invalid .nvmrc");
+    assert.match(result.stderr, /does not pin a valid Node\.js version/);
+    assert.equal(readCalls(invalid), "", "no docker/helm/kubectl shim should be called when .nvmrc is invalid");
+    assertNoLock(invalid);
+  } finally {
+    fs.rmSync(invalid.base, { recursive: true, force: true });
+  }
+});
+
+test("ship-deploy succeeds with the Node.js pinned by the candidate .nvmrc", () => {
+  const fixture = makeFixture({ nvmrcContent: "20.14.0\n" });
+  try {
+    const result = runShipDeploy(fixture, [fixture.sha], { FAKE_NODE_VERSION: "20.14.0" });
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+    assert.equal(result.stdout, `SHIP_DEPLOYED_SHA=${fixture.sha}\n`);
+    assert.ok(!result.stderr.includes("Node.js version mismatch"), "matching candidate pin must not be reported as a mismatch");
+    assert.ok(!result.stderr.includes("Node.js not found on PATH"), "present Node.js must not be reported as missing");
+    const calls = readCalls(fixture);
+    assert.match(calls, /docker build .*localhost:5104\/companion\/web:/, "must build when the candidate pin matches");
+    assert.match(calls, /docker push /, "must publish when the candidate pin matches");
+    assert.match(calls, /helm upgrade --install companion /, "must deploy when the candidate pin matches");
     assertNoLock(fixture);
   } finally {
     fs.rmSync(fixture.base, { recursive: true, force: true });

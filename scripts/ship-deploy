@@ -16,7 +16,12 @@
 #     (shared deadline, time-bounded read-only calls, ownership-chain and
 #     current-revision proof, sole non-deleting pod per workload).
 #   - On success, stdout is exactly one line: SHIP_DEPLOYED_SHA=<SHA>.
-#     Every other diagnostic goes to stderr.
+#     Every other diagnostic goes to stderr. The effective `node` on
+#     the inherited PATH is verified against the candidate's tracked
+#     tests/e2e/.nvmrc before any build, registry publish, Helm, or
+#     cluster mutation; a mismatch or missing `node` blocks with an
+#     actionable diagnostic and never downloads or switches the
+#     runtime automatically.
 #
 # Fixed-target identity: live cluster identity (context, API server,
 # namespace/UID pins, approved registry repositories) is verified against a
@@ -86,9 +91,32 @@ HEAD_SHA="$(git rev-parse HEAD)" || fail "cannot resolve HEAD"
 [[ "$HEAD_SHA" == "$CANDIDATE" ]] || fail "HEAD ($HEAD_SHA) does not equal the candidate ($CANDIDATE); refusing to deploy a moved HEAD"
 # The running script must be byte-identical to the candidate's tracked copy.
 git show "$CANDIDATE:scripts/ship-deploy" 2>/dev/null | cmp -s - "$SCRIPT_PATH" || fail "running scripts/ship-deploy differs from the candidate tree; refusing to deploy with an unverified entry point"
-for required in "package.json" "deploy/helm/companion/Chart.yaml" "deploy/docker/Dockerfile.web" "deploy/docker/Dockerfile.worker" "scripts/test-e2e.mjs"; do
+for required in "package.json" "deploy/helm/companion/Chart.yaml" "deploy/docker/Dockerfile.web" "deploy/docker/Dockerfile.worker" "scripts/test-e2e.mjs" "tests/e2e/.nvmrc"; do
   git cat-file -e "$CANDIDATE:$required" >/dev/null 2>&1 || fail "candidate tree is missing required path: $required"
 done
+
+# --- Node preflight: the effective `node` on the inherited PATH must
+# match the candidate's tracked tests/e2e/.nvmrc before any build,
+# registry publish, Helm, or cluster mutation. The expected version
+# comes from the immutable candidate tree (`git show`), never the
+# working tree. No automatic download or runtime switch: on mismatch
+# or absence this blocks with an actionable diagnostic (stderr) so
+# the operator can select the pinned Node.js and rerun the ship
+# workflow. The E2E runner re-checks the same pin independently.
+EXPECTED_NODE_VERSION_RAW="$(git show "$CANDIDATE:tests/e2e/.nvmrc" 2>/dev/null)" \
+  || fail "candidate tree is missing required path: tests/e2e/.nvmrc"
+EXPECTED_NODE_VERSION="${EXPECTED_NODE_VERSION_RAW//[[:space:]]/}"
+EXPECTED_NODE_VERSION="${EXPECTED_NODE_VERSION#v}"
+[[ "$EXPECTED_NODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+  || fail "candidate tests/e2e/.nvmrc does not pin a valid Node.js version (refusing to build, publish, or mutate the cluster with an unpinned runtime)"
+EFFECTIVE_NODE_PATH="$(command -v node 2>/dev/null)" || EFFECTIVE_NODE_PATH=""
+[[ -n "$EFFECTIVE_NODE_PATH" ]] \
+  || fail "Node.js not found on PATH: candidate pins Node.js $EXPECTED_NODE_VERSION via tests/e2e/.nvmrc. Select the pinned Node.js before rerunning the ship workflow (prepend its bin directory to PATH and verify with 'node --version'); refusing to build, publish, or mutate the cluster with an unpinned Node.js (no automatic download or runtime switch)"
+EFFECTIVE_NODE_VERSION_RAW="$(node --version 2>/dev/null)" || EFFECTIVE_NODE_VERSION_RAW=""
+EFFECTIVE_NODE_VERSION="${EFFECTIVE_NODE_VERSION_RAW//[[:space:]]/}"
+EFFECTIVE_NODE_VERSION="${EFFECTIVE_NODE_VERSION#v}"
+[[ "$EFFECTIVE_NODE_VERSION" == "$EXPECTED_NODE_VERSION" ]] \
+  || fail "Node.js version mismatch: effective node on PATH ($EFFECTIVE_NODE_PATH) reports v${EFFECTIVE_NODE_VERSION:-unknown}, but candidate pins Node.js $EXPECTED_NODE_VERSION via tests/e2e/.nvmrc. Select the pinned Node.js before rerunning the ship workflow (prepend its bin directory to PATH and verify with 'node --version'); refusing to build, publish, or mutate the cluster with an unpinned Node.js (no automatic download or runtime switch)"
 
 # --- Tooling: approved local build/deploy tools must already exist. ---
 for tool in git docker helm kubectl python3 tar cmp mktemp timeout sleep date; do
