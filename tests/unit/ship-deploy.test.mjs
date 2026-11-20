@@ -20,6 +20,24 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..", "..");
 const REAL_SHIP_DEPLOY = fs.readFileSync(path.join(repoRoot, "scripts", "ship-deploy"));
 
+// The real-render regression fixtures delegate `helm template` to the
+// local Helm binary against the repository's real Companion chart.
+// Helm templating is a local render (no cluster, registry, or network),
+// but the binary must exist; real-render tests skip cleanly when it
+// does not. The fabricated shim path never consults this.
+const REAL_HELM = (() => {
+  const probe = spawnSync(process.platform === "win32" ? "where" : "which", ["helm"], {
+    encoding: "utf8",
+  });
+  if (probe.status === 0 && probe.stdout.trim()) {
+    return probe.stdout.trim().split("\n")[0];
+  }
+  for (const candidate of ["/usr/bin/helm", "/usr/local/bin/helm", "/opt/homebrew/bin/helm"]) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+})();
+
 const WEB_DIGEST = `sha256:${"a".repeat(64)}`;
 const WORKER_DIGEST = `sha256:${"b".repeat(64)}`;
 const KUBE_SYSTEM_UID = "11111111-1111-4111-8111-111111111111";
@@ -37,7 +55,7 @@ function writeFile(file, content, mode) {
   if (mode !== undefined) fs.chmodSync(file, mode);
 }
 
-function makeShims(shimDir, logFile) {
+function makeShims(shimDir, logFile, { realRender = false } = {}) {
   const docker = `#!/bin/sh
 echo "docker $*" >> "${logFile}"
 case "$1" in
@@ -74,21 +92,14 @@ JSON
 esac
 exit 4
 `;
-  const helm = `#!/bin/sh
-echo "helm $*" >> "${logFile}"
-case "$1" in
-  list)
-    cat <<JSON
-[{"name":"companion","namespace":"companion-np","chart":"companion-0.1.0","status":"deployed"}]
-JSON
-    exit 0 ;;
-  template)
-    # Chart directory is the 3rd argument (helm template <release> <chart> ...);
-    # it must be inside the candidate archive source.
-    chart="$3"
-    case "$chart" in */source/deploy/helm/companion) ;; *) echo "chart is not from the candidate archive: $chart" >&2; exit 8 ;; esac
-    if [ ! -f "$chart/Chart.yaml" ]; then echo "candidate chart missing" >&2; exit 8; fi
-    web_digest=""; worker_digest=""
+  // Fabricated render for the hermetic fixtures. It deliberately
+  // mirrors the real chart's rendered shape: Deployments omit
+  // metadata.namespace (applied into the `-n` release namespace) and
+  // only the web Deployment carries COMPANION_* / WEB_TEST_GATE_* env.
+  // The real-render fixtures instead run the local Helm binary against
+  // the repository chart (see makeFixture realRender) and may then
+  // mutate the rendered YAML via FAKE_RENDER_MUTATION.
+  const fabricatedBranch = `    web_digest=""; worker_digest=""
     for a in "$@"; do
       case "$a" in web.image.digest=*) web_digest="\${a#web.image.digest=}" ;; worker.image.digest=*) worker_digest="\${a#worker.image.digest=}" ;; esac
     done
@@ -98,7 +109,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: companion-web
-  namespace: companion-np
 spec:
   template:
     spec:
@@ -117,7 +127,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: companion-worker
-  namespace: companion-np
 spec:
   template:
     spec:
@@ -125,11 +134,84 @@ spec:
         - name: worker
           image: "localhost:5104/companion/worker@$worker_digest"
           env:
-            - name: COMPANION_DEPLOYMENT_PURPOSE
-              value: "non-production"
-            - name: COMPANION_DEPLOYMENT_NAMESPACE
-              value: "companion-np"
-YAML
+            - name: WORKER_HTTP_PORT
+              value: "8080"
+YAML`;
+  const realBranch = `    rendered="$(mktemp)"
+    if ! "${REAL_HELM}" "$@" > "$rendered" 2>&1; then
+      cat -- "$rendered" >&2
+      rm -f -- "$rendered"
+      exit 8
+    fi
+    mutation="\${FAKE_RENDER_MUTATION:-}"
+    if [ -n "$mutation" ]; then
+      python3 - "$rendered" "$mutation" <<'MUTPYEOF' || { rm -f -- "$rendered"; exit 8; }
+import sys
+import yaml
+path, mutation = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as handle:
+    docs = [d for d in yaml.safe_load_all(handle) if d]
+def deps(suffix):
+    return [d for d in docs if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith(suffix)]
+def web_envs():
+    return deps("-web")[0]["spec"]["template"]["spec"]["containers"][0]["env"]
+def set_env(name, value):
+    for entry in web_envs():
+        if entry["name"] == name:
+            entry["value"] = value
+            return
+    web_envs().append({"name": name, "value": value})
+def drop_env(name):
+    deps("-web")[0]["spec"]["template"]["spec"]["containers"][0]["env"] = [e for e in web_envs() if e["name"] != name]
+if mutation == "explicit-good-namespace":
+    for suffix in ("-web", "-worker"):
+        deps(suffix)[0]["metadata"]["namespace"] = "companion-np"
+elif mutation == "explicit-bad-namespace":
+    for suffix in ("-web", "-worker"):
+        deps(suffix)[0]["metadata"]["namespace"] = "companion-prod"
+elif mutation == "explicit-empty-namespace":
+    for suffix in ("-web", "-worker"):
+        deps(suffix)[0]["metadata"]["namespace"] = ""
+elif mutation == "web-purpose-missing":
+    drop_env("COMPANION_DEPLOYMENT_PURPOSE")
+elif mutation == "web-purpose-wrong":
+    set_env("COMPANION_DEPLOYMENT_PURPOSE", "production")
+elif mutation == "web-namespace-missing":
+    drop_env("COMPANION_DEPLOYMENT_NAMESPACE")
+elif mutation == "web-namespace-wrong":
+    set_env("COMPANION_DEPLOYMENT_NAMESPACE", "companion-prod")
+elif mutation == "web-gate-missing":
+    drop_env("WEB_TEST_GATE_ENABLED")
+elif mutation == "web-gate-wrong":
+    set_env("WEB_TEST_GATE_ENABLED", "false")
+elif mutation == "image-mismatch":
+    container = deps("-web")[0]["spec"]["template"]["spec"]["containers"][0]
+    repo = container["image"].split("@", 1)[0]
+    container["image"] = repo + "@sha256:" + "c" * 64
+else:
+    print(f"unknown FAKE_RENDER_MUTATION: {mutation}", file=sys.stderr)
+    sys.exit(8)
+with open(path, "w", encoding="utf-8") as handle:
+    yaml.safe_dump_all(docs, handle, sort_keys=False)
+MUTPYEOF
+    fi
+    cat -- "$rendered"
+    rm -f -- "$rendered"`;
+  const helm = `#!/bin/sh
+echo "helm $*" >> "${logFile}"
+case "$1" in
+  list)
+    cat <<JSON
+[{"name":"companion","namespace":"companion-np","chart":"companion-0.1.0","status":"deployed"}]
+JSON
+    exit 0 ;;
+  template)
+    # Chart directory is the 3rd argument (helm template <release> <chart> ...);
+    # it must be inside the candidate archive source.
+    chart="$3"
+    case "$chart" in */source/deploy/helm/companion) ;; *) echo "chart is not from the candidate archive: $chart" >&2; exit 8 ;; esac
+    if [ ! -f "$chart/Chart.yaml" ]; then echo "candidate chart missing" >&2; exit 8; fi
+${realRender ? realBranch : fabricatedBranch}
     exit 0 ;;
   upgrade)
     if [ "\${FAKE_HELM_FAIL:-}" = "1" ]; then echo "fake helm upgrade failure" >&2; exit 9; fi
@@ -186,7 +268,7 @@ exit 4
   writeFile(path.join(shimDir, "kubectl"), kubectl, 0o755);
 }
 
-function makeFixture({ identityOverrides = {}, valuesText = null, dirty = false } = {}) {
+function makeFixture({ identityOverrides = {}, valuesText = null, dirty = false, realRender = false } = {}) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "ship-deploy-test-"));
   const repo = path.join(base, "repo");
   const shimDir = path.join(base, "shims");
@@ -201,7 +283,18 @@ function makeFixture({ identityOverrides = {}, valuesText = null, dirty = false 
   writeFile(path.join(repo, "scripts/ship-deploy"), REAL_SHIP_DEPLOY, 0o755);
   writeFile(path.join(repo, "scripts/test-e2e.mjs"), "// fixture runner\n");
   writeFile(path.join(repo, "package.json"), '{"name":"fixture"}\n');
-  writeFile(path.join(repo, "deploy/helm/companion/Chart.yaml"), "apiVersion: v2\nname: companion\nversion: 0.1.0\n");
+  if (realRender) {
+    // Commit the repository's real chart so the immutable candidate
+    // archive carries the production templates; the helm shim then
+    // renders that chart with the local Helm binary. The fixture
+    // values below are non-secret placeholders (existing-Secret names
+    // are references only; no Secret values are ever supplied).
+    fs.cpSync(path.join(repoRoot, "deploy", "helm", "companion"), path.join(repo, "deploy", "helm", "companion"), {
+      recursive: true,
+    });
+  } else {
+    writeFile(path.join(repo, "deploy/helm/companion/Chart.yaml"), "apiVersion: v2\nname: companion\nversion: 0.1.0\n");
+  }
   writeFile(path.join(repo, "deploy/docker/Dockerfile.web"), "FROM scratch\n");
   writeFile(path.join(repo, "deploy/docker/Dockerfile.worker"), "FROM scratch\n");
   git(repo, ["add", "-A"]);
@@ -220,6 +313,10 @@ function makeFixture({ identityOverrides = {}, valuesText = null, dirty = false 
     ...identityOverrides,
   };
   writeFile(path.join(repo, ".private/deploy/ship-target-identity.json"), `${JSON.stringify(identity, null, 2)}\n`, 0o600);
+  // Synthetic non-secret values. The extra web/worker fields are
+  // required only by the real chart render (realRender fixtures); the
+  // values-parse stage in ship-deploy ignores them, so the fabricated
+  // fixtures behave identically with or without them.
   const defaultValues = [
     "deployment:",
     "  purpose: non-production",
@@ -227,18 +324,28 @@ function makeFixture({ identityOverrides = {}, valuesText = null, dirty = false 
     "web:",
     "  image:",
     "    repository: localhost:5104/companion/web",
+    "  ingress:",
+    "    host: app.example.com",
+    "  env:",
+    '    WEB_PUBLIC_URL: "https://companion.example.com"',
+    '    WEB_OIDC_ISSUER_URL: "https://keycloak.example.com/realms/companion"',
+    '    WEB_OIDC_CLIENT_ID: "companion-web"',
+    '    WEB_OWNER_SUBJECTS: "owner-subject"',
+    "  existingSecret: web-secrets",
     "  testGate:",
     "    enabled: true",
     "    port: 3100",
+    "    existingSecret: web-test-gate-secrets",
     "worker:",
     "  enabled: true",
     "  image:",
     "    repository: localhost:5104/companion/worker",
+    "  existingSecret: worker-secrets",
     "",
   ].join("\n");
   writeFile(path.join(repo, ".private/deploy/non-production-values.yaml"), valuesText ?? defaultValues);
   if (dirty) writeFile(path.join(repo, "dirty.txt"), "uncommitted dirty file that must not enter the build\n");
-  makeShims(shimDir, logFile);
+  makeShims(shimDir, logFile, { realRender });
   return { base, repo, shimDir, logFile, sha };
 }
 
@@ -388,3 +495,85 @@ test("ship-deploy blocks on cluster identity mismatch, registry tag reuse, and v
     fs.rmSync(badValues.base, { recursive: true, force: true });
   }
 });
+
+// --- Real-chart render regression -------------------------------
+// The fixtures above fabricate their rendered YAML. These cases run
+// the repository's real Companion chart through the local Helm
+// binary, guarding the shape the production chart actually renders:
+// Deployments omit metadata.namespace, and only the web workload
+// carries the deployment-purpose attestation and the test-entry gate.
+// The pre-fix guard required an explicit companion-np namespace and
+// worker COMPANION_* markers, so it rejected every real render after
+// the images were pushed and before the Helm upgrade.
+
+test(
+  "ship-deploy accepts the real Helm-rendered chart (omitted namespaces, web-only markers)",
+  { skip: !REAL_HELM },
+  () => {
+    const fixture = makeFixture({ realRender: true });
+    try {
+      const result = runShipDeploy(fixture, [fixture.sha]);
+      assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+      assert.equal(result.stdout, `SHIP_DEPLOYED_SHA=${fixture.sha}\n`);
+      assert.match(readCalls(fixture), /helm template companion /);
+      assert.match(readCalls(fixture), /helm upgrade --install companion /);
+    } finally {
+      fs.rmSync(fixture.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "ship-deploy accepts explicit companion-np namespaces in the real render",
+  { skip: !REAL_HELM },
+  () => {
+    const fixture = makeFixture({ realRender: true });
+    try {
+      const result = runShipDeploy(fixture, [fixture.sha], {
+        FAKE_RENDER_MUTATION: "explicit-good-namespace",
+      });
+      assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+      assert.equal(result.stdout, `SHIP_DEPLOYED_SHA=${fixture.sha}\n`);
+    } finally {
+      fs.rmSync(fixture.base, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "ship-deploy rejects conflicting/invalid namespaces, degraded web markers, and image mismatch in the real render",
+  { skip: !REAL_HELM },
+  () => {
+    for (const mutation of [
+      "explicit-bad-namespace",
+      "explicit-empty-namespace",
+      "web-purpose-missing",
+      "web-purpose-wrong",
+      "web-namespace-missing",
+      "web-namespace-wrong",
+      "web-gate-missing",
+      "web-gate-wrong",
+      "image-mismatch",
+    ]) {
+      const fixture = makeFixture({ realRender: true });
+      try {
+        const result = runShipDeploy(fixture, [fixture.sha], { FAKE_RENDER_MUTATION: mutation });
+        assert.notEqual(result.status, 0, `mutation ${mutation} must fail`);
+        assert.ok(!result.stdout.includes("SHIP_DEPLOYED_SHA="), `mutation ${mutation} must not print success`);
+        assert.match(result.stderr, /rendered candidate chart does not match/);
+        const calls = readCalls(fixture);
+        assert.match(calls, /helm template companion /, `mutation ${mutation} must reach the render check`);
+        assert.ok(
+          !calls.includes("helm upgrade"),
+          `mutation ${mutation} must fail before the Helm upgrade (pre-Helm failure)`,
+        );
+        assert.ok(
+          !fs.existsSync(path.join(fixture.repo, ".git/ship-deploy.lock")),
+          `mutation ${mutation} is a pre-Helm failure and must remove the lock`,
+        );
+      } finally {
+        fs.rmSync(fixture.base, { recursive: true, force: true });
+      }
+    }
+  },
+);

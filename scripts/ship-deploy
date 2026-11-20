@@ -457,14 +457,30 @@ if web["spec"]["template"]["spec"]["containers"][0]["image"] != f"{web_repo}@{we
 if worker["spec"]["template"]["spec"]["containers"][0]["image"] != f"{worker_repo}@{worker_digest}":
     sys.exit(1)
 for d in (web, worker):
-    if d["metadata"].get("namespace") != "companion-np":
+    # Helm/Kubernetes namespace semantics: a namespaced manifest that
+    # omits metadata.namespace is applied into the Helm release
+    # namespace. Both the render (`helm template -n`) and the upgrade
+    # (`helm upgrade -n`, below) use the fixed $NAMESPACE
+    # (companion-np), whose UID and release already passed
+    # cluster-identity verification, so an omitted namespace on either
+    # Deployment is effective companion-np. An explicit namespace is
+    # only safe when it is exactly companion-np; anything else — a
+    # conflicting namespace, an empty string, or a non-string value —
+    # must block before the upgrade starts.
+    rendered_ns = d["metadata"].get("namespace")
+    if rendered_ns is not None and (not isinstance(rendered_ns, str) or rendered_ns != "companion-np"):
         sys.exit(1)
-    env = {e["name"]: e.get("value") for e in d["spec"]["template"]["spec"]["containers"][0]["env"] if "value" in e}
-    if env.get("COMPANION_DEPLOYMENT_PURPOSE") != "non-production":
-        sys.exit(1)
-    if env.get("COMPANION_DEPLOYMENT_NAMESPACE") != "companion-np":
-        sys.exit(1)
+# The chart carries the deployment-purpose attestation and the enabled
+# test-entry gate on the web workload only: the worker chart renders no
+# COMPANION_* markers, so the worker must not be required to carry
+# them. The web markers are required exactly, and the gate must be
+# enabled — the degraded render (missing/wrong markers, disabled gate)
+# must never upgrade.
 web_env = {e["name"]: e.get("value") for e in web["spec"]["template"]["spec"]["containers"][0]["env"] if "value" in e}
+if web_env.get("COMPANION_DEPLOYMENT_PURPOSE") != "non-production":
+    sys.exit(1)
+if web_env.get("COMPANION_DEPLOYMENT_NAMESPACE") != "companion-np":
+    sys.exit(1)
 if web_env.get("WEB_TEST_GATE_ENABLED") != "true":
     sys.exit(1)
 PYEOF
