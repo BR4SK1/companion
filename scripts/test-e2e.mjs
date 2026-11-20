@@ -16,17 +16,13 @@
  *   - SHIP_TARGET_SHA == SHIP_DEPLOYED_SHA == the 40-hex candidate SHA,
  *     HEAD == that SHA, and a clean working tree (local suites build from
  *     the working tree, so it must be the candidate).
- *   - SHIP_DEPLOY_EXCLUSIVE_WINDOW=1, confirming the owner-coordinated
- *     exclusive window (Cal asks the user). The local ship lock does not
- *     prove all-writer exclusivity; this flag records operator coordination
- *     and is required before any deployed smoke send.
- *   - The ship lock handoff (.git/ship-deploy.lock, phase "deployed") from
- *     a successful ship-deploy for the same SHA, with matching digests and
- *     pod names. The runner adopts that lock for the whole E2E run so a
- *     concurrent candidate cannot deploy over the deployment under test.
- *     The lock only serializes ship entry points on this host; it does not
- *     enforce exclusivity against manual writers (hence the exclusive
- *     window requirement above).
+ *   - No Ship lock: this runner consults no lock file and requires no
+ *     reservation gate. It has no replacement reservation or lock. The
+ *     expected immutable full-SHA image tags are resolved independently
+ *     here at the same fixed registry (from the trusted identity pins),
+ *     verified against both deployed Deployment spec images and live pod
+ *     runtime digests, and the exact verified pod names and UIDs are
+ *     captured in memory at run start and rechecked through the run.
  *   - The trusted local identity pins and local-only values file used by
  *     ship-deploy, verified again here against the live cluster before any
  *     test runs. Identity values are never printed.
@@ -43,7 +39,8 @@
  *     service; fails without its configured URL).
  *   Deployed suite (exact candidate in companion-np):
  *     deployed-smoke (guarded normal-use smoke through the loopback gate,
- *     pinned to the lock's pods/digests, retaining its synthetic history).
+ *     pinned to the in-memory verified pods/digests, retaining its
+ *     synthetic history).
  *   Explicitly not run (by repository safety rules, not by omission):
  *     the database-backed integration suites under tests/integration are
  *     destructive/disposable-only tools, not routine ship gates. They are
@@ -66,6 +63,7 @@ import { fileURLToPath } from "node:url";
 
 export const SHA_RE = /^[0-9a-f]{40}$/;
 export const DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
+export const UID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 export const PINNED_NODE = "22.23.4";
 export const NAMESPACE = "companion-np";
 export const RELEASE = "companion";
@@ -102,34 +100,23 @@ export function validateShipEnv(env) {
   if (target !== deployed) {
     throw new Error(`SHIP_TARGET_SHA (${target}) does not equal SHIP_DEPLOYED_SHA (${deployed}); refusing to run E2E against an unpinned deployment`);
   }
-  if (env.SHIP_DEPLOY_EXCLUSIVE_WINDOW !== "1") {
-    throw new Error(
-      "requires SHIP_DEPLOY_EXCLUSIVE_WINDOW=1 confirming the owner-coordinated exclusive window for companion-np (Cal must ask the user; the local lock alone does not prove exclusivity)",
-    );
-  }
   return { sha: target };
 }
 
-export function validateLockOwner(owner) {
-  if (owner === null || typeof owner !== "object" || Array.isArray(owner)) {
-    throw new Error("ship lock owner record is not an object");
+export function validateVerifiedBaseline(baseline) {
+  if (baseline === null || typeof baseline !== "object" || Array.isArray(baseline)) {
+    throw new Error("verified baseline is not an object");
   }
-  if (!SHA_RE.test(String(owner.sha ?? ""))) {
-    throw new Error("ship lock owner SHA is not a 40-hex SHA");
+  if (!DIGEST_RE.test(String(baseline.webDigest ?? "")) || !DIGEST_RE.test(String(baseline.workerDigest ?? ""))) {
+    throw new Error("verified baseline digests are missing or invalid");
   }
-  if (owner.phase !== "deployed") {
-    throw new Error(`ship lock phase is ${String(owner.phase ?? "missing")}, expected "deployed" (ship-deploy must have succeeded for this candidate first)`);
+  if (typeof baseline.webPod !== "string" || !baseline.webPod || typeof baseline.workerPod !== "string" || !baseline.workerPod) {
+    throw new Error("verified baseline pod names are missing");
   }
-  if (owner.namespace !== NAMESPACE || owner.release !== RELEASE) {
-    throw new Error("ship lock namespace/release do not match the predetermined non-production target");
+  if (!UID_RE.test(String(baseline.webPodUid ?? "")) || !UID_RE.test(String(baseline.workerPodUid ?? ""))) {
+    throw new Error("verified baseline pod UIDs are missing or invalid");
   }
-  if (!DIGEST_RE.test(String(owner.webDigest ?? "")) || !DIGEST_RE.test(String(owner.workerDigest ?? ""))) {
-    throw new Error("ship lock digests are missing or invalid");
-  }
-  if (typeof owner.webPod !== "string" || !owner.webPod || typeof owner.workerPod !== "string" || !owner.workerPod) {
-    throw new Error("ship lock pod names are missing");
-  }
-  return owner;
+  return baseline;
 }
 
 export function digestFromImageId(imageId) {
@@ -140,20 +127,241 @@ export function digestFromImageId(imageId) {
   return DIGEST_RE.test(digest) ? digest : null;
 }
 
-export function pidStarttime(pid) {
-  try {
-    const stat = fs.readFileSync(`/proc/${String(pid)}/stat`, "utf8");
-    const after = stat.slice(stat.lastIndexOf(")") + 2);
-    return after.split(" ")[19] ?? "gone";
-  } catch {
-    return "gone";
+/**
+ * Strict live-pod check against the in-memory verified baseline captured
+ * at E2E start: the pod must be exactly that pod (name AND UID), not
+ * terminating, Running and Ready, carrying exactly one named
+ * container/status pair running the digest-pinned candidate image. Error
+ * messages are predicate-only and never echo pod names or UIDs. Exported
+ * for hermetic unit tests; the baseline recheck delegates here after
+ * selecting the sole match.
+ */
+export function checkLivePod(pod, name, digest, expectedPod, expectedPodUid, expectedImage) {
+  if (pod?.metadata?.name !== expectedPod) {
+    throw new Error(`${name} pod is not the pod verified at E2E start; refusing to run E2E against a different pod`);
   }
+  if (pod?.metadata?.uid !== expectedPodUid) {
+    throw new Error(`${name} pod UID does not match the pod verified at E2E start; refusing to run E2E against a replacement pod`);
+  }
+  if (pod?.metadata?.deletionTimestamp) throw new Error(`${name} pod is terminating`);
+  if (pod?.status?.phase !== "Running") throw new Error(`${name} pod is not Running`);
+  const containers = pod?.spec?.containers;
+  if (!Array.isArray(containers) || containers.length !== 1 || containers[0]?.name !== name) {
+    throw new Error(`${name} pod does not carry exactly one ${name} container`);
+  }
+  const statuses = pod?.status?.containerStatuses;
+  if (!Array.isArray(statuses) || statuses.length !== 1 || statuses[0]?.name !== name) {
+    throw new Error(`${name} pod does not carry exactly one ${name} container status`);
+  }
+  if (statuses[0]?.ready !== true) throw new Error(`${name} pod is not Ready`);
+  if (digestFromImageId(statuses[0]?.imageID) !== digest) throw new Error(`${name} pod image digest does not match the deployed candidate digest`);
+  if (containers[0]?.image !== expectedImage) {
+    throw new Error(`${name} pod image reference does not match the digest-pinned candidate image`);
+  }
+  return pod;
 }
 
-export function isPidLive(pid, starttime) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  const current = pidStarttime(pid);
-  return current !== "gone" && String(starttime) !== "gone" && current === String(starttime);
+/**
+ * Build the registry manifest URL for an immutable full-SHA tag.
+ * Pure and exported for hermetic tests. Loopback registries use `http`;
+ * all other hosts use `https`. The host comes from the trusted identity
+ * pins, never from the live cluster, so the expected digest is never
+ * inferred from a live pod.
+ */
+export function registryManifestUrl(repo, sha) {
+  if (typeof repo !== "string" || !repo || /\s/.test(repo) || repo.includes("@") || repo.includes("://")) {
+    throw new Error("registry repository is missing or invalid");
+  }
+  const slash = repo.indexOf("/");
+  if (slash === -1) throw new Error("registry repository is missing or invalid");
+  const host = repo.slice(0, slash);
+  const name = repo.slice(slash + 1);
+  if (!host || !name || name.endsWith("/") || name.startsWith("/") || name.includes("..")) {
+    throw new Error("registry repository is missing or invalid");
+  }
+  if (!/^[A-Za-z0-9._-]+(:\d+)?$/.test(host) && !/^\[[0-9A-Fa-f:.]+\](:\d+)?$/.test(host)) {
+    throw new Error("registry repository is missing or invalid");
+  }
+  if (!SHA_RE.test(String(sha ?? ""))) throw new Error("candidate SHA is not a 40-hex SHA");
+  const hostname = host.replace(/:\d+$/, "").replace(/^\[/, "").replace(/\]$/, "");
+  const isLoopback =
+    hostname === "localhost" ||
+    hostname.endsWith(".localhost") ||
+    hostname === "127.0.0.1" ||
+    /^127\.\d+\.\d+\.\d+$/.test(hostname) ||
+    hostname === "::1";
+  const scheme = isLoopback ? "http" : "https";
+  return `${scheme}://${host}/v2/${name}/manifests/${sha}`;
+}
+
+/**
+ * Resolve one expected digest independently from the registry for the
+ * immutable full-SHA tag. Read-only manifest lookup; any failure is
+ * fail-closed and never falls back to a live-pod value. Exported with an
+ * injectable fetch for hermetic tests.
+ */
+export async function resolveRegistryDigest(repo, sha, { fetchImpl = globalThis.fetch, timeoutMs = 15_000 } = {}) {
+  const url = registryManifestUrl(repo, sha);
+  if (typeof fetchImpl !== "function") {
+    throw new Error("cannot resolve the expected image digest from the registry for the candidate (refusing to infer it from the live pod)");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      headers: {
+        Accept:
+          "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json",
+      },
+      signal: controller.signal,
+    });
+  } catch {
+    throw new Error("cannot resolve the expected image digest from the registry for the candidate (refusing to infer it from the live pod)");
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!response || response.ok !== true) {
+    throw new Error("cannot resolve the expected image digest from the registry for the candidate (refusing to infer it from the live pod)");
+  }
+  let digest = null;
+  try {
+    digest = response.headers?.get?.("docker-content-digest") ?? response.headers?.get?.("Docker-Content-Digest");
+  } catch {
+    digest = null;
+  }
+  if (!digest || !DIGEST_RE.test(String(digest))) {
+    throw new Error("cannot resolve the expected image digest from the registry for the candidate (refusing to infer it from the live pod)");
+  }
+  try {
+    await response.text?.();
+  } catch {
+    // Body is intentionally discarded; only the validated digest header matters.
+  }
+  return String(digest);
+}
+
+/**
+ * Resolve both expected digests at the fixed registry for the candidate.
+ * Both repos come from the trusted identity pins. Any failure blocks the
+ * run before any test step executes.
+ */
+export async function resolveExpectedDigests(pins, sha, options = {}) {
+  const repos = pins?.registryRepositories;
+  if (!repos || typeof repos !== "object" || Array.isArray(repos)) {
+    throw new Error("cannot resolve expected digests without the fixed registry repositories (refusing to infer them from the live pod)");
+  }
+  let webDigest;
+  try {
+    webDigest = await resolveRegistryDigest(repos.web, sha, options);
+  } catch {
+    throw new Error("cannot resolve the expected web image digest from the registry for the candidate (refusing to infer it from the live pod)");
+  }
+  let workerDigest;
+  try {
+    workerDigest = await resolveRegistryDigest(repos.worker, sha, options);
+  } catch {
+    throw new Error("cannot resolve the expected worker image digest from the registry for the candidate (refusing to infer it from the live pod)");
+  }
+  return { webDigest, workerDigest };
+}
+
+/** Verify a Deployment spec carries exactly the digest-pinned candidate image. */
+export function checkDeploymentSpec(deploy, containerName, expectedImage) {
+  const containers = deploy?.spec?.template?.spec?.containers;
+  if (!Array.isArray(containers) || containers.length !== 1 || containers[0]?.name !== containerName) {
+    throw new Error(`${containerName} deployment does not carry exactly one ${containerName} container`);
+  }
+  if (containers[0]?.image !== expectedImage) {
+    throw new Error(`${containerName} deployment spec image does not match the registry-resolved candidate digest`);
+  }
+  return deploy;
+}
+
+/** Select the sole workload pod for one workload label. */
+export function selectSoleWorkloadPod(pods, name) {
+  const matches = (Array.isArray(pods) ? pods : []).filter(
+    (p) => p?.metadata?.labels?.["app.kubernetes.io/name"] === name && p?.metadata?.labels?.["app.kubernetes.io/instance"] === RELEASE,
+  );
+  if (matches.length !== 1) throw new Error(`expected exactly one ${name} pod in ${NAMESPACE}, found ${matches.length}`);
+  return matches[0];
+}
+
+/**
+ * Capture the in-memory verified baseline at E2E start. Digests come
+ * only from the registry (`expected`); pod names/UIDs are captured here
+ * only after both Deployment specs and pod runtimes prove those
+ * digests. Never persists anything to disk. Pure for hermetic tests.
+ */
+export function captureVerifiedBaseline({ pods, webDeploy, workerDeploy }, pins, expected) {
+  if (!DIGEST_RE.test(String(expected?.webDigest ?? "")) || !DIGEST_RE.test(String(expected?.workerDigest ?? ""))) {
+    throw new Error("expected registry digests are missing or invalid");
+  }
+  const webRepo = pins?.registryRepositories?.web;
+  const workerRepo = pins?.registryRepositories?.worker;
+  if (!webRepo || !workerRepo) {
+    throw new Error("cannot verify the live deployment without the fixed registry repositories");
+  }
+  checkDeploymentSpec(webDeploy, "web", `${webRepo}@${expected.webDigest}`);
+  checkDeploymentSpec(workerDeploy, "worker", `${workerRepo}@${expected.workerDigest}`);
+  const webPod = selectSoleWorkloadPod(pods, "web");
+  const workerPod = selectSoleWorkloadPod(pods, "worker");
+  const capturePod = (pod, name, digest, expectedImage) => {
+    if (pod?.metadata?.deletionTimestamp) throw new Error(`${name} pod is terminating`);
+    if (pod?.status?.phase !== "Running") throw new Error(`${name} pod is not Running`);
+    const podName = pod?.metadata?.name;
+    const podUid = pod?.metadata?.uid;
+    if (typeof podName !== "string" || !podName) throw new Error(`${name} pod name is missing`);
+    if (!UID_RE.test(String(podUid ?? ""))) throw new Error(`${name} pod UID is missing or invalid`);
+    const containers = pod?.spec?.containers;
+    if (!Array.isArray(containers) || containers.length !== 1 || containers[0]?.name !== name) {
+      throw new Error(`${name} pod does not carry exactly one ${name} container`);
+    }
+    const statuses = pod?.status?.containerStatuses;
+    if (!Array.isArray(statuses) || statuses.length !== 1 || statuses[0]?.name !== name) {
+      throw new Error(`${name} pod does not carry exactly one ${name} container status`);
+    }
+    if (statuses[0]?.ready !== true) throw new Error(`${name} pod is not Ready`);
+    if (digestFromImageId(statuses[0]?.imageID) !== digest) {
+      throw new Error(`${name} pod image digest does not match the registry-resolved candidate digest`);
+    }
+    if (containers[0]?.image !== expectedImage) {
+      throw new Error(`${name} pod image reference does not match the digest-pinned candidate image`);
+    }
+    return { podName, podUid };
+  };
+  const web = capturePod(webPod, "web", expected.webDigest, `${webRepo}@${expected.webDigest}`);
+  const worker = capturePod(workerPod, "worker", expected.workerDigest, `${workerRepo}@${expected.workerDigest}`);
+  return validateVerifiedBaseline({
+    webDigest: expected.webDigest,
+    workerDigest: expected.workerDigest,
+    webPod: web.podName,
+    webPodUid: web.podUid,
+    workerPod: worker.podName,
+    workerPodUid: worker.podUid,
+  });
+}
+
+/**
+ * Recheck the live deployment against the same in-memory baseline after
+ * the suites (and through the run via the smoke pin). Any pod
+ * replacement (name or UID), spec drift, or digest drift fails closed.
+ * Pure for hermetic tests.
+ */
+export function assertBaselineCurrent(baseline, { pods, webDeploy, workerDeploy }, pins) {
+  validateVerifiedBaseline(baseline);
+  const webRepo = pins?.registryRepositories?.web;
+  const workerRepo = pins?.registryRepositories?.worker;
+  if (!webRepo || !workerRepo) {
+    throw new Error("cannot verify the live deployment without the fixed registry repositories");
+  }
+  checkDeploymentSpec(webDeploy, "web", `${webRepo}@${baseline.webDigest}`);
+  checkDeploymentSpec(workerDeploy, "worker", `${workerRepo}@${baseline.workerDigest}`);
+  const webPod = selectSoleWorkloadPod(pods, "web");
+  const workerPod = selectSoleWorkloadPod(pods, "worker");
+  checkLivePod(webPod, "web", baseline.webDigest, baseline.webPod, baseline.webPodUid, `${webRepo}@${baseline.webDigest}`);
+  checkLivePod(workerPod, "worker", baseline.workerDigest, baseline.workerPod, baseline.workerPodUid, `${workerRepo}@${baseline.workerDigest}`);
+  return baseline;
 }
 
 /** Run a command, capturing stdout (trimmed). Throws on non-zero exit. */
@@ -220,11 +428,7 @@ function repoRoot() {
   return fromFile;
 }
 
-function gitDir(root) {
-  return runCaptured("git", ["rev-parse", "--absolute-git-dir"], { cwd: root });
-}
-
-function verifyLiveDeployment(root, pins, lock) {
+function verifyClusterIdentity(root, pins) {
   const context = runCaptured("kubectl", ["config", "current-context"], { cwd: root });
   if (context !== pins.context) throw new Error("kubectl context does not match the fixed identity pin");
   const kubeSystemUid = runCaptured("kubectl", ["get", "namespace", "kube-system", "-o", "jsonpath={.metadata.uid}"], { cwd: root });
@@ -234,31 +438,17 @@ function verifyLiveDeployment(root, pins, lock) {
   if (ns?.metadata?.uid !== pins.namespaceUid || ns?.status?.phase !== "Active") {
     throw new Error("non-production namespace does not match the fixed identity pin");
   }
-  const podsRaw = runCaptured("kubectl", ["get", "pods", "-n", NAMESPACE, "-o", "json"], { cwd: root });
-  const pods = JSON.parse(podsRaw)?.items ?? [];
-  const checkPod = (name, digest, expectedPod) => {
-    const matches = pods.filter(
-      (p) => p?.metadata?.labels?.["app.kubernetes.io/name"] === name && p?.metadata?.labels?.["app.kubernetes.io/instance"] === RELEASE,
-    );
-    if (matches.length !== 1) throw new Error(`expected exactly one ${name} pod in ${NAMESPACE}, found ${matches.length}`);
-    const pod = matches[0];
-    if (pod.metadata.name !== expectedPod) {
-      throw new Error(`${name} pod is ${pod.metadata.name}, not the pod verified at deploy time (${expectedPod}); refusing to run E2E against a different pod`);
-    }
-    if (pod.status?.phase !== "Running") throw new Error(`${name} pod is not Running`);
-    const status = pod.status?.containerStatuses?.[0];
-    if (status?.ready !== true) throw new Error(`${name} pod is not Ready`);
-    if (digestFromImageId(status?.imageID) !== digest) throw new Error(`${name} pod image digest does not match the deployed candidate digest`);
-    if (pod.spec?.containers?.[0]?.image !== `${pins.registryRepositories[name]}@${digest}`) {
-      throw new Error(`${name} pod image reference does not match the digest-pinned candidate image`);
-    }
-  };
-  checkPod("web", lock.webDigest, lock.webPod);
-  checkPod("worker", lock.workerDigest, lock.workerPod);
-  log("live deployment verified against the ship lock (pods, digests, namespace identity)");
 }
 
-function runStep(step, { root, runsBase, gatePort, lock, pins }) {
+function loadLiveState(root) {
+  const podsRaw = runCaptured("kubectl", ["get", "pods", "-n", NAMESPACE, "-o", "json"], { cwd: root });
+  const pods = JSON.parse(podsRaw)?.items ?? [];
+  const webDeploy = JSON.parse(runCaptured("kubectl", ["get", "deploy", "companion-web", "-n", NAMESPACE, "-o", "json"], { cwd: root }));
+  const workerDeploy = JSON.parse(runCaptured("kubectl", ["get", "deploy", "companion-worker", "-n", NAMESPACE, "-o", "json"], { cwd: root }));
+  return { pods, webDeploy, workerDeploy };
+}
+
+function runStep(step, { root, runsBase, gatePort, baseline, pins }) {
   log(`step ${step.id}: ${step.label}`);
   const childEnv = { ...process.env };
   // Destructive integration suites are not run by this runner; strip their
@@ -289,10 +479,12 @@ function runStep(step, { root, runsBase, gatePort, lock, pins }) {
     childEnv.E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS = "1";
     childEnv.E2E_DEPLOYED_NAMESPACE = NAMESPACE;
     childEnv.E2E_DEPLOYED_GATE_PORT = String(gatePort);
-    childEnv.E2E_DEPLOYED_EXPECT_WEB_POD = lock.webPod;
-    childEnv.E2E_DEPLOYED_EXPECT_WORKER_POD = lock.workerPod;
-    childEnv.E2E_DEPLOYED_EXPECT_WEB_IMAGE_ID = `${pins.registryRepositories.web}@${lock.webDigest}`;
-    childEnv.E2E_DEPLOYED_EXPECT_WORKER_IMAGE_ID = `${pins.registryRepositories.worker}@${lock.workerDigest}`;
+    childEnv.E2E_DEPLOYED_EXPECT_WEB_POD = baseline.webPod;
+    childEnv.E2E_DEPLOYED_EXPECT_WORKER_POD = baseline.workerPod;
+    childEnv.E2E_DEPLOYED_EXPECT_WEB_POD_UID = baseline.webPodUid;
+    childEnv.E2E_DEPLOYED_EXPECT_WORKER_POD_UID = baseline.workerPodUid;
+    childEnv.E2E_DEPLOYED_EXPECT_WEB_IMAGE_ID = `${pins.registryRepositories.web}@${baseline.webDigest}`;
+    childEnv.E2E_DEPLOYED_EXPECT_WORKER_IMAGE_ID = `${pins.registryRepositories.worker}@${baseline.workerDigest}`;
   }
   const result = spawnSync(command, args, { cwd: root, env: childEnv, stdio: "inherit" });
   if (result.error) throw result.error;
@@ -320,62 +512,26 @@ async function main() {
   const pins = loadIdentityPins(root);
   const gatePort = loadGatePort(root);
 
-  // Adopt the ship lock handoff for the whole E2E run.
-  const lockDir = path.join(gitDir(root), "ship-deploy.lock");
-  let lockStat;
-  try {
-    lockStat = fs.lstatSync(lockDir);
-  } catch {
-    throw new Error("ship lock handoff is missing (.git/ship-deploy.lock); ship-deploy must succeed for this candidate before E2E");
-  }
-  if (lockStat.isSymbolicLink() || !lockStat.isDirectory()) throw new Error("ship lock must be a directory, not a symlink");
-  const ownerFile = path.join(lockDir, "owner.json");
-  const ownerStat = fs.lstatSync(ownerFile);
-  if (ownerStat.isSymbolicLink() || !ownerStat.isFile()) throw new Error("ship lock owner record must be a regular file");
-  const lock = validateLockOwner(JSON.parse(fs.readFileSync(ownerFile, "utf8")));
-  if (lock.sha !== sha) throw new Error(`ship lock SHA (${lock.sha}) does not equal the candidate (${sha})`);
-  if (isPidLive(lock.pid, lock.pid_starttime)) {
-    throw new Error("ship-deploy process from the lock is still live; refusing to adopt a lock owned by a running deploy");
-  }
-  const adopted = {
-    ...lock,
-    phase: "e2e",
-    pid: process.pid,
-    pid_starttime: pidStarttime(process.pid),
-    adopted_at: new Date().toISOString(),
-  };
-  const tmpOwner = path.join(lockDir, ".owner.tmp");
-  fs.writeFileSync(tmpOwner, `${JSON.stringify(adopted, null, 2)}\n`, { encoding: "utf8" });
-  fs.renameSync(tmpOwner, ownerFile);
-  log(`adopted ship lock for ${sha} (phase=deployed -> e2e); concurrent candidates are blocked for the whole E2E run`);
+  // No handoff file: resolve the expected immutable full-SHA digests
+  // independently at the fixed registry, verify them against both the
+  // Deployment specs and the pod runtimes, and capture the verified pod
+  // baseline in memory. Nothing is persisted for the run.
+  verifyClusterIdentity(root, pins);
+  const expected = await resolveExpectedDigests(pins, sha);
+  const baseline = captureVerifiedBaseline(loadLiveState(root), pins, expected);
+  log("live deployment verified against the registry-resolved candidate (specs, runtimes, pods); baseline held in memory");
 
-  const removeLockIfOurs = () => {
-    try {
-      const current = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
-      if (current.sha === sha && current.pid === process.pid && current.phase === "e2e") {
-        const dirStat = fs.lstatSync(lockDir);
-        if (!dirStat.isSymbolicLink() && dirStat.isDirectory()) fs.rmSync(lockDir, { recursive: true, force: true });
-      }
-    } catch {
-      // Lock already gone or unreadable; leaving it is fail-closed.
-    }
-  };
-
-  try {
-    verifyLiveDeployment(root, pins, lock);
-    const runsBase = fs.mkdtempSync(path.join(os.tmpdir(), "companion-ship-e2e-"));
-    log(`E2E runs directory (task-owned, outside the repo): ${runsBase}`);
-    log(`running the complete inventory (${STEPS.length} steps, no filtering, no skips) against ${sha}`);
-    for (const step of STEPS) {
-      runStep(step, { root, runsBase, gatePort, lock, pins });
-    }
-    // Re-verify the deployment is still the pinned pods/digests after all
-    // suites (in particular after the deployed smoke).
-    verifyLiveDeployment(root, pins, lock);
-    log(`full E2E passed for ${sha} (${STEPS.length}/${STEPS.length} steps)`);
-  } finally {
-    removeLockIfOurs();
+  const runsBase = fs.mkdtempSync(path.join(os.tmpdir(), "companion-ship-e2e-"));
+  log(`E2E runs directory (task-owned, outside the repo): ${runsBase}`);
+  log(`running the complete inventory (${STEPS.length} steps, no filtering, no skips) against ${sha}`);
+  for (const step of STEPS) {
+    runStep(step, { root, runsBase, gatePort, baseline, pins });
   }
+  // Re-verify the deployment is still the same verified pods/digests
+  // after all suites (in particular after the deployed smoke).
+  verifyClusterIdentity(root, pins);
+  assertBaselineCurrent(baseline, loadLiveState(root), pins);
+  log(`full E2E passed for ${sha} (${STEPS.length}/${STEPS.length} steps)`);
 }
 
 const invokedAsMain = process.argv[1] !== undefined && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);

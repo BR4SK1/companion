@@ -47,9 +47,12 @@ stack-ops and smoke-regression suites, and the non-database embedding
 check) **plus** deployed non-production validation, which includes the
 [guarded deployed smoke](#guarded-deployed-non-production-smoke), which may
 invoke external providers and incur charges. The full runner requires the
-exact candidate SHA (`SHIP_TARGET_SHA`/`SHIP_DEPLOYED_SHA`), the exclusive
-window, and the ship lock handoff from a successful `scripts/ship-deploy`,
-and has no local-only, filtered, or skip mode. The command above
+exact candidate SHA (`SHIP_TARGET_SHA`/`SHIP_DEPLOYED_SHA`) with HEAD and a
+clean tree matching it, and proves the deployed candidate by resolving its
+immutable full-SHA tags at the fixed registry and verifying both digests
+against the live Deployment specs and pod runtimes, with the verified pods
+held in memory. It consults no handoff file and requires no reservation
+gate, and has no local-only, filtered, or skip mode. The command above
 (`pnpm --filter @companion/e2e test`) runs only the local Playwright stack:
 chat/decision calls use a fake provider, while synthetic embedding requests
 use the configured embedding service. It never includes the deployed smoke
@@ -233,14 +236,17 @@ and may invoke configured external providers that incur charges.
 - Read-only preflight before anything is sent verifies the deployed image,
   the gate's non-production attestation/enablement, a free local forward port,
   scenario linkage, provisioned-configuration fingerprint, thread quiescence,
-  and no unsettled prior smoke marker. When the ship E2E runner invokes the
-  smoke it also pins it to the deployment verified at deploy time:
+  and no unsettled prior smoke marker. When the E2E runner invokes the
+  smoke it also pins it to the in-memory deployment verified at E2E start:
   `E2E_DEPLOYED_EXPECT_WEB_POD`, `E2E_DEPLOYED_EXPECT_WORKER_POD`,
+  `E2E_DEPLOYED_EXPECT_WEB_POD_UID`, `E2E_DEPLOYED_EXPECT_WORKER_POD_UID`,
   `E2E_DEPLOYED_EXPECT_WEB_IMAGE_ID`, and `E2E_DEPLOYED_EXPECT_WORKER_IMAGE_ID`
   are all required together, and preflight refuses to send unless the live
-  pods in `companion-np` are exactly those pods running exactly those image
-  digests. Standalone invocations without those variables retain the
-  original preflight behaviour; partial or invalid pinning fails closed. Completed intentionally retained runs
+  pods in `companion-np` are exactly those pods (same names and UIDs) running
+  exactly those image digests. In E2E-pinned mode the worker pod-side actions
+  exec into the verified worker pod by name; standalone invocations without
+  those variables retain the original preflight behaviour and the Deployment
+  exec target. Partial or invalid pinning fails closed. Completed intentionally retained runs
   are allowed; each new exact marker is checked before send. Memory ingest/recall and an embedding
   endpoint must be configured with bounded convergence. Enabled relationship
   questions, cursor initialization/catch-up, and runnable consolidation or

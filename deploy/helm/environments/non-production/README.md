@@ -31,9 +31,7 @@ coordinated with shared capacity.
 - The chart and container image definitions exist. The chart itself has no
   deployment trigger or controller; non-production ship installs run
   through the repo-owned `scripts/ship-deploy` entry point on push
-  (exact-SHA, digest-pinned, serialized by the local ship lock plus an
-  owner-coordinated exclusive window), and other installs are performed
-  manually.
+  (exact-SHA, digest-pinned), and other installs are performed manually.
 - Environment-specific values (registry path, image tag, ingress hostname,
   middleware names, model ids) are maintained in a local-only values file
   excluded from version control, per [`../README.md`](../README.md).
@@ -123,6 +121,6 @@ forward bound to workstation loopback and remove only task-owned resources.
 ## Open items
 
 - PostgreSQL remains an external service and is not provisioned or operated by
-  this repository. Candidate identification/serialization remains required so
-  normal-use checks cannot silently switch versions. The runner-free
+  this repository. Candidate identification so normal-use checks cannot
+  silently switch versions remains required. The runner-free
   trigger/controller remains unresolved.

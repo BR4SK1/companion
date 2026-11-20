@@ -6,61 +6,263 @@ import test from "node:test";
 
 import {
   STEPS,
+  assertBaselineCurrent,
+  captureVerifiedBaseline,
+  checkLivePod,
   digestFromImageId,
-  isPidLive,
-  pidStarttime,
-  validateLockOwner,
+  registryManifestUrl,
+  resolveExpectedDigests,
+  resolveRegistryDigest,
   validateShipEnv,
+  validateVerifiedBaseline,
 } from "../../scripts/test-e2e.mjs";
 
 const SHA = "a".repeat(40);
 const SHA_B = "b".repeat(40);
 const WEB_DIGEST = `sha256:${"a".repeat(64)}`;
 const WORKER_DIGEST = `sha256:${"b".repeat(64)}`;
+const WRONG_DIGEST = `sha256:${"d".repeat(64)}`;
+const WEB_POD_UID = "77777777-7777-7777-7777-777777777777";
+const WORKER_POD_UID = "88888888-8888-8888-8888-888888888888";
+const REPLACEMENT_POD_UID = "99999999-9999-9999-9999-999999999999";
+const WEB_REPO = "localhost:5104/companion/web";
+const WORKER_REPO = "localhost:5104/companion/worker";
+const PINS = {
+  context: "default",
+  kubeSystemUid: "11111111-1111-4111-8111-111111111111",
+  namespaceUid: "22222222-2222-4222-8222-222222222222",
+  registryRepositories: { web: WEB_REPO, worker: WORKER_REPO },
+};
 
-test("validateShipEnv requires matching 40-hex SHIP variables and the exclusive window", () => {
+function makeDeploy(name, container, image) {
+  return {
+    metadata: { name, namespace: "companion-np", uid: "33333333-3333-3333-3333-333333333333" },
+    spec: {
+      replicas: 1,
+      template: { spec: { containers: [{ name: container, image }] } },
+    },
+    status: { observedGeneration: 2, updatedReplicas: 1, readyReplicas: 1, availableReplicas: 1 },
+  };
+}
+
+function makePod(name, uid, workload, image, imageID, ready = true) {
+  return {
+    metadata: {
+      name,
+      uid,
+      labels: {
+        "app.kubernetes.io/name": workload,
+        "app.kubernetes.io/instance": "companion",
+      },
+    },
+    spec: { containers: [{ name: workload, image }] },
+    status: { phase: "Running", containerStatuses: [{ name: workload, ready, imageID }] },
+  };
+}
+
+function goodLiveState() {
+  return {
+    pods: [
+      makePod("companion-web-test-0", WEB_POD_UID, "web", `${WEB_REPO}@${WEB_DIGEST}`, `${WEB_REPO}@${WEB_DIGEST}`),
+      makePod("companion-worker-test-0", WORKER_POD_UID, "worker", `${WORKER_REPO}@${WORKER_DIGEST}`, `${WORKER_REPO}@${WORKER_DIGEST}`),
+    ],
+    webDeploy: makeDeploy("companion-web", "web", `${WEB_REPO}@${WEB_DIGEST}`),
+    workerDeploy: makeDeploy("companion-worker", "worker", `${WORKER_REPO}@${WORKER_DIGEST}`),
+  };
+}
+
+function fakeFetchFor(map) {
+  return async (url) => {
+    const digest = map.get(String(url));
+    if (digest === undefined) {
+      return { ok: false, status: 404, headers: { get: () => null }, text: async () => "" };
+    }
+    return {
+      ok: true,
+      status: 200,
+      headers: { get: (key) => (String(key).toLowerCase() === "docker-content-digest" ? digest : null) },
+      text: async () => "{}",
+    };
+  };
+}
+
+test("validateShipEnv requires matching 40-hex SHIP variables with no exclusive-window or lock requirement", () => {
+  assert.equal(validateShipEnv({ SHIP_TARGET_SHA: SHA, SHIP_DEPLOYED_SHA: SHA }).sha, SHA);
+  // A reservation attestation is neither required nor consulted: any or
+  // no value is ignored, and a missing value never blocks.
   assert.equal(validateShipEnv({ SHIP_TARGET_SHA: SHA, SHIP_DEPLOYED_SHA: SHA, SHIP_DEPLOY_EXCLUSIVE_WINDOW: "1" }).sha, SHA);
-  assert.throws(() => validateShipEnv({ SHIP_TARGET_SHA: SHA, SHIP_DEPLOYED_SHA: SHA }), /exclusive window/);
+  assert.equal(validateShipEnv({ SHIP_TARGET_SHA: SHA, SHIP_DEPLOYED_SHA: SHA, SHIP_DEPLOY_EXCLUSIVE_WINDOW: "" }).sha, SHA);
+  assert.throws(() => validateShipEnv({ SHIP_TARGET_SHA: SHA_B, SHIP_DEPLOYED_SHA: SHA }), /does not equal/);
+  assert.throws(() => validateShipEnv({ SHIP_TARGET_SHA: "abc", SHIP_DEPLOYED_SHA: "abc" }), /40-hex/);
+  assert.throws(() => validateShipEnv({}), /40-hex/);
+  assert.throws(() => validateShipEnv({ SHIP_TARGET_SHA: SHA.toUpperCase(), SHIP_DEPLOYED_SHA: SHA.toUpperCase() }), /40-hex/);
+  // Wrong SHA relationship is blocked even when the exclusive window is set.
   assert.throws(() => validateShipEnv({ SHIP_TARGET_SHA: SHA_B, SHIP_DEPLOYED_SHA: SHA, SHIP_DEPLOY_EXCLUSIVE_WINDOW: "1" }), /does not equal/);
-  assert.throws(() => validateShipEnv({ SHIP_TARGET_SHA: "abc", SHIP_DEPLOYED_SHA: "abc", SHIP_DEPLOY_EXCLUSIVE_WINDOW: "1" }), /40-hex/);
-  assert.throws(() => validateShipEnv({ SHIP_DEPLOY_EXCLUSIVE_WINDOW: "1" }), /40-hex/);
-  assert.throws(() => validateShipEnv({ SHIP_TARGET_SHA: SHA.toUpperCase(), SHIP_DEPLOYED_SHA: SHA.toUpperCase(), SHIP_DEPLOY_EXCLUSIVE_WINDOW: "1" }), /40-hex/);
 });
 
-test("validateLockOwner requires the deployed handoff for the predetermined target", () => {
-  const owner = {
-    sha: SHA,
-    phase: "deployed",
-    namespace: "companion-np",
-    release: "companion",
+test("test-e2e runner source consults no Ship lock and requires no reservation gate", () => {
+  const hereDir = path.dirname(new URL(import.meta.url).pathname);
+  const runnerSource = fs.readFileSync(path.join(path.resolve(hereDir, "..", ".."), "scripts", "test-e2e.mjs"), "utf8");
+  assert.ok(!runnerSource.includes("ship-deploy.lock"), "runner must not reference a Ship lock path");
+  assert.ok(!runnerSource.includes("SHIP_DEPLOY_EXCLUSIVE_WINDOW"), "runner must not reference a reservation gate");
+  assert.ok(!runnerSource.includes("validateLockOwner"), "runner must not consult lock owner records");
+  assert.ok(!runnerSource.includes("owner.json"), "runner must not read a lock owner file");
+});
+
+test("validateVerifiedBaseline requires in-memory digests, pod names, and UIDs", () => {
+  const baseline = {
     webDigest: WEB_DIGEST,
     workerDigest: WORKER_DIGEST,
     webPod: "companion-web-test-0",
     workerPod: "companion-worker-test-0",
+    webPodUid: WEB_POD_UID,
+    workerPodUid: WORKER_POD_UID,
   };
-  assert.equal(validateLockOwner(owner), owner);
-  assert.throws(() => validateLockOwner({ ...owner, phase: "deploying" }), /phase/);
-  assert.throws(() => validateLockOwner({ ...owner, namespace: "prod" }), /namespace/);
-  assert.throws(() => validateLockOwner({ ...owner, webDigest: "sha256:xyz" }), /digests/);
-  assert.throws(() => validateLockOwner({ ...owner, webPod: "" }), /pod/);
-  assert.throws(() => validateLockOwner(null), /not an object/);
+  assert.equal(validateVerifiedBaseline(baseline), baseline);
+  assert.throws(() => validateVerifiedBaseline({ ...baseline, webDigest: "sha256:xyz" }), /digests/);
+  assert.throws(() => validateVerifiedBaseline({ ...baseline, webPod: "" }), /pod names/);
+  assert.throws(() => validateVerifiedBaseline(null), /not an object/);
+  // Pod UIDs are bound in the baseline: without them a same-name
+  // replacement pod with a new UID would otherwise be accepted.
+  const { webPodUid: _webUid, ...withoutWebUid } = baseline;
+  assert.throws(() => validateVerifiedBaseline(withoutWebUid), /pod UIDs/);
+  const { workerPodUid: _workerUid, ...withoutWorkerUid } = baseline;
+  assert.throws(() => validateVerifiedBaseline(withoutWorkerUid), /pod UIDs/);
+  assert.throws(() => validateVerifiedBaseline({ ...baseline, webPodUid: "not-a-uid" }), /pod UIDs/);
+  assert.throws(() => validateVerifiedBaseline({ ...baseline, workerPodUid: REPLACEMENT_POD_UID.slice(0, 8) }), /pod UIDs/);
+  // A well-formed but different UID is a valid baseline shape; the live
+  // recheck (assertBaselineCurrent via checkLivePod) is what rejects the
+  // replacement pod's UID.
+  assert.equal(validateVerifiedBaseline({ ...baseline, webPodUid: REPLACEMENT_POD_UID }).webPodUid, REPLACEMENT_POD_UID);
+});
+
+test("checkLivePod rejects a same-name replacement pod with a new UID", () => {
+  const goodPod = {
+    metadata: { name: "companion-web-test-0", uid: WEB_POD_UID },
+    spec: { containers: [{ name: "web", image: `${WEB_REPO}@${WEB_DIGEST}` }] },
+    status: { phase: "Running", containerStatuses: [{ name: "web", ready: true, imageID: `${WEB_REPO}@${WEB_DIGEST}` }] },
+  };
+  const expectedImage = `${WEB_REPO}@${WEB_DIGEST}`;
+  assert.equal(checkLivePod(goodPod, "web", WEB_DIGEST, "companion-web-test-0", WEB_POD_UID, expectedImage), goodPod);
+  assert.throws(
+    () => checkLivePod({ ...goodPod, metadata: { name: "companion-web-test-0", uid: REPLACEMENT_POD_UID } }, "web", WEB_DIGEST, "companion-web-test-0", WEB_POD_UID, expectedImage),
+    /UID does not match/,
+  );
+  assert.throws(
+    () => checkLivePod({ ...goodPod, metadata: { name: "companion-web-test-0", uid: REPLACEMENT_POD_UID } }, "web", WEB_DIGEST, "companion-web-test-0", WEB_POD_UID, expectedImage),
+    (error) => !error.message.includes(REPLACEMENT_POD_UID) && !error.message.includes(WEB_POD_UID),
+  );
+  assert.throws(
+    () => checkLivePod({ ...goodPod, metadata: { name: "companion-web-test-0", uid: WEB_POD_UID, deletionTimestamp: "2026-11-19T12:00:00Z" } }, "web", WEB_DIGEST, "companion-web-test-0", WEB_POD_UID, expectedImage),
+    /terminating/,
+  );
+  // Wrong digest and wrong spec image are blocked even for the same pod.
+  assert.throws(() => checkLivePod(goodPod, "web", WRONG_DIGEST, "companion-web-test-0", WEB_POD_UID, `${WEB_REPO}@${WRONG_DIGEST}`), /digest does not match/);
+});
+
+test("registryManifestUrl pins loopback to http and other hosts to https", () => {
+  assert.equal(registryManifestUrl(WEB_REPO, SHA), `http://localhost:5104/v2/companion/web/manifests/${SHA}`);
+  assert.equal(registryManifestUrl("registry.example.com/companion/web", SHA), `https://registry.example.com/v2/companion/web/manifests/${SHA}`);
+  assert.equal(registryManifestUrl("127.0.0.1:5104/companion/worker", SHA), `http://127.0.0.1:5104/v2/companion/worker/manifests/${SHA}`);
+  assert.throws(() => registryManifestUrl("", SHA), /registry repository/);
+  assert.throws(() => registryManifestUrl(WEB_REPO, "abc"), /40-hex/);
+  assert.throws(() => registryManifestUrl(`${WEB_REPO}@${WEB_DIGEST}`, SHA), /registry repository/);
+  assert.throws(() => registryManifestUrl("https://registry.example.com/companion/web", SHA), /registry repository/);
+});
+
+test("resolveRegistryDigest returns the registry digest and fails closed without a live-pod fallback", async () => {
+  const url = registryManifestUrl(WEB_REPO, SHA);
+  const okFetch = fakeFetchFor(new Map([[url, WEB_DIGEST]]));
+  assert.equal(await resolveRegistryDigest(WEB_REPO, SHA, { fetchImpl: okFetch }), WEB_DIGEST);
+  // Missing tag, malformed digest, and transport failure all fail closed;
+  // the expected digest is never taken from a live pod.
+  await assert.rejects(() => resolveRegistryDigest(WEB_REPO, SHA, { fetchImpl: fakeFetchFor(new Map()) }), /refusing to infer/);
+  await assert.rejects(() => resolveRegistryDigest(WEB_REPO, SHA, { fetchImpl: fakeFetchFor(new Map([[url, "not-a-digest"]])) }), /refusing to infer/);
+  await assert.rejects(
+    () => resolveRegistryDigest(WEB_REPO, SHA, { fetchImpl: async () => { throw new Error("network down"); } }),
+    /refusing to infer/,
+  );
+  // A wrong SHA resolves a different tag: the caller must not accept a
+  // digest that does not match the live spec/runtime (covered by the
+  // baseline tests below), never an inferred live value.
+  await assert.rejects(() => resolveRegistryDigest(WEB_REPO, "not-a-sha", { fetchImpl: okFetch }), /40-hex/);
+});
+
+test("resolveExpectedDigests resolves both fixed-registry tags and blocks wrong SHA", async () => {
+  const webUrl = registryManifestUrl(WEB_REPO, SHA);
+  const workerUrl = registryManifestUrl(WORKER_REPO, SHA);
+  const fetchImpl = fakeFetchFor(
+    new Map([
+      [webUrl, WEB_DIGEST],
+      [workerUrl, WORKER_DIGEST],
+    ]),
+  );
+  assert.deepEqual(await resolveExpectedDigests(PINS, SHA, { fetchImpl }), { webDigest: WEB_DIGEST, workerDigest: WORKER_DIGEST });
+  // Only the requested SHA's tags are queried: a different SHA has no
+  // registry entry here, so resolution fails instead of blessing the
+  // live deployment's digests.
+  await assert.rejects(() => resolveExpectedDigests(PINS, SHA_B, { fetchImpl }), /refusing to infer/);
+  await assert.rejects(() => resolveExpectedDigests({ registryRepositories: { web: WEB_REPO } }, SHA, { fetchImpl }), /refusing to infer/);
+});
+
+test("captureVerifiedBaseline proves Deployment specs and pod runtimes against registry digests", () => {
+  const baseline = captureVerifiedBaseline(goodLiveState(), PINS, { webDigest: WEB_DIGEST, workerDigest: WORKER_DIGEST });
+  assert.deepEqual(baseline, {
+    webDigest: WEB_DIGEST,
+    workerDigest: WORKER_DIGEST,
+    webPod: "companion-web-test-0",
+    workerPod: "companion-worker-test-0",
+    webPodUid: WEB_POD_UID,
+    workerPodUid: WORKER_POD_UID,
+  });
+  // Wrong registry digest blocked: spec and runtime still carry the old digests.
+  assert.throws(() => captureVerifiedBaseline(goodLiveState(), PINS, { webDigest: WRONG_DIGEST, workerDigest: WORKER_DIGEST }), /does not match/);
+  // Wrong Deployment spec blocked even when the pod runtime matches.
+  const specDrift = goodLiveState();
+  specDrift.webDeploy = makeDeploy("companion-web", "web", `${WEB_REPO}@${WRONG_DIGEST}`);
+  assert.throws(() => captureVerifiedBaseline(specDrift, PINS, { webDigest: WEB_DIGEST, workerDigest: WORKER_DIGEST }), /spec image does not match/);
+  // Wrong pod runtime digest blocked; the digest is never inferred from the live pod.
+  const runtimeDrift = goodLiveState();
+  runtimeDrift.pods[0] = makePod("companion-web-test-0", WEB_POD_UID, "web", `${WEB_REPO}@${WEB_DIGEST}`, `${WEB_REPO}@${WRONG_DIGEST}`);
+  assert.throws(() => captureVerifiedBaseline(runtimeDrift, PINS, { webDigest: WEB_DIGEST, workerDigest: WORKER_DIGEST }), /digest does not match/);
+  // Duplicate workload pods are blocked (exactly one required).
+  const dup = goodLiveState();
+  dup.pods.push(makePod("companion-web-other-0", REPLACEMENT_POD_UID, "web", `${WEB_REPO}@${WEB_DIGEST}`, `${WEB_REPO}@${WEB_DIGEST}`));
+  assert.throws(() => captureVerifiedBaseline(dup, PINS, { webDigest: WEB_DIGEST, workerDigest: WORKER_DIGEST }), /exactly one web pod/);
+});
+
+test("assertBaselineCurrent rechecks the same pods and blocks replacement, drift, and wrong SHA", () => {
+  const baseline = captureVerifiedBaseline(goodLiveState(), PINS, { webDigest: WEB_DIGEST, workerDigest: WORKER_DIGEST });
+  assert.equal(assertBaselineCurrent(baseline, goodLiveState(), PINS), baseline);
+  // Same-name replacement pod with a new UID is blocked on recheck.
+  const replaced = goodLiveState();
+  replaced.pods[0] = makePod("companion-web-test-0", REPLACEMENT_POD_UID, "web", `${WEB_REPO}@${WEB_DIGEST}`, `${WEB_REPO}@${WEB_DIGEST}`);
+  assert.throws(() => assertBaselineCurrent(baseline, replaced, PINS), /UID does not match/);
+  // Different pod name is blocked.
+  const renamed = goodLiveState();
+  renamed.pods[0] = makePod("companion-web-new-0", WEB_POD_UID, "web", `${WEB_REPO}@${WEB_DIGEST}`, `${WEB_REPO}@${WEB_DIGEST}`);
+  assert.throws(() => assertBaselineCurrent(baseline, renamed, PINS), /not the pod verified/);
+  // Spec or runtime digest drift after capture is blocked (wrong SHA/digest).
+  const specDrift = goodLiveState();
+  specDrift.workerDeploy = makeDeploy("companion-worker", "worker", `${WORKER_REPO}@${WRONG_DIGEST}`);
+  assert.throws(() => assertBaselineCurrent(baseline, specDrift, PINS), /spec image does not match/);
+  const runtimeDrift = goodLiveState();
+  runtimeDrift.pods[1] = makePod("companion-worker-test-0", WORKER_POD_UID, "worker", `${WORKER_REPO}@${WORKER_DIGEST}`, `${WORKER_REPO}@${WRONG_DIGEST}`);
+  assert.throws(() => assertBaselineCurrent(baseline, runtimeDrift, PINS), /digest does not match/);
+  // A baseline for a different candidate (wrong SHA's digests) never
+  // matches the live deployment for this SHA.
+  assert.throws(
+    () => assertBaselineCurrent({ ...baseline, webDigest: WRONG_DIGEST }, goodLiveState(), PINS),
+    /spec image does not match/,
+  );
 });
 
 test("digestFromImageId extracts only a full sha256 digest", () => {
-  assert.equal(digestFromImageId(`localhost:5104/companion/web@${WEB_DIGEST}`), WEB_DIGEST);
-  assert.equal(digestFromImageId(`docker-pullable://localhost:5104/companion/web@${WEB_DIGEST}`), WEB_DIGEST);
-  assert.equal(digestFromImageId("localhost:5104/companion/web:latest"), null);
+  assert.equal(digestFromImageId(`${WEB_REPO}@${WEB_DIGEST}`), WEB_DIGEST);
+  assert.equal(digestFromImageId(`docker-pullable://${WEB_REPO}@${WEB_DIGEST}`), WEB_DIGEST);
+  assert.equal(digestFromImageId(`${WEB_REPO}:latest`), null);
   assert.equal(digestFromImageId(""), null);
   assert.equal(digestFromImageId("repo@sha256:xyz"), null);
-});
-
-test("pid identity helpers recognise the current process and reject dead pids", () => {
-  const start = pidStarttime(process.pid);
-  assert.notEqual(start, "gone");
-  assert.equal(isPidLive(process.pid, start), true);
-  assert.equal(isPidLive(process.pid, "1"), false);
-  assert.equal(isPidLive(999999999, "1"), false);
-  assert.equal(isPidLive(0, start), false);
 });
 
 test("STEPS inventory is complete, ordered, and contains no filtering or skip arguments", () => {

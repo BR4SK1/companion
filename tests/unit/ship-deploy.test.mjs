@@ -40,8 +40,20 @@ const REAL_HELM = (() => {
 
 const WEB_DIGEST = `sha256:${"a".repeat(64)}`;
 const WORKER_DIGEST = `sha256:${"b".repeat(64)}`;
+const OLD_DIGEST = `sha256:${"c".repeat(64)}`;
+const WRONG_DIGEST = `sha256:${"d".repeat(64)}`;
 const KUBE_SYSTEM_UID = "11111111-1111-4111-8111-111111111111";
 const NAMESPACE_UID = "22222222-2222-4222-8222-222222222222";
+const WEB_DEPLOY_UID = "33333333-3333-3333-3333-333333333333";
+const WORKER_DEPLOY_UID = "44444444-4444-4444-4444-444444444444";
+const WEB_RS_UID = "55555555-5555-5555-5555-555555555555";
+const WORKER_RS_UID = "66666666-6666-6666-6666-666666666666";
+const WEB_POD_UID = "77777777-7777-7777-7777-777777777777";
+const WORKER_POD_UID = "88888888-8888-8888-8888-888888888888";
+const OLD_WEB_RS_UID = "99999999-9999-9999-9999-999999999999";
+const OLD_WEB_POD_UID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+const FOREIGN_POD_UID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+const FOREIGN_RS_UID = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 
 function git(dir, args) {
   const result = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
@@ -244,20 +256,45 @@ JSON
   "get deploy companion-web -n companion-np -o name") echo "deployment.apps/companion-web"; exit 0 ;;
   "get deploy companion-worker -n companion-np -o name") echo "deployment.apps/companion-worker"; exit 0 ;;
   "get deploy companion-web -n companion-np -o json")
-    echo '{"metadata":{"name":"companion-web"},"status":{"readyReplicas":1,"replicas":1}}'
+    if [ "\${FAKE_POST_ROLLOUT_SCENARIO:-}" = "deadline-stale-generation" ]; then
+      printf '%s\n' '{"metadata":{"name":"companion-web","namespace":"companion-np","uid":"${WEB_DEPLOY_UID}","generation":2},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]}}},"status":{"observedGeneration":1,"updatedReplicas":1,"readyReplicas":1,"availableReplicas":1,"replicas":1}}'
+    else
+      printf '%s\n' '{"metadata":{"name":"companion-web","namespace":"companion-np","uid":"${WEB_DEPLOY_UID}","generation":2},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]}}},"status":{"observedGeneration":2,"updatedReplicas":1,"readyReplicas":1,"availableReplicas":1,"replicas":1}}'
+    fi
     exit 0 ;;
   "get deploy companion-worker -n companion-np -o json")
-    echo '{"metadata":{"name":"companion-worker"},"status":{"readyReplicas":1,"replicas":1}}'
+    printf '%s\n' '{"metadata":{"name":"companion-worker","namespace":"companion-np","uid":"${WORKER_DEPLOY_UID}","generation":2},"spec":{"replicas":1,"template":{"spec":{"containers":[{"name":"worker","image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}},"status":{"observedGeneration":2,"updatedReplicas":1,"readyReplicas":1,"availableReplicas":1,"replicas":1}}'
     exit 0 ;;
   "rollout status deploy/companion-web -n companion-np --timeout=600s") exit 0 ;;
   "rollout status deploy/companion-worker -n companion-np --timeout=600s") exit 0 ;;
   "get pods -n companion-np -o json")
-    cat <<JSON
-{"items":[
-{"metadata":{"name":"companion-web-test-0","labels":{"app.kubernetes.io/name":"web","app.kubernetes.io/instance":"companion"}},"spec":{"containers":[{"image":"localhost:5104/companion/web@${WEB_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"ready":true,"imageID":"localhost:5104/companion/web@${WEB_DIGEST}"}]}},
-{"metadata":{"name":"companion-worker-test-0","labels":{"app.kubernetes.io/name":"worker","app.kubernetes.io/instance":"companion"}},"spec":{"containers":[{"image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"ready":true,"imageID":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}
-]}
-JSON
+    counter_file="${logFile}.pods-count"
+    count=0
+    if [ -f "$counter_file" ]; then count=$(cat "$counter_file"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$counter_file"
+    scenario="\${FAKE_POST_ROLLOUT_SCENARIO:-}"
+    if [ "$scenario" = "terminating-disappears" ] && [ "$count" -eq 1 ]; then
+      printf '%s\n' '{"items":[{"metadata":{"name":"companion-web-test-0","namespace":"companion-np","uid":"${WEB_POD_UID}","labels":{"app.kubernetes.io/name":"web","app.kubernetes.io/instance":"companion","pod-template-hash":"webhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-web-7d9c8b6f5","uid":"${WEB_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"web","ready":true,"imageID":"localhost:5104/companion/web@${WEB_DIGEST}"}]}},{"metadata":{"name":"companion-web-oldtest-0","namespace":"companion-np","uid":"${OLD_WEB_POD_UID}","deletionTimestamp":"2026-11-19T12:00:00Z","labels":{"app.kubernetes.io/name":"web","app.kubernetes.io/instance":"companion","pod-template-hash":"oldwebhash1"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-web-5b4c3d2e1","uid":"${OLD_WEB_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${OLD_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"web","ready":true,"imageID":"localhost:5104/companion/web@${OLD_DIGEST}"}]}},{"metadata":{"name":"companion-worker-test-0","namespace":"companion-np","uid":"${WORKER_POD_UID}","labels":{"app.kubernetes.io/name":"worker","app.kubernetes.io/instance":"companion","pod-template-hash":"workerhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-worker-6c8d9e7f6","uid":"${WORKER_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"worker","image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"worker","ready":true,"imageID":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}]}'
+    elif [ "$scenario" = "delayed-ready" ] && [ "$count" -eq 1 ]; then
+      printf '%s\n' '{"items":[{"metadata":{"name":"companion-web-test-0","namespace":"companion-np","uid":"${WEB_POD_UID}","labels":{"app.kubernetes.io/name":"web","app.kubernetes.io/instance":"companion","pod-template-hash":"webhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-web-7d9c8b6f5","uid":"${WEB_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"web","ready":false,"imageID":""}]}},{"metadata":{"name":"companion-worker-test-0","namespace":"companion-np","uid":"${WORKER_POD_UID}","labels":{"app.kubernetes.io/name":"worker","app.kubernetes.io/instance":"companion","pod-template-hash":"workerhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-worker-6c8d9e7f6","uid":"${WORKER_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"worker","image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"worker","ready":true,"imageID":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}]}'
+    elif [ "$scenario" = "foreign-duplicate" ]; then
+      printf '%s\n' '{"items":[{"metadata":{"name":"companion-web-test-0","namespace":"companion-np","uid":"${WEB_POD_UID}","labels":{"app.kubernetes.io/name":"web","app.kubernetes.io/instance":"companion","pod-template-hash":"webhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-web-7d9c8b6f5","uid":"${WEB_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"web","ready":true,"imageID":"localhost:5104/companion/web@${WEB_DIGEST}"}]}},{"metadata":{"name":"companion-web-foreign-0","namespace":"companion-np","uid":"${FOREIGN_POD_UID}","labels":{"app.kubernetes.io/name":"web","app.kubernetes.io/instance":"companion","pod-template-hash":"webhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-web-foreign","uid":"${FOREIGN_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"web","ready":true,"imageID":"localhost:5104/companion/web@${WEB_DIGEST}"}]}},{"metadata":{"name":"companion-worker-test-0","namespace":"companion-np","uid":"${WORKER_POD_UID}","labels":{"app.kubernetes.io/name":"worker","app.kubernetes.io/instance":"companion","pod-template-hash":"workerhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-worker-6c8d9e7f6","uid":"${WORKER_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"worker","image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"worker","ready":true,"imageID":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}]}'
+    elif [ "$scenario" = "stale-ownership" ]; then
+      printf '%s\n' '{"items":[{"metadata":{"name":"companion-web-test-0","namespace":"companion-np","uid":"${WEB_POD_UID}","labels":{"app.kubernetes.io/name":"web","app.kubernetes.io/instance":"companion","pod-template-hash":"webhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-web-5b4c3d2e1","uid":"${OLD_WEB_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"web","ready":true,"imageID":"localhost:5104/companion/web@${WEB_DIGEST}"}]}},{"metadata":{"name":"companion-worker-test-0","namespace":"companion-np","uid":"${WORKER_POD_UID}","labels":{"app.kubernetes.io/name":"worker","app.kubernetes.io/instance":"companion","pod-template-hash":"workerhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-worker-6c8d9e7f6","uid":"${WORKER_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"worker","image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"worker","ready":true,"imageID":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}]}'
+    elif [ "$scenario" = "wrong-digest" ]; then
+      printf '%s\n' '{"items":[{"metadata":{"name":"companion-web-test-0","namespace":"companion-np","uid":"${WEB_POD_UID}","labels":{"app.kubernetes.io/name":"web","app.kubernetes.io/instance":"companion","pod-template-hash":"webhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-web-7d9c8b6f5","uid":"${WEB_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"web","ready":true,"imageID":"localhost:5104/companion/web@${WRONG_DIGEST}"}]}},{"metadata":{"name":"companion-worker-test-0","namespace":"companion-np","uid":"${WORKER_POD_UID}","labels":{"app.kubernetes.io/name":"worker","app.kubernetes.io/instance":"companion","pod-template-hash":"workerhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-worker-6c8d9e7f6","uid":"${WORKER_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"worker","image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"worker","ready":true,"imageID":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}]}'
+    else
+      printf '%s\n' '{"items":[{"metadata":{"name":"companion-web-test-0","namespace":"companion-np","uid":"${WEB_POD_UID}","labels":{"app.kubernetes.io/name":"web","app.kubernetes.io/instance":"companion","pod-template-hash":"webhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-web-7d9c8b6f5","uid":"${WEB_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"web","ready":true,"imageID":"localhost:5104/companion/web@${WEB_DIGEST}"}]}},{"metadata":{"name":"companion-worker-test-0","namespace":"companion-np","uid":"${WORKER_POD_UID}","labels":{"app.kubernetes.io/name":"worker","app.kubernetes.io/instance":"companion","pod-template-hash":"workerhash01"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"ReplicaSet","name":"companion-worker-6c8d9e7f6","uid":"${WORKER_RS_UID}","controller":true}]},"spec":{"containers":[{"name":"worker","image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]},"status":{"phase":"Running","containerStatuses":[{"name":"worker","ready":true,"imageID":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}]}'
+    fi
+    exit 0 ;;
+  "get rs -n companion-np -o json")
+    scenario="\${FAKE_POST_ROLLOUT_SCENARIO:-}"
+    if [ "$scenario" = "terminating-disappears" ] || [ "$scenario" = "stale-ownership" ]; then
+      printf '%s\n' '{"items":[{"metadata":{"name":"companion-web-5b4c3d2e1","namespace":"companion-np","uid":"${OLD_WEB_RS_UID}","labels":{"pod-template-hash":"oldwebhash1"},"annotations":{"deployment.kubernetes.io/revision":"1"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"companion-web","uid":"${WEB_DEPLOY_UID}","controller":true}]},"spec":{"template":{"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${OLD_DIGEST}"}]}}}},{"metadata":{"name":"companion-web-7d9c8b6f5","namespace":"companion-np","uid":"${WEB_RS_UID}","labels":{"pod-template-hash":"webhash01"},"annotations":{"deployment.kubernetes.io/revision":"2"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"companion-web","uid":"${WEB_DEPLOY_UID}","controller":true}]},"spec":{"template":{"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]}}}},{"metadata":{"name":"companion-worker-6c8d9e7f6","namespace":"companion-np","uid":"${WORKER_RS_UID}","labels":{"pod-template-hash":"workerhash01"},"annotations":{"deployment.kubernetes.io/revision":"2"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"companion-worker","uid":"${WORKER_DEPLOY_UID}","controller":true}]},"spec":{"template":{"spec":{"containers":[{"name":"worker","image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}}}]}'
+    else
+      printf '%s\n' '{"items":[{"metadata":{"name":"companion-web-7d9c8b6f5","namespace":"companion-np","uid":"${WEB_RS_UID}","labels":{"pod-template-hash":"webhash01"},"annotations":{"deployment.kubernetes.io/revision":"2"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"companion-web","uid":"${WEB_DEPLOY_UID}","controller":true}]},"spec":{"template":{"spec":{"containers":[{"name":"web","image":"localhost:5104/companion/web@${WEB_DIGEST}"}]}}}},{"metadata":{"name":"companion-worker-6c8d9e7f6","namespace":"companion-np","uid":"${WORKER_RS_UID}","labels":{"pod-template-hash":"workerhash01"},"annotations":{"deployment.kubernetes.io/revision":"2"},"ownerReferences":[{"apiVersion":"apps/v1","kind":"Deployment","name":"companion-worker","uid":"${WORKER_DEPLOY_UID}","controller":true}]},"spec":{"template":{"spec":{"containers":[{"name":"worker","image":"localhost:5104/companion/worker@${WORKER_DIGEST}"}]}}}}]}'
+    fi
     exit 0 ;;
 esac
 echo "unexpected kubectl call: $*" >&2
@@ -353,7 +390,6 @@ function runShipDeploy(fixture, args, extraEnv = {}) {
   const env = {
     ...process.env,
     PATH: `${fixture.shimDir}:${process.env.PATH}`,
-    SHIP_DEPLOY_EXCLUSIVE_WINDOW: "1",
     ...extraEnv,
   };
   return spawnSync("bash", [path.join(fixture.repo, "scripts/ship-deploy"), ...args], {
@@ -367,11 +403,15 @@ function readCalls(fixture) {
   return fs.readFileSync(fixture.logFile, "utf8");
 }
 
-function lockOwner(fixture) {
-  return JSON.parse(fs.readFileSync(path.join(fixture.repo, ".git/ship-deploy.lock/owner.json"), "utf8"));
+function assertNoLock(fixture) {
+  const lockPath = path.join(fixture.repo, ".git/ship-deploy.lock");
+  assert.ok(!fs.existsSync(lockPath), "ship-deploy must never create a Ship lock");
+  const deploySource = fs.readFileSync(path.join(repoRoot, "scripts", "ship-deploy"), "utf8");
+  assert.ok(!deploySource.includes("ship-deploy.lock"), "ship-deploy source must not reference a Ship lock");
+  assert.ok(!deploySource.includes("SHIP_DEPLOY_EXCLUSIVE_WINDOW"), "ship-deploy source must not reference a reservation gate");
 }
 
-test("ship-deploy rejects argument and exclusive-window violations without calling tools", () => {
+test("ship-deploy rejects argument violations without calling tools", () => {
   const fixture = makeFixture();
   try {
     for (const args of [[], [fixture.sha, "extra"], ["abc"], [fixture.sha.toUpperCase()], ["g".repeat(40)]]) {
@@ -379,14 +419,11 @@ test("ship-deploy rejects argument and exclusive-window violations without calli
       assert.notEqual(result.status, 0, `args ${JSON.stringify(args)} must fail`);
       assert.ok(!result.stdout.includes("SHIP_DEPLOYED_SHA="), "no success line on failure");
     }
-    const noWindow = runShipDeploy(fixture, [fixture.sha], { SHIP_DEPLOY_EXCLUSIVE_WINDOW: "" });
-    assert.notEqual(noWindow.status, 0);
-    assert.match(noWindow.stderr, /exclusive window/);
     const unknown = runShipDeploy(fixture, ["f".repeat(40)]);
     assert.notEqual(unknown.status, 0);
     assert.match(unknown.stderr, /not a commit/);
     assert.equal(readCalls(fixture), "", "no docker/helm/kubectl shim should be called for early rejections");
-    assert.ok(!fs.existsSync(path.join(fixture.repo, ".git/ship-deploy.lock")), "early rejections must not leave a lock");
+    assertNoLock(fixture);
   } finally {
     fs.rmSync(fixture.base, { recursive: true, force: true });
   }
@@ -405,38 +442,100 @@ test("ship-deploy happy path deploys the exact candidate and prints only the suc
     assert.match(calls, /helm upgrade --install companion /);
     assert.match(calls, /web\.image\.digest=sha256:aaa/);
     assert.match(calls, /worker\.image\.digest=sha256:bbb/);
-    const owner = lockOwner(fixture);
-    assert.equal(owner.sha, fixture.sha);
-    assert.equal(owner.phase, "deployed");
-    assert.equal(owner.webDigest, WEB_DIGEST);
-    assert.equal(owner.workerDigest, WORKER_DIGEST);
-    assert.equal(owner.webPod, "companion-web-test-0");
-    assert.equal(owner.workerPod, "companion-worker-test-0");
+    assertNoLock(fixture);
   } finally {
     fs.rmSync(fixture.base, { recursive: true, force: true });
   }
 });
 
-test("ship-deploy refuses to race an existing lock", () => {
+test("ship-deploy waits for a recognized terminating old pod to disappear (strict verifier)", () => {
+  const fixture = makeFixture();
+  try {
+    const result = runShipDeploy(fixture, [fixture.sha], { FAKE_POST_ROLLOUT_SCENARIO: "terminating-disappears" });
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+    assert.equal(result.stdout, `SHIP_DEPLOYED_SHA=${fixture.sha}\n`);
+    assert.match(result.stderr, /post-rollout verification waiting: web:retiring_pods_present/);
+    assertNoLock(fixture);
+  } finally {
+    fs.rmSync(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("ship-deploy waits for delayed Ready/imageID to settle (strict verifier)", () => {
+  const fixture = makeFixture();
+  try {
+    const result = runShipDeploy(fixture, [fixture.sha], { FAKE_POST_ROLLOUT_SCENARIO: "delayed-ready" });
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+    assert.equal(result.stdout, `SHIP_DEPLOYED_SHA=${fixture.sha}\n`);
+    assert.match(result.stderr, /post-rollout verification waiting: web:pod_not_ready/);
+    assertNoLock(fixture);
+  } finally {
+    fs.rmSync(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("ship-deploy fails closed on foreign duplicate, stale ownership, and wrong digest with no lock", () => {
+  const cases = [
+    ["foreign-duplicate", "duplicate_live_pods"],
+    ["stale-ownership", "pod_stale_owner"],
+    ["wrong-digest", "pod_wrong_digest"],
+  ];
+  for (const [scenario, predicate] of cases) {
+    const fixture = makeFixture();
+    try {
+      const result = runShipDeploy(fixture, [fixture.sha], { FAKE_POST_ROLLOUT_SCENARIO: scenario });
+      assert.notEqual(result.status, 0, `scenario ${scenario} must fail`);
+      assert.equal(result.stdout, "", `scenario ${scenario} must not print the success line`);
+      assert.match(result.stderr, new RegExp(predicate), `scenario ${scenario} diagnostic`);
+      assert.ok(!result.stderr.includes(WEB_POD_UID), `scenario ${scenario} stderr must not leak pod UIDs`);
+      assert.ok(!result.stderr.includes(WEB_DIGEST), `scenario ${scenario} stderr must not leak digests`);
+      assert.ok(!result.stderr.includes(WRONG_DIGEST), `scenario ${scenario} stderr must not leak digests`);
+      assertNoLock(fixture);
+    } finally {
+      fs.rmSync(fixture.base, { recursive: true, force: true });
+    }
+  }
+});
+
+test("ship-deploy fails after the shared deadline on stale generation with no lock", () => {
+  const fixture = makeFixture();
+  try {
+    const result = runShipDeploy(fixture, [fixture.sha], { FAKE_POST_ROLLOUT_SCENARIO: "deadline-stale-generation" });
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /did not settle within 30s/);
+    assert.match(result.stderr, /observed_generation_stale/);
+    assert.ok(!result.stderr.includes(WEB_POD_UID), "deadline stderr must not leak pod UIDs");
+    assertNoLock(fixture);
+  } finally {
+    fs.rmSync(fixture.base, { recursive: true, force: true });
+  }
+});
+
+test("ship-deploy ignores a stale pre-existing lock directory (no lock consulted)", () => {
   const fixture = makeFixture();
   try {
     fs.mkdirSync(path.join(fixture.repo, ".git/ship-deploy.lock"));
-    fs.writeFileSync(path.join(fixture.repo, ".git/ship-deploy.lock/owner.json"), `${JSON.stringify({ sha: fixture.sha, phase: "deployed" })}\n`);
+    fs.writeFileSync(path.join(fixture.repo, ".git/ship-deploy.lock/stale-owner.txt"), "stale\n");
     const result = runShipDeploy(fixture, [fixture.sha]);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /lock already exists/);
-    assert.ok(!readCalls(fixture).includes("docker build"), "must not build while another candidate holds the lock");
+    assert.equal(result.status, 0, `stderr: ${result.stderr}`);
+    assert.equal(result.stdout, `SHIP_DEPLOYED_SHA=${fixture.sha}\n`);
+    // The stale directory is untouched and unused: success proves the
+    // entry point neither consults nor requires any lock.
+    assert.equal(fs.readFileSync(path.join(fixture.repo, ".git/ship-deploy.lock/stale-owner.txt"), "utf8"), "stale\n");
+    assert.ok(readCalls(fixture).includes("docker build"), "must build even when a stale lock directory exists");
   } finally {
     fs.rmSync(fixture.base, { recursive: true, force: true });
   }
 });
 
-test("ship-deploy keeps the lock after a Helm failure and removes it after an early build failure", () => {
+test("ship-deploy creates no lock after a Helm failure or an early build failure", () => {
   const helmFail = makeFixture();
   try {
     const result = runShipDeploy(helmFail, [helmFail.sha], { FAKE_HELM_FAIL: "1" });
     assert.notEqual(result.status, 0);
-    assert.equal(lockOwner(helmFail).phase, "failed-after-helm");
+    assert.ok(!result.stdout.includes("SHIP_DEPLOYED_SHA="));
+    assertNoLock(helmFail);
   } finally {
     fs.rmSync(helmFail.base, { recursive: true, force: true });
   }
@@ -444,7 +543,8 @@ test("ship-deploy keeps the lock after a Helm failure and removes it after an ea
   try {
     const result = runShipDeploy(buildFail, [buildFail.sha], { FAKE_DOCKER_BUILD_FAIL: "1" });
     assert.notEqual(result.status, 0);
-    assert.ok(!fs.existsSync(path.join(buildFail.repo, ".git/ship-deploy.lock")), "early failure must remove the lock");
+    assert.ok(!result.stdout.includes("SHIP_DEPLOYED_SHA="));
+    assertNoLock(buildFail);
   } finally {
     fs.rmSync(buildFail.base, { recursive: true, force: true });
   }
@@ -567,10 +667,7 @@ test(
           !calls.includes("helm upgrade"),
           `mutation ${mutation} must fail before the Helm upgrade (pre-Helm failure)`,
         );
-        assert.ok(
-          !fs.existsSync(path.join(fixture.repo, ".git/ship-deploy.lock")),
-          `mutation ${mutation} is a pre-Helm failure and must remove the lock`,
-        );
+        assertNoLock(fixture);
       } finally {
         fs.rmSync(fixture.base, { recursive: true, force: true });
       }

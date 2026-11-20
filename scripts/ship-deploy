@@ -12,7 +12,9 @@
 #     (`git archive <SHA>`, never the working tree), tags them with the full
 #     SHA, pushes them, records their registry digests, deploys the exact
 #     candidate chart with digest-pinned images, and verifies the Ready
-#     workloads run those digests.
+#     workloads run those digests with a strict bounded post-rollout check
+#     (shared deadline, time-bounded read-only calls, ownership-chain and
+#     current-revision proof, sole non-deleting pod per workload).
 #   - On success, stdout is exactly one line: SHIP_DEPLOYED_SHA=<SHA>.
 #     Every other diagnostic goes to stderr.
 #
@@ -25,25 +27,13 @@
 # printed here. If the file is missing, untracked-check fails, permissions
 # are wrong, or the live cluster does not match, this script blocks.
 #
-# Serialization: a local lock directory (.git/ship-deploy.lock, atomic mkdir)
-# serializes ship entry points on this host/checkout so concurrent candidates
-# cannot race deploy and E2E. The lock is a handoff, not proof of
-# all-writer exclusivity: it cannot stop a manual kubectl/helm writer on
-# another host. Deployment therefore also requires the owner-coordinated
-# exclusive window (SHIP_DEPLOY_EXCLUSIVE_WINDOW=1, set by Cal only after
-# asking the user that no other writer, deploy, smoke, or manual operation
-# will touch companion-np during deploy+E2E). That assertion is operator
-# coordination, not system enforcement; this script never manufactures it.
-#   - ship-deploy holds the lock through build/deploy/verify and, on
-#     success, leaves it in phase "deployed" for the E2E runner to adopt.
-#     It does not remove the lock on success.
-#   - On failure before the Helm upgrade starts, the lock is removed.
-#   - On failure after the Helm upgrade starts, the lock is kept in phase
-#     "failed-after-helm" to block the next deploy until an operator
-#     inspects the cluster; nothing is auto-rolled-back or auto-cleaned.
-#   - If the E2E runner never runs, the "deployed" lock remains and blocks
-#     the next deploy until an operator verifies no E2E is running and
-#     removes only that lock directory.
+# No Ship lock: this entry point creates, consults, retains, or hands off
+# no lock file or directory, and requires no reservation gate. It has no
+# replacement reservation or lock, so concurrent candidates are not
+# serialized here. The E2E runner re-proves the exact candidate
+# independently from the registry and the live cluster without any handoff
+# file. On failure at any stage this script exits non-zero; nothing is
+# auto-rolled-back or auto-cleaned.
 set -uo pipefail
 
 NAMESPACE="companion-np"
@@ -56,50 +46,14 @@ VALUES_FILE_REL=".private/deploy/non-production-values.yaml"
 log() { printf 'ship-deploy: %s\n' "$*" >&2; }
 fail() { log "ERROR: $*"; exit 1; }
 
-pid_starttime() {
-  # /proc/<pid>/stat field 22 (starttime) after the comm field's closing paren.
-  local stat_file="/proc/$1/stat"
-  [[ -r "$stat_file" ]] || { printf 'gone'; return 0; }
-  local rest
-  rest="$(cat "$stat_file" 2>/dev/null)" || { printf 'gone'; return 0; }
-  rest="${rest##*) }"
-  # shellcheck disable=SC2086
-  set -- $rest
-  # After comm, fields are state,ppid,...; starttime is field 22 overall,
-  # i.e. index 20 in this remainder (1-based field 3 is $1 here).
-  printf '%s' "${20:-gone}"
-}
-
-# --- Global lock/temp state for the EXIT cleanup. ---
+# --- Global temp state for the EXIT cleanup. ---
 REPO_ROOT=""
-GIT_DIR=""
-LOCK_DIR=""
-LOCK_OWNED=0
-PHASE="none"
-HELM_STARTED=0
 TMP_ROOT=""
 
 cleanup_on_exit() {
   local rc=$?
   if [[ -n "$TMP_ROOT" && -d "$TMP_ROOT" && ! -L "$TMP_ROOT" ]]; then
     rm -rf -- "$TMP_ROOT" 2>/dev/null || true
-  fi
-  if [[ "$LOCK_OWNED" == "1" && "$PHASE" == "deploying" && -n "$LOCK_DIR" && -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]]; then
-    if [[ "$HELM_STARTED" == "0" ]]; then
-      rm -rf -- "$LOCK_DIR" 2>/dev/null || true
-    else
-      python3 - "$LOCK_DIR/owner.json" <<'PYEOF' 2>/dev/null || true
-import json, sys
-from pathlib import Path
-p = Path(sys.argv[1])
-try:
-    data = json.loads(p.read_text(encoding="utf-8"))
-    data["phase"] = "failed-after-helm"
-    p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-except Exception:
-    pass
-PYEOF
-    fi
   fi
   exit "$rc"
 }
@@ -114,16 +68,11 @@ CANDIDATE="$1"
 if [[ -n "${HUSKY:-}" && "$HUSKY" == "0" ]]; then
   fail "bypass disabled: HUSKY=0 would disable the Husky gates"
 fi
-# Owner-coordinated exclusive window: Cal sets this only after asking the
-# user. This script never sets it for itself and never treats the local
-# lock as proof of all-writer exclusivity.
-[[ "${SHIP_DEPLOY_EXCLUSIVE_WINDOW:-}" == "1" ]] || fail "requires SHIP_DEPLOY_EXCLUSIVE_WINDOW=1 confirming the owner-coordinated exclusive window for companion-np (Cal must ask the user; the local lock alone does not prove exclusivity)"
 
 # --- Repository and script provenance. ---
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "must run inside a Git repository"
 cd -- "$REPO_ROOT" || fail "cannot enter repository root"
-GIT_DIR="$(git rev-parse --absolute-git-dir)" || fail "not a Git repository"
-[[ -d "$GIT_DIR" && ! -L "$GIT_DIR" ]] || fail "unsafe Git layout: .git must be a directory, not a symlink"
+git rev-parse --absolute-git-dir >/dev/null 2>&1 || fail "not a Git repository"
 SCRIPT_SRC="${BASH_SOURCE[0]:-$0}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_SRC")" && pwd -P)" || fail "cannot resolve script directory"
 SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "$SCRIPT_SRC")"
@@ -142,7 +91,7 @@ for required in "package.json" "deploy/helm/companion/Chart.yaml" "deploy/docker
 done
 
 # --- Tooling: approved local build/deploy tools must already exist. ---
-for tool in git docker helm kubectl python3 tar cmp mktemp; do
+for tool in git docker helm kubectl python3 tar cmp mktemp timeout sleep date; do
   command -v "$tool" >/dev/null 2>&1 || fail "required tooling missing: $tool (install the approved tooling; refusing to guess an alternative)"
 done
 docker info >/dev/null 2>&1 || fail "docker daemon is not available; refusing to build without the approved build tooling"
@@ -270,52 +219,6 @@ while IFS='=' read -r parsed_key parsed_val; do
 done <<< "$PARSED"
 [[ -n "${ID_CONTEXT:-}" && -n "${ID_API_SERVER:-}" && -n "${ID_KUBE_SYSTEM_UID:-}" && -n "${ID_NAMESPACE_UID:-}" && -n "${ID_WEB_REPO:-}" && -n "${ID_WORKER_REPO:-}" && -n "${VAL_GATE_PORT:-}" ]] || fail "identity parse did not produce all required pins"
 
-# --- Local lock: atomic mkdir serializes ship entry points on this host. ---
-LOCK_DIR="$GIT_DIR/ship-deploy.lock"
-[[ -d "$GIT_DIR" && ! -L "$GIT_DIR" ]] || fail "unsafe Git layout for lock"
-if ! mkdir -- "$LOCK_DIR" 2>/dev/null; then
-  log "ERROR: ship deploy lock already exists at .git/ship-deploy.lock (another candidate deploy or E2E may be in progress, or a previous run left a handoff/failed lock)"
-  if [[ -f "$LOCK_DIR/owner.json" && ! -L "$LOCK_DIR/owner.json" ]]; then
-    log "lock owner (verify before removing only that directory):"
-    cat -- "$LOCK_DIR/owner.json" >&2 || true
-  fi
-  log "refusing to race another candidate; inspect the lock and cluster state, then remove only that lock directory if no live run owns it"
-  exit 1
-fi
-LOCK_OWNED=1
-PHASE="deploying"
-MY_PID="$$"
-MY_START="$(pid_starttime "$MY_PID")"
-write_lock() {
-  python3 - "$LOCK_DIR/owner.json" "$CANDIDATE" "$MY_PID" "$MY_START" "$PHASE" "$CANDIDATE_TREE" "${WEB_DIGEST:-}" "${WORKER_DIGEST:-}" "${WEB_POD:-}" "${WORKER_POD:-}" <<'PYEOF'
-import json, sys
-from pathlib import Path
-path = Path(sys.argv[1])
-sha, pid, start, phase, tree, web_digest, worker_digest, web_pod, worker_pod = sys.argv[2:11]
-payload = {
-    "sha": sha,
-    "pid": int(pid) if pid.isdigit() else pid,
-    "pid_starttime": start,
-    "phase": phase,
-    "tree": tree,
-    "namespace": "companion-np",
-    "release": "companion",
-}
-if web_digest:
-    payload["webDigest"] = web_digest
-if worker_digest:
-    payload["workerDigest"] = worker_digest
-if web_pod:
-    payload["webPod"] = web_pod
-if worker_pod:
-    payload["workerPod"] = worker_pod
-tmp = path.with_suffix(".tmp")
-tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-tmp.replace(path)
-PYEOF
-}
-write_lock || fail "cannot write ship deploy lock owner record"
-log "acquired local ship lock for candidate $CANDIDATE (phase=deploying); exclusive window asserted by operator, not proven by this lock"
 TMP_ROOT="$(mktemp -d)" || fail "cannot create temporary build directory"
 
 # --- Fixed cluster identity verification (read-only, before any mutation). ---
@@ -388,6 +291,8 @@ WEB_DIGEST=""
 WORKER_DIGEST=""
 WEB_POD=""
 WORKER_POD=""
+WEB_POD_UID=""
+WORKER_POD_UID=""
 
 build_and_push() {
   local label="$1" repo="$2" dockerfile="$3"
@@ -486,62 +391,346 @@ if web_env.get("WEB_TEST_GATE_ENABLED") != "true":
 PYEOF
 log "candidate chart render verified (digest-pinned, no Secrets, gate enabled)"
 
-HELM_STARTED=1
 helm upgrade --install "$RELEASE" "$CHART_DIR" -n "$NAMESPACE" -f "$VALUES_FILE" \
   --set "web.image.tag=$CANDIDATE" --set "worker.image.tag=$CANDIDATE" \
   --set "web.image.digest=$WEB_DIGEST" --set "worker.image.digest=$WORKER_DIGEST" \
   --wait --timeout 600s >&2 \
-  || fail "helm upgrade failed; deployment state is unknown and the lock is kept for operator inspection (no auto-rollback)"
+  || fail "helm upgrade failed; deployment state is unknown (no auto-rollback)"
 kubectl rollout status "deploy/$WEB_DEPLOY" -n "$NAMESPACE" --timeout=600s >&2 || fail "web rollout did not complete"
 kubectl rollout status "deploy/$WORKER_DEPLOY" -n "$NAMESPACE" --timeout=600s >&2 || fail "worker rollout did not complete"
-log "rollouts completed; verifying Ready pods run the expected digests"
+log "rollouts completed; verifying Ready pods run the expected digests (strict bounded post-rollout check)"
 
-kubectl get pods -n "$NAMESPACE" -o json > "$TMP_ROOT/pods.json" 2>/dev/null || fail "cannot list pods in $NAMESPACE after rollout"
-python3 - "$TMP_ROOT/pods.json" "$ID_WEB_REPO" "$WEB_DIGEST" "$ID_WORKER_REPO" "$WORKER_DIGEST" > "$TMP_ROOT/pods.txt" <<'PYEOF' || fail "Ready pods do not match the expected candidate digests"
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-web_repo, web_digest, worker_repo, worker_digest = sys.argv[2:6]
-def check(name, repo, digest):
-    pods = [
-        p for p in data.get("items", [])
-        if (p.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/name") == name
-        and (p.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/instance") == "companion"
-    ]
-    if len(pods) != 1:
-        sys.exit(1)
-    pod = pods[0]
-    if pod.get("status", {}).get("phase") != "Running":
-        sys.exit(1)
-    containers = pod["spec"]["containers"]
-    if len(containers) != 1 or containers[0]["image"] != f"{repo}@{digest}":
-        sys.exit(1)
-    statuses = pod["status"]["containerStatuses"]
-    if len(statuses) != 1 or statuses[0].get("ready") is not True:
-        sys.exit(1)
+# Strict post-rollout verifier: one shared deadline for both workloads,
+# time-bounded read-only calls, and repeated checks until the exact
+# candidate state is proven or the deadline expires. Recognized
+# same-Deployment terminating pods and not-yet-Ready / imageID-missing
+# pods are waited on; wrong (non-empty) digests, foreign owners, stale
+# ownership of a live pod, and unexplained live duplicates fail closed
+# immediately. Diagnostics are predicate codes only (no pod names, UIDs,
+# digests, or image references), so failure output stays safe metadata.
+POST_ROLLOUT_DEADLINE_SECONDS=30
+POST_ROLLOUT_POLL_SECONDS=1
+POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS=15
+VERIFIED_FILE="$TMP_ROOT/verified-pods.txt"
+POST_ROLLOUT_DEADLINE_EPOCH=$(( $(date +%s) + POST_ROLLOUT_DEADLINE_SECONDS ))
+while :; do
+  timeout "${POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS}s" kubectl get deploy "$WEB_DEPLOY" -n "$NAMESPACE" -o json > "$TMP_ROOT/deploy-web.json" 2>/dev/null || fail "cannot read deployment $WEB_DEPLOY after rollout"
+  timeout "${POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS}s" kubectl get deploy "$WORKER_DEPLOY" -n "$NAMESPACE" -o json > "$TMP_ROOT/deploy-worker.json" 2>/dev/null || fail "cannot read deployment $WORKER_DEPLOY after rollout"
+  timeout "${POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS}s" kubectl get pods -n "$NAMESPACE" -o json > "$TMP_ROOT/pods.json" 2>/dev/null || fail "cannot list pods in $NAMESPACE after rollout"
+  timeout "${POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS}s" kubectl get rs -n "$NAMESPACE" -o json > "$TMP_ROOT/replicasets.json" 2>/dev/null || fail "cannot list ReplicaSets in $NAMESPACE after rollout"
+  : > "$VERIFIED_FILE"
+  python3 - "$TMP_ROOT/pods.json" "$TMP_ROOT/replicasets.json" "$TMP_ROOT/deploy-web.json" "$TMP_ROOT/deploy-worker.json" "$ID_WEB_REPO" "$WEB_DIGEST" "$ID_WORKER_REPO" "$WORKER_DIGEST" "$WEB_DEPLOY" "$WORKER_DEPLOY" > "$VERIFIED_FILE" <<'PYEOF'
+import json, re, sys
+
+pods_path, rs_path, web_deploy_path, worker_deploy_path = sys.argv[1:5]
+web_repo, web_digest, worker_repo, worker_digest = sys.argv[5:9]
+web_deploy_name, worker_deploy_name = sys.argv[9:11]
+
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+def is_uuid(value):
+    return isinstance(value, str) and UUID_RE.fullmatch(value) is not None
+
+def digest_of(image_id):
+    text = image_id if isinstance(image_id, str) else ""
+    if "@" not in text:
+        return None
+    digest = text.rsplit("@", 1)[-1]
+    return digest if DIGEST_RE.fullmatch(digest) else None
+
+def meta_ns_ok(meta):
+    ns = meta.get("namespace")
+    return ns is None or ns == "companion-np"
+
+def controller_owner(meta):
+    owners = meta.get("ownerReferences") or []
+    return [o for o in owners if isinstance(o, dict) and o.get("controller") is True]
+
+try:
+    pods_data = json.load(open(pods_path, encoding="utf-8"))
+    rs_data = json.load(open(rs_path, encoding="utf-8"))
+    web_deploy_data = json.load(open(web_deploy_path, encoding="utf-8"))
+    worker_deploy_data = json.load(open(worker_deploy_path, encoding="utf-8"))
+except Exception:
+    print("invalid_cluster_state")
+    sys.exit(2)
+
+terminal = []
+retryable = []
+verified = {}
+
+def check_workload(label, deploy_data, expected_deploy_name, container_name, expected_image, expected_digest, workload_label):
+    meta = deploy_data.get("metadata") or {}
+    spec = deploy_data.get("spec") or {}
+    status = deploy_data.get("status") or {}
+    if meta.get("name") != expected_deploy_name:
+        terminal.append(f"{label}:deploy_name_mismatch")
+        return
+    if not meta_ns_ok(meta):
+        terminal.append(f"{label}:deploy_namespace_mismatch")
+        return
+    deploy_uid = meta.get("uid")
+    if not is_uuid(deploy_uid):
+        terminal.append(f"{label}:deploy_uid_missing")
+        return
+    generation = meta.get("generation")
+    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
+        terminal.append(f"{label}:deploy_generation_missing")
+        return
+    observed = status.get("observedGeneration")
+    if observed is None:
+        retryable.append(f"{label}:observed_generation_missing")
+    elif not isinstance(observed, int) or isinstance(observed, bool):
+        terminal.append(f"{label}:observed_generation_invalid")
+        return
+    elif observed > generation:
+        terminal.append(f"{label}:observed_generation_invalid")
+        return
+    elif observed < generation:
+        retryable.append(f"{label}:observed_generation_stale")
+    if spec.get("replicas") != 1:
+        terminal.append(f"{label}:deploy_replicas_not_single")
+        return
+    for field in ("updatedReplicas", "readyReplicas", "availableReplicas"):
+        if status.get(field) != 1:
+            retryable.append(f"{label}:deploy_{field}_not_single")
+    template_spec = ((spec.get("template") or {}).get("spec") or {})
+    containers = template_spec.get("containers") or []
+    if len(containers) != 1:
+        terminal.append(f"{label}:deploy_container_count")
+        return
+    if containers[0].get("name") != container_name:
+        terminal.append(f"{label}:deploy_container_name_mismatch")
+        return
+    if containers[0].get("image") != expected_image:
+        terminal.append(f"{label}:deploy_image_mismatch")
+        return
+    rs_items = rs_data.get("items") or []
+    rs_by_uid = {}
+    for rs in rs_items:
+        rmeta = rs.get("metadata") or {}
+        if isinstance(rmeta.get("uid"), str):
+            rs_by_uid[rmeta["uid"]] = rs
+    owned_rs = []
+    for rs in rs_items:
+        rmeta = rs.get("metadata") or {}
+        if not meta_ns_ok(rmeta):
+            continue
+        owners = rmeta.get("ownerReferences") or []
+        for owner in owners:
+            if (owner.get("controller") is True and owner.get("kind") == "Deployment"
+                    and owner.get("name") == expected_deploy_name and owner.get("uid") == deploy_uid
+                    and owner.get("apiVersion") == "apps/v1"):
+                owned_rs.append(rs)
+                break
+    if not owned_rs:
+        retryable.append(f"{label}:no_current_replicaset")
+        return
+    revisions = []
+    for rs in owned_rs:
+        annotations = (rs.get("metadata") or {}).get("annotations") or {}
+        raw_revision = annotations.get("deployment.kubernetes.io/revision")
+        try:
+            revision = int(raw_revision)
+        except (TypeError, ValueError):
+            terminal.append(f"{label}:rs_revision_missing")
+            return
+        if revision < 1:
+            terminal.append(f"{label}:rs_revision_missing")
+            return
+        revisions.append((revision, rs))
+    max_revision = max(revision for revision, _ in revisions)
+    current = [rs for revision, rs in revisions if revision == max_revision]
+    if len(current) != 1:
+        terminal.append(f"{label}:current_revision_ambiguous")
+        return
+    current_rs = current[0]
+    cr_meta = current_rs.get("metadata") or {}
+    current_rs_uid = cr_meta.get("uid")
+    current_rs_name = cr_meta.get("name")
+    if not is_uuid(current_rs_uid) or not isinstance(current_rs_name, str) or not current_rs_name:
+        terminal.append(f"{label}:current_rs_identity_missing")
+        return
+    cr_containers = (((current_rs.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers") or []
+    if len(cr_containers) != 1:
+        terminal.append(f"{label}:current_rs_container_count")
+        return
+    if cr_containers[0].get("name") != container_name:
+        terminal.append(f"{label}:current_rs_container_name_mismatch")
+        return
+    if cr_containers[0].get("image") != expected_image:
+        terminal.append(f"{label}:current_rs_image_mismatch")
+        return
+    current_hash = (cr_meta.get("labels") or {}).get("pod-template-hash")
+    if not isinstance(current_hash, str) or not current_hash:
+        terminal.append(f"{label}:current_rs_template_hash_missing")
+        return
+    pod_items = pods_data.get("items") or []
+    workload_pods = []
+    for pod in pod_items:
+        pmeta = pod.get("metadata") or {}
+        pname = pmeta.get("name") or ""
+        labels = pmeta.get("labels") or {}
+        if (isinstance(pname, str) and pname.startswith(expected_deploy_name + "-")) or labels.get("app.kubernetes.io/name") == workload_label:
+            workload_pods.append(pod)
+    deleting = []
+    live = []
+    for pod in workload_pods:
+        if (pod.get("metadata") or {}).get("deletionTimestamp"):
+            deleting.append(pod)
+        else:
+            live.append(pod)
+    for pod in deleting:
+        pmeta = pod.get("metadata") or {}
+        labels = pmeta.get("labels") or {}
+        if labels.get("app.kubernetes.io/name") != workload_label or labels.get("app.kubernetes.io/instance") != "companion":
+            terminal.append(f"{label}:retiring_pod_foreign_labels")
+            return
+        if not meta_ns_ok(pmeta):
+            terminal.append(f"{label}:retiring_pod_foreign_owner")
+            return
+        owners = controller_owner(pmeta)
+        if len(owners) != 1 or owners[0].get("kind") != "ReplicaSet" or owners[0].get("apiVersion") != "apps/v1":
+            terminal.append(f"{label}:retiring_pod_foreign_owner")
+            return
+        owner_rs = rs_by_uid.get(owners[0].get("uid")) if isinstance(owners[0].get("uid"), str) else None
+        if owner_rs is None:
+            terminal.append(f"{label}:retiring_pod_unknown_owner")
+            return
+        rs_owners = (owner_rs.get("metadata") or {}).get("ownerReferences") or []
+        if not any(o.get("controller") is True and o.get("kind") == "Deployment"
+                   and o.get("name") == expected_deploy_name and o.get("uid") == deploy_uid for o in rs_owners):
+            terminal.append(f"{label}:retiring_pod_foreign_owner")
+            return
+    if deleting:
+        retryable.append(f"{label}:retiring_pods_present")
+    if len(live) == 0:
+        retryable.append(f"{label}:no_live_pod")
+        return
+    if len(live) > 1:
+        terminal.append(f"{label}:duplicate_live_pods")
+        return
+    pod = live[0]
+    pmeta = pod.get("metadata") or {}
+    pod_name = pmeta.get("name")
+    pod_uid = pmeta.get("uid")
+    if not isinstance(pod_name, str) or not pod_name:
+        terminal.append(f"{label}:pod_name_missing")
+        return
+    if not is_uuid(pod_uid):
+        terminal.append(f"{label}:pod_uid_missing")
+        return
+    if not meta_ns_ok(pmeta):
+        terminal.append(f"{label}:pod_foreign_owner")
+        return
+    labels = pmeta.get("labels") or {}
+    if labels.get("app.kubernetes.io/name") != workload_label or labels.get("app.kubernetes.io/instance") != "companion":
+        terminal.append(f"{label}:pod_labels_mismatch")
+        return
+    if labels.get("pod-template-hash") != current_hash:
+        terminal.append(f"{label}:pod_template_hash_mismatch")
+        return
+    owners = controller_owner(pmeta)
+    if len(owners) != 1:
+        terminal.append(f"{label}:pod_foreign_owner")
+        return
+    owner = owners[0]
+    if owner.get("kind") != "ReplicaSet" or owner.get("apiVersion") != "apps/v1" or owner.get("name") != current_rs_name or owner.get("uid") != current_rs_uid:
+        owner_rs = rs_by_uid.get(owner.get("uid")) if isinstance(owner.get("uid"), str) else None
+        is_stale = False
+        if owner_rs is not None:
+            rs_owners = (owner_rs.get("metadata") or {}).get("ownerReferences") or []
+            if any(o.get("controller") is True and o.get("kind") == "Deployment"
+                   and o.get("name") == expected_deploy_name and o.get("uid") == deploy_uid for o in rs_owners):
+                annotations = (owner_rs.get("metadata") or {}).get("annotations") or {}
+                try:
+                    owner_revision = int(annotations.get("deployment.kubernetes.io/revision"))
+                except (TypeError, ValueError):
+                    owner_revision = None
+                if owner_revision is not None and owner_revision != max_revision:
+                    is_stale = True
+        terminal.append(f"{label}:pod_stale_owner" if is_stale else f"{label}:pod_foreign_owner")
+        return
+    pcontainers = (pod.get("spec") or {}).get("containers") or []
+    if len(pcontainers) != 1:
+        terminal.append(f"{label}:pod_container_count")
+        return
+    if pcontainers[0].get("name") != container_name:
+        terminal.append(f"{label}:pod_container_name_mismatch")
+        return
+    if pcontainers[0].get("image") != expected_image:
+        terminal.append(f"{label}:pod_image_mismatch")
+        return
+    pstatus = pod.get("status") or {}
+    if pstatus.get("phase") != "Running":
+        retryable.append(f"{label}:pod_not_running")
+        return
+    statuses = pstatus.get("containerStatuses") or []
+    if len(statuses) != 1:
+        retryable.append(f"{label}:pod_container_status_missing")
+        return
+    if statuses[0].get("name") != container_name:
+        terminal.append(f"{label}:pod_status_container_name_mismatch")
+        return
+    if statuses[0].get("ready") is not True:
+        retryable.append(f"{label}:pod_not_ready")
+        return
     image_id = statuses[0].get("imageID") or ""
-    if "@" not in image_id or image_id.rsplit("@", 1)[-1] != digest:
-        sys.exit(1)
-    print(pod["metadata"]["name"])
-web_pod = check("web", web_repo, web_digest)
-worker_pod = check("worker", worker_repo, worker_digest)
+    if not image_id:
+        retryable.append(f"{label}:pod_image_id_missing")
+        return
+    digest = digest_of(image_id)
+    if digest is None:
+        suffix = image_id.rsplit("@", 1)[-1] if "@" in image_id else ""
+        if suffix.startswith("sha256:"):
+            terminal.append(f"{label}:pod_wrong_digest")
+        else:
+            retryable.append(f"{label}:pod_image_id_missing")
+        return
+    if digest != expected_digest:
+        terminal.append(f"{label}:pod_wrong_digest")
+        return
+    verified[label] = (pod_name, pod_uid)
+
+check_workload("web", web_deploy_data, web_deploy_name, "web", f"{web_repo}@{web_digest}", web_digest, "web")
+check_workload("worker", worker_deploy_data, worker_deploy_name, "worker", f"{worker_repo}@{worker_digest}", worker_digest, "worker")
+if terminal:
+    print(terminal[0])
+    sys.exit(2)
+if retryable:
+    print(retryable[0])
+    sys.exit(3)
+print(verified["web"][0])
+print(verified["web"][1])
+print(verified["worker"][0])
+print(verified["worker"][1])
 PYEOF
-POD_LINES="$(cat -- "$TMP_ROOT/pods.txt")"
-WEB_POD="$(printf '%s\n' "$POD_LINES" | sed -n '1p')"
-WORKER_POD="$(printf '%s\n' "$POD_LINES" | sed -n '2p')"
-[[ -n "$WEB_POD" && -n "$WORKER_POD" ]] || fail "pod verification did not record both pods"
-for deploy_name in "$WEB_DEPLOY" "$WORKER_DEPLOY"; do
-  kubectl get deploy "$deploy_name" -n "$NAMESPACE" -o json > "$TMP_ROOT/deploy.json" 2>/dev/null || fail "cannot read deployment $deploy_name after rollout"
-  python3 - "$TMP_ROOT/deploy.json" <<'PYEOF' || fail "deployment $deploy_name ready replicas do not match the rolled-out candidate"
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-if (data.get("status") or {}).get("readyReplicas") != 1:
-    sys.exit(1)
-if (data.get("status") or {}).get("replicas") != 1:
-    sys.exit(1)
-PYEOF
+  verify_rc=$?
+  if [[ "$verify_rc" -eq 0 ]]; then
+    break
+  fi
+  verdict="$(head -n 1 -- "$VERIFIED_FILE" 2>/dev/null || printf 'unknown')"
+  [[ -n "$verdict" ]] || verdict="unknown"
+  if [[ "$verify_rc" -eq 2 ]]; then
+    fail "post-rollout verification failed ($verdict); deployment state is unknown (no auto-rollback)"
+  fi
+  if [[ "$verify_rc" -eq 3 ]]; then
+    now_epoch="$(date +%s)"
+    if (( now_epoch >= POST_ROLLOUT_DEADLINE_EPOCH )); then
+      fail "post-rollout verification did not settle within ${POST_ROLLOUT_DEADLINE_SECONDS}s (last waiting predicate: $verdict); deployment state is unknown (no auto-rollback)"
+    fi
+    log "post-rollout verification waiting: $verdict"
+    sleep "$POST_ROLLOUT_POLL_SECONDS"
+    continue
+  fi
+  fail "post-rollout verification error (exit $verify_rc, predicate: $verdict); deployment state is unknown (no auto-rollback)"
 done
-PHASE="deployed"
-write_lock || fail "cannot record deployed handoff in the ship lock"
-log "deployed candidate $CANDIDATE verified Ready on expected digests (web pod $WEB_POD, worker pod $WORKER_POD); lock left in phase=deployed for the E2E runner"
+WEB_POD="$(sed -n '1p' -- "$VERIFIED_FILE")"
+WEB_POD_UID="$(sed -n '2p' -- "$VERIFIED_FILE")"
+WORKER_POD="$(sed -n '3p' -- "$VERIFIED_FILE")"
+WORKER_POD_UID="$(sed -n '4p' -- "$VERIFIED_FILE")"
+[[ -n "$WEB_POD" && -n "$WEB_POD_UID" && -n "$WORKER_POD" && -n "$WORKER_POD_UID" ]] || fail "pod verification did not record both pods"
+log "deployed candidate $CANDIDATE verified Ready on expected digests (web pod $WEB_POD, worker pod $WORKER_POD)"
 # Only stdout output of the whole script.
 printf 'SHIP_DEPLOYED_SHA=%s\n' "$CANDIDATE"
