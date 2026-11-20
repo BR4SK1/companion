@@ -73,6 +73,7 @@ import {
   buildMarker,
   buildPodActionScript,
   createShutdownController,
+  deployedPinFromEnvironment,
   evaluateExpectedHttpPromptModuleTrace,
   expectedHttpPromptModuleFromEnvironment,
   fingerprint,
@@ -80,6 +81,7 @@ import {
   planRetainedScenarioDecision,
   redactText,
   sanitizeError,
+  verifyDeployedPin,
 } from "./deployed-smoke-lib.mjs";
 
 const NAMESPACE = process.env.E2E_DEPLOYED_NAMESPACE ?? "companion-np";
@@ -119,6 +121,10 @@ const expectedHttpPromptModule = expectedHttpPromptModuleFromEnvironment(process
 if (expectedHttpPromptModule !== null) {
   secrets.push(expectedHttpPromptModule.id, expectedHttpPromptModule.definitionFingerprint);
 }
+// Optional ship-runner pinning to the exact deployed pods/digests. When the
+// runner sets these, preflight must prove the live pods are those exact
+// pods running those exact digests in companion-np before anything is sent.
+const deployedPin = deployedPinFromEnvironment(process.env);
 const shutdown = createShutdownController();
 
 /** The marker of this run, set before the send (used by cleanup/recovery). */
@@ -278,6 +284,14 @@ async function preflight() {
   };
   log(`web: ${evidence.deployment.webImage}`);
   log(`worker: ${evidence.deployment.workerImage}`);
+  if (deployedPin !== null) {
+    const pinResult = verifyDeployedPin(evidence.deployment, deployedPin, NAMESPACE);
+    evidence.preflight.deployedPin = { required: true, passed: pinResult.passed, reason: pinResult.reason };
+    if (!pinResult.passed) {
+      throw new Error(`deployed pod/digest pin verification failed (${pinResult.reason}) — refusing to send against an unverified deployment`);
+    }
+    log("deployed pod/digest pin verified");
+  }
 
   // Gate configuration: must be enabled, in the authorized non-production
   // attestation shape, and never exposed beyond the pod.

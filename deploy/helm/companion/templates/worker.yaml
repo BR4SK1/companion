@@ -31,7 +31,7 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds }}
       containers:
         - name: worker
-          image: "{{ $repository }}:{{ $tag }}"
+          image: "{{ include "companion.imageRef" (dict "repository" $repository "tag" $tag "digest" (.Values.worker.image.digest | default "")) }}"
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

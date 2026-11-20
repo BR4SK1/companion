@@ -161,6 +161,19 @@ and supplied through a per-environment values file that this repository keeps
 outside version control (see [`../environments/README.md`](../environments/README.md)).
 Missing required values fail rendering instead of producing broken resources.
 
+## Digest pinning (ship deploys)
+
+Each deployable also accepts `web.image.digest` / `worker.image.digest`
+(`sha256:<64 hex>`; empty by default). When a digest is set, the Deployment
+renders `repository@digest` instead of `repository:tag`, so the kubelet pulls
+the verified content even if the tag is later overwritten; a malformed
+digest fails rendering. Ship deploys (`scripts/ship-deploy`) always set both
+the tag (the full candidate SHA, for provenance) and the digest of the image
+just built and pushed from the exact candidate source, then verify the Ready
+pods run those digests. Manual deploys may leave the digests empty and keep
+using tags. The chart render checks cover both forms and the malformed-digest
+negatives.
+
 Render-time checks for the chart guards — including the structural
 Deployment validation (ports vs env shapes, attestation injection) and the
 purpose/namespace negatives — run without cluster access:
@@ -179,7 +192,9 @@ deploy/helm/render-checks.sh
 - No production values file exists in this repository. Production
   configuration, approval binding, and promotion are still open (see
   [`../environments/production/README.md`](../environments/production/README.md)).
-- The chart creates no deployment automation: there is no trigger or
-  controller, and installs are performed manually from the local-only
-  per-environment procedure.
+- The chart itself creates no deployment automation and no controller.
+  Non-production ship installs run through the repo-owned
+  `scripts/ship-deploy` entry point (exact-SHA, digest-pinned); other installs
+  are performed manually from the local-only per-environment procedure.
+  Production promotion remains unresolved.
 - Container image definitions live in [`../../docker/`](../../docker/).

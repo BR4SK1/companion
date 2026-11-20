@@ -68,7 +68,7 @@ spec:
     spec:
       containers:
         - name: web
-          image: "{{ $repository }}:{{ $tag }}"
+          image: "{{ include "companion.imageRef" (dict "repository" $repository "tag" $tag "digest" (.Values.web.image.digest | default "")) }}"
           imagePullPolicy: IfNotPresent
           ports:
             - name: http

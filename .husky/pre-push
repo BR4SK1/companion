@@ -1,0 +1,3 @@
+#!/bin/sh
+# .husky/pre-push — delegate the real pre-push to the fleet wrapper.
+exec "/home/brasky/Projects/the-team/scripts/ship/ship-deploy"

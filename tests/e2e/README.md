@@ -39,17 +39,24 @@ cleanup cannot inspect historical `.runs` entries.
 
 ### Request scope: full E2E versus local-only
 
-An unqualified request to "run E2E" means a **full E2E run**: this disposable
-local stack **plus** deployed non-production validation, which includes the
+An unqualified request to "run E2E" means a **full E2E run**
+(`pnpm run test:e2e` from the repository root, `node scripts/test-e2e.mjs`):
+the complete inventory — the local candidate suites
+(format, lint, unit, typecheck, render checks, this disposable stack, the
+stack-ops and smoke-regression suites, and the non-database embedding
+check) **plus** deployed non-production validation, which includes the
 [guarded deployed smoke](#guarded-deployed-non-production-smoke), which may
-invoke external providers and incur charges. The command above runs only the
-local Playwright stack: chat/decision calls use a fake provider, while synthetic
-embedding requests use the configured embedding service. It
-never includes the deployed smoke, which runs only through its own documented
-command. A request explicitly scoped to local-only validation (for example
-"run the local e2e suite") covers exactly this local coverage and nothing
-deployed. The deployed smoke is also a valid request on its own, independent of
-a full E2E run.
+invoke external providers and incur charges. The full runner requires the
+exact candidate SHA (`SHIP_TARGET_SHA`/`SHIP_DEPLOYED_SHA`), the exclusive
+window, and the ship lock handoff from a successful `scripts/ship-deploy`,
+and has no local-only, filtered, or skip mode. The command above
+(`pnpm --filter @companion/e2e test`) runs only the local Playwright stack:
+chat/decision calls use a fake provider, while synthetic embedding requests
+use the configured embedding service. It never includes the deployed smoke
+and never proves deployed exact-candidate validation. A request explicitly
+scoped to local-only validation (for example "run the local e2e suite")
+covers exactly this local coverage and nothing deployed. The deployed smoke
+is also a valid request on its own, independent of a full E2E run.
 
 The stack supervisor (`stack.mjs`, started by Playwright as its web server)
 uses these dependencies:
@@ -226,7 +233,14 @@ and may invoke configured external providers that incur charges.
 - Read-only preflight before anything is sent verifies the deployed image,
   the gate's non-production attestation/enablement, a free local forward port,
   scenario linkage, provisioned-configuration fingerprint, thread quiescence,
-  and no unsettled prior smoke marker. Completed intentionally retained runs
+  and no unsettled prior smoke marker. When the ship E2E runner invokes the
+  smoke it also pins it to the deployment verified at deploy time:
+  `E2E_DEPLOYED_EXPECT_WEB_POD`, `E2E_DEPLOYED_EXPECT_WORKER_POD`,
+  `E2E_DEPLOYED_EXPECT_WEB_IMAGE_ID`, and `E2E_DEPLOYED_EXPECT_WORKER_IMAGE_ID`
+  are all required together, and preflight refuses to send unless the live
+  pods in `companion-np` are exactly those pods running exactly those image
+  digests. Standalone invocations without those variables retain the
+  original preflight behaviour; partial or invalid pinning fails closed. Completed intentionally retained runs
   are allowed; each new exact marker is checked before send. Memory ingest/recall and an embedding
   endpoint must be configured with bounded convergence. Enabled relationship
   questions, cursor initialization/catch-up, and runnable consolidation or

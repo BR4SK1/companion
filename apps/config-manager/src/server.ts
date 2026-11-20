@@ -369,48 +369,191 @@ export async function startConfigManagerServer(
 function renderIndex(environment: "nonprod" | "production"): string {
   const prod = environment === "production";
   return `<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Companion configuration manager</title>
-<style>body{font-family:system-ui,sans-serif;max-width:1000px;margin:2rem auto;padding:0 1rem}
-pre{white-space:pre-wrap;background:#f4f4f4;padding:.5rem;overflow:auto}
-.warn{background:#fff3cd;border:1px solid #c9a227;padding:.75rem}
-table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:.25rem;vertical-align:top}
-textarea{width:100%;min-height:4rem}</style></head><body>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Companion configuration manager</title>
+<style>
+:root{color-scheme:dark;--bg:#0f141a;--surface:#161e27;--surface-2:#1d2835;--header-bg:#111a24;--border:#3a4a5e;--text:#e8eef5;--muted:#b6c2d2;--accent:#3b82f6;--accent-strong:#2563eb;--danger:#b91c1c;--danger-strong:#991b1b;--warn-bg:#2e2107;--warn-text:#fcd34d;--warn-border:#92600e;--input-bg:#0a0f15;--input-border:#54687f;--focus:#7dd3fc;--badge-bg:#263449;--radius:.5rem}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;line-height:1.5}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.site-header{position:sticky;top:0;z-index:20;background:var(--header-bg);border-bottom:1px solid var(--border);box-shadow:0 2px 12px rgba(0,0,0,.45);max-height:85vh;overflow-y:auto}
+.header-inner{max-width:1100px;margin:0 auto;padding:.85rem 1rem;display:grid;grid-template-columns:minmax(0,1fr);gap:.75rem}
+.header-main{display:flex;flex-wrap:wrap;gap:1rem;align-items:flex-start;justify-content:space-between}
+.header-main>*{min-width:0}
+h1{font-size:1.45rem;line-height:1.2;margin:0 0 .35rem}
+.env-context{margin:0;color:var(--muted);overflow-wrap:anywhere}
+.env-badge{display:inline-block;background:var(--badge-bg);color:var(--text);border:1px solid var(--border);border-radius:999px;padding:.05rem .55rem}
+.warn{margin:.5rem 0 0;background:var(--warn-bg);color:var(--warn-text);border:1px solid var(--warn-border);border-radius:var(--radius);padding:.6rem .75rem;overflow-wrap:anywhere}
+.env-hint{margin:.5rem 0 0;color:var(--muted);overflow-wrap:anywhere}
+.controls{display:flex;flex-wrap:wrap;gap:.85rem 1.25rem;align-items:flex-end;min-width:0;flex:1 1 26rem}
+.confirm-field{display:grid;gap:.3rem;flex:1 1 16rem;min-width:0}
+.confirm-field label{font-weight:600}
+.hint{margin:0;color:var(--muted);font-size:.88rem}
+.actions{display:flex;flex-wrap:wrap;gap:.5rem}
+button{font:inherit;font-weight:600;border-radius:var(--radius);border:1px solid var(--border);background:var(--surface-2);color:var(--text);padding:.6rem 1rem;cursor:pointer}
+button:hover:not(:disabled){filter:brightness(1.18)}
+button:disabled{opacity:.55;cursor:not-allowed}
+button.primary{background:var(--accent-strong);border-color:#1e40af;color:#fff}
+button.danger{background:var(--danger);border-color:var(--danger-strong);color:#fff}
+input,textarea{width:100%;background:var(--input-bg);color:var(--text);border:1px solid var(--input-border);border-radius:.4rem;padding:.55rem .65rem;font:inherit}
+textarea{min-height:8rem;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9rem;white-space:pre-wrap;overflow-wrap:anywhere;resize:vertical}
+input[type="checkbox"]{width:1.25rem;height:1.25rem;accent-color:var(--accent);flex:none}
+input:focus-visible,textarea:focus-visible,button:focus-visible,summary:focus-visible,pre:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+.status{margin:0;flex-basis:100%;color:var(--muted);overflow-wrap:anywhere;min-width:0}
+.results{border:1px solid var(--border);border-radius:var(--radius);background:var(--surface);overflow:hidden}
+.results summary{cursor:pointer;padding:.6rem .8rem;font-weight:700;display:flex;flex-wrap:wrap;gap:.4rem 1rem;align-items:center;justify-content:space-between}
+.results summary::-webkit-details-marker{color:var(--muted)}
+.results-state{font-weight:500;color:var(--muted)}
+.results-panel{max-height:min(38vh,22rem);overflow:auto;border-top:1px solid var(--border)}
+.results-panel pre{margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86rem;padding:.8rem}
+.page{max-width:1100px;margin:0 auto;padding:1.25rem 1rem 3rem}
+.intro{color:var(--muted);max-width:70ch}
+.table-section{margin:1.75rem 0}
+.table-section>h2{font-size:1.2rem;margin:0 0 .3rem;padding-bottom:.35rem;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+.table-meta{color:var(--muted);margin:.35rem 0 1rem}
+.row-card{background:var(--surface);border:1px solid var(--border);border-radius:.65rem;padding:1rem;margin:0 0 1rem}
+.row-card>h3{margin:0 0 .85rem;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:1rem;overflow-wrap:anywhere}
+.fields{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,18rem),1fr));gap:.85rem}
+.field{display:grid;gap:.35rem;align-content:start;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius);padding:.7rem}
+.field--prompt{grid-column:1/-1}
+.field--boolean{display:flex;align-items:center;gap:.6rem}
+.field--boolean label{font-weight:600}
+.field label,.field-label{font-weight:600;overflow-wrap:anywhere}
+.field output{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow-wrap:anywhere;color:var(--muted)}
+.badge{display:inline-block;font-size:.72rem;font-weight:700;letter-spacing:.02em;text-transform:uppercase;background:var(--badge-bg);border:1px solid var(--border);border-radius:999px;padding:.08rem .45rem;vertical-align:middle}
+.field .hint{font-size:.82rem}
+@media (max-width:40rem){.header-inner{padding:.7rem .75rem}h1{font-size:1.2rem}.controls{min-width:0}.actions,.actions button{flex:1 1 auto}.page{padding:1rem .75rem 2.5rem}.env-hint{display:none}}
+@media (max-height:36rem){.header-inner{gap:.5rem;padding:.5rem .75rem}h1{font-size:1rem}.env-context{font-size:.9rem}.warn{margin-top:.35rem;padding:.45rem .6rem}.env-hint,#confirm-hint{display:none}.results-panel{max-height:24vh}.controls{align-items:center;gap:.5rem .85rem}button{padding:.45rem .8rem}input,textarea{padding:.4rem .5rem}}
+</style></head><body>
+<header class="site-header" id="site-header">
+<div class="header-inner">
+<div class="header-main">
+<div class="header-title">
 <h1>Companion configuration manager</h1>
-<p>Environment (fixed server-side, cannot be changed here): <strong>${escapeHtml(environment)}</strong></p>
-${prod ? '<p class="warn"><strong>PRODUCTION binding.</strong> Applying an edit writes production configuration. Type <code>production</code> exactly to confirm.</p>' : `<p>Type <code>nonprod</code> exactly to confirm an apply.</p>`}
-<p id="status">Loading…</p>
+<p class="env-context">Environment (fixed server-side, cannot be changed here): <strong class="env-badge" data-environment="${escapeHtml(environment)}">${escapeHtml(environment)}</strong></p>
+${prod ? '<p class="warn"><strong>PRODUCTION binding.</strong> Applying an edit writes production configuration. Type <code>production</code> exactly to confirm.</p>' : `<p class="env-hint">Non-production binding. Type <code>nonprod</code> exactly to confirm an apply.</p>`}
+</div>
+<div class="controls">
+<div class="confirm-field">
+<label for="confirm">Confirmation (type the environment name): <code>${escapeHtml(environment)}</code></label>
+<input id="confirm" name="confirmation" autocomplete="off" spellcheck="false" aria-describedby="confirm-hint">
+<p class="hint" id="confirm-hint">The typed value must match the server-bound environment exactly.</p>
+</div>
+<div class="actions">
+<button type="button" id="preview" disabled>Review diff</button>
+<button type="button" id="apply" class="${prod ? "danger" : "primary"}" disabled>Apply edits</button>
+</div>
+<p id="status" class="status" role="status" aria-live="polite" aria-atomic="true">Loading…</p>
+</div>
+</div>
+<details class="results" id="results">
+<summary id="results-summary" aria-controls="diff"><span>Review results</span><span class="results-state" id="results-state">No review yet</span></summary>
+<div class="results-panel"><pre id="diff" tabindex="0" aria-label="Review diff output">No review yet.</pre></div>
+</details>
+</div>
+</header>
+<main class="page">
+<p class="intro">Edit the labelled fields below, then use <strong>Review diff</strong> in the sticky header to preview the validated changes, or <strong>Apply edits</strong> to write them. Prompt fields show the full stored text in the labelled textarea. Fields marked <span class="badge">Server-managed</span> are display-only and cannot be set here. Review results stay available from the sticky header while you scroll.</p>
 <div id="tables"></div>
-<label>Confirmation (type the environment name): <input id="confirm" autocomplete="off"></label>
-<button id="preview">Review diff</button> <button id="apply">Apply edits</button>
-<pre id="diff"></pre>
+</main>
 <script>
 const env = ${JSON.stringify(environment)};
-let baseHash = null, snapshot = null;
+// The snapshot API returns no column metadata, so these mirror the
+// server registry: auto (server-managed) columns and per-table primary keys.
+const SERVER_MANAGED = new Set(['updated_at', 'revision']);
+const PRIMARY_KEYS = {
+  chat_identity: ['id'],
+  companion_time_settings: ['id'],
+  engagement_bands: ['id'],
+  memory_behavior: ['id'],
+  memory_subject: ['id'],
+  memory_prompt: ['kind', 'version'],
+  response_pattern: ['id'],
+  prompt_module: ['id'],
+  routine_settings: ['id'],
+  routine_transition: ['id'],
+  relationship_settings: ['id'],
+  relationship_tier: ['id'],
+  relationship_question_type: ['type_key'],
+  relationship_question: ['id'],
+  article_feed: ['id'],
+  article_behavior: ['id'],
+  article_prompt: ['kind', 'version']
+};
+let baseHash = null, snapshot = null, inFlight = false;
+const previewBtn = document.getElementById('preview');
+const applyBtn = document.getElementById('apply');
+const confirmInput = document.getElementById('confirm');
+const statusEl = document.getElementById('status');
+const diffEl = document.getElementById('diff');
+const resultsEl = document.getElementById('results');
+const resultsStateEl = document.getElementById('results-state');
+const headerEl = document.getElementById('site-header');
 function esc(s){return String(s ?? '').replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function setStatus(message){ statusEl.textContent = message; }
+function setResultsState(message){ resultsStateEl.textContent = message; }
+function setBusy(busy, message){
+  inFlight = busy;
+  previewBtn.disabled = busy || !snapshot;
+  applyBtn.disabled = busy || !snapshot;
+  confirmInput.disabled = busy;
+  headerEl.setAttribute('aria-busy', busy ? 'true' : 'false');
+  if (message) setStatus(message);
+}
+function primaryKeyLabel(table, row, ri){
+  const pk = PRIMARY_KEYS[table] || [];
+  if (pk.length === 0) return 'Row ' + (ri + 1);
+  const parts = pk.map(k => k + ': ' + String(row[k] ?? ''));
+  return parts.join(' · ') || ('Row ' + (ri + 1));
+}
+function fieldId(table, ri, field){
+  return 'f-' + String(table).replace(/[^a-zA-Z0-9_-]/g, '-') + '-' + ri + '-' + String(field).replace(/[^a-zA-Z0-9_-]/g, '-');
+}
 async function load(){
-  const r = await fetch('/api/config'); snapshot = await r.json();
-  baseHash = snapshot.snapshotHash;
-  document.getElementById('status').textContent = 'snapshot ' + baseHash + ' · ' + snapshot.tables.length + ' tables';
-  const host = document.getElementById('tables'); host.innerHTML = '';
-  for (const t of snapshot.tables) {
-    const sec = document.createElement('section');
-    sec.innerHTML = '<h2>' + esc(t.table) + '</h2><p>Prompt fields (full text): ' + esc(t.promptFields.join(', ') || 'none') + '</p>';
-    t.rows.forEach((row, ri) => {
-      const div = document.createElement('div');
-      div.dataset.table = t.table; div.dataset.row = ri;
-      let html = '<h3>Row ' + (ri+1) + '</h3><table>';
-      for (const [k,v] of Object.entries(row)) {
-        html += '<tr><th>' + esc(k) + '</th><td>';
-        if (t.promptFields.includes(k)) html += '<pre>' + esc(v ?? '') + '</pre><textarea data-field="' + esc(k) + '">' + esc(v ?? '') + '</textarea>';
-        else if (typeof v === 'boolean') html += '<input type="checkbox" data-field="' + esc(k) + '"' + (v ? ' checked' : '') + '>';
-        else if (v === null || v === undefined) html += '<input data-field="' + esc(k) + '" value="">';
-        else html += '<input data-field="' + esc(k) + '" value="' + esc(v) + '">';
-        html += '</td></tr>';
-      }
-      div.innerHTML = html + '</table>';
-      sec.appendChild(div);
-    });
-    host.appendChild(sec);
+  try {
+    const r = await fetch('/api/config');
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.message || ('HTTP ' + r.status));
+    snapshot = data;
+    baseHash = snapshot.snapshotHash;
+    setStatus('snapshot ' + baseHash + ' · ' + snapshot.tables.length + ' tables');
+    const host = document.getElementById('tables'); host.innerHTML = '';
+    for (const t of snapshot.tables) {
+      const sec = document.createElement('section');
+      sec.className = 'table-section';
+      sec.innerHTML = '<h2>' + esc(t.table) + '</h2><p class="table-meta">Prompt fields (full text): ' + esc(t.promptFields.join(', ') || 'none') + ' · ' + t.rows.length + ' row(s)</p>';
+      t.rows.forEach((row, ri) => {
+        const div = document.createElement('div');
+        div.className = 'row-card';
+        div.dataset.table = t.table; div.dataset.row = ri;
+        let html = '<h3>' + esc(primaryKeyLabel(t.table, row, ri)) + '</h3><div class="fields">';
+        for (const [k, v] of Object.entries(row)) {
+          const id = fieldId(t.table, ri, k);
+          if (SERVER_MANAGED.has(k)) {
+            html += '<div class="field field--server-managed"><span class="field-label">' + esc(k) + ' <span class="badge">Server-managed</span></span><output>' + esc(v ?? '') + '</output><span class="hint">Display only — cannot be set here.</span></div>';
+          } else if (t.promptFields.includes(k)) {
+            html += '<div class="field field--prompt"><label for="' + id + '">' + esc(k) + ' <span class="badge">Full prompt text</span></label><textarea id="' + id + '" data-field="' + esc(k) + '" spellcheck="false">' + esc(v ?? '') + '</textarea></div>';
+          } else if (typeof v === 'boolean') {
+            html += '<div class="field field--boolean"><input type="checkbox" id="' + id + '" data-field="' + esc(k) + '"' + (v ? ' checked' : '') + '><label for="' + id + '">' + esc(k) + '</label></div>';
+          } else if (v === null || v === undefined) {
+            html += '<div class="field"><label for="' + id + '">' + esc(k) + '</label><input id="' + id + '" data-field="' + esc(k) + '" value="" placeholder="(empty — null)"></div>';
+          } else {
+            html += '<div class="field"><label for="' + id + '">' + esc(k) + '</label><input id="' + id + '" data-field="' + esc(k) + '" value="' + esc(v) + '"></div>';
+          }
+        }
+        div.innerHTML = html + '</div>';
+        sec.appendChild(div);
+      });
+      host.appendChild(sec);
+    }
+    setBusy(false);
+    return true;
+  } catch (error) {
+    snapshot = null; baseHash = null;
+    setBusy(false);
+    setStatus('Could not load snapshot: ' + (error && error.message ? error.message : String(error)));
+    setResultsState('Load failed');
+    diffEl.textContent = 'Could not load snapshot: ' + (error && error.message ? error.message : String(error));
+    return false;
   }
 }
 function collectEdits(){
@@ -435,16 +578,58 @@ function collectEdits(){
 async function call(path, body){
   const r = await fetch(path, {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(body)});
   const data = await r.json().catch(()=>({}));
-  document.getElementById('diff').textContent = JSON.stringify(data, null, 2);
+  diffEl.textContent = JSON.stringify(data, null, 2);
   return {status: r.status, data};
 }
-document.getElementById('preview').onclick = async () => {
-  await call('/api/config/preview', {baseHash, edits: collectEdits()});
+previewBtn.onclick = async () => {
+  if (inFlight || !snapshot) return;
+  setBusy(true, 'Reviewing diff…');
+  setResultsState('Reviewing…');
+  resultsEl.open = true;
+  try {
+    const {status, data} = await call('/api/config/preview', {baseHash, edits: collectEdits()});
+    if (status === 200) {
+      setStatus('Diff reviewed: ' + ((data && data.diff ? data.diff.length : 0)) + ' change(s). Nothing was written.');
+      setResultsState('Preview complete');
+    } else {
+      setStatus('Preview failed (' + status + '): ' + ((data && data.message) || 'see review results'));
+      setResultsState('Preview failed');
+    }
+  } catch (error) {
+    const message = 'Preview failed: ' + (error && error.message ? error.message : String(error));
+    setStatus(message);
+    diffEl.textContent = message;
+    setResultsState('Preview failed');
+  } finally {
+    setBusy(false);
+  }
 };
-document.getElementById('apply').onclick = async () => {
-  const confirmation = document.getElementById('confirm').value;
-  const {status, data} = await call('/api/config/apply', {baseHash, edits: collectEdits(), confirmation});
-  if (status === 200) { document.getElementById('status').textContent = 'applied; new snapshot ' + data.newSnapshotHash; await load(); }
+applyBtn.onclick = async () => {
+  if (inFlight || !snapshot) return;
+  const confirmation = confirmInput.value;
+  setBusy(true, 'Applying edits…');
+  setResultsState('Applying…');
+  resultsEl.open = true;
+  try {
+    const {status, data} = await call('/api/config/apply', {baseHash, edits: collectEdits(), confirmation});
+    if (status === 200) {
+      const newHash = data.newSnapshotHash;
+      const reloaded = await load();
+      resultsEl.open = true;
+      setResultsState('Apply complete');
+      setStatus(reloaded ? ('Applied; new snapshot ' + newHash) : ('Applied; new snapshot ' + newHash + ', but the snapshot could not be reloaded.'));
+    } else {
+      setStatus('Apply failed (' + status + '): ' + ((data && data.message) || 'see review results'));
+      setResultsState('Apply failed');
+    }
+  } catch (error) {
+    const message = 'Apply failed: ' + (error && error.message ? error.message : String(error));
+    setStatus(message);
+    diffEl.textContent = message;
+    setResultsState('Apply failed');
+  } finally {
+    setBusy(false);
+  }
 };
 load();
 </script></body></html>`;

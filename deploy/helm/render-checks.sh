@@ -336,4 +336,41 @@ pass "the test gate and the web LoadBalancer can never render in the same releas
 render_must_fail 'web.image.repository=registry.example/companion/web'
 pass "rendering without the deployment-purpose attestation fails"
 
+# 7. Digest pinning: a valid sha256 digest renders repository@digest for
+#    both deployables; a malformed digest fails rendering. Without a
+#    digest the tag form is unchanged (checked structurally above).
+TEST_WEB_DIGEST="sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+TEST_WORKER_DIGEST="sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+render "$BASE_SETS,$GATE_SETS,web.image.digest=$TEST_WEB_DIGEST,worker.image.digest=$TEST_WORKER_DIGEST" > "$TMPDIR_CHECK/digest.yaml"
+python3 - "$TMPDIR_CHECK/digest.yaml" "$TEST_WEB_DIGEST" "$TEST_WORKER_DIGEST" <<'PYEOF'
+import sys
+
+import yaml
+
+path, web_digest, worker_digest = sys.argv[1:4]
+with open(path, encoding="utf-8") as handle:
+    docs = [doc for doc in yaml.safe_load_all(handle) if doc]
+
+def image_of(name_suffix):
+    matches = [
+        doc for doc in docs
+        if doc.get("kind") == "Deployment" and doc["metadata"]["name"].endswith(name_suffix)
+    ]
+    assert len(matches) == 1, f"expected one Deployment ending {name_suffix}, got {len(matches)}"
+    return matches[0]["spec"]["template"]["spec"]["containers"][0]["image"]
+
+web_image = image_of("-web")
+worker_image = image_of("-worker")
+assert web_image == f"registry.example/companion/web@{web_digest}", web_image
+assert worker_image == f"registry.example/companion/worker@{worker_digest}", worker_image
+print("ok    - digest pinning renders repository@digest for both web and worker")
+PYEOF
+pass "digest pinning renders repository@digest for both deployables"
+render_must_fail "$BASE_SETS,web.image.digest=sha256:not-hex"
+pass "a malformed web image digest fails rendering"
+render_must_fail "$BASE_SETS,worker.image.digest=latest"
+pass "a malformed worker image digest fails rendering"
+render_must_fail "$BASE_SETS,web.image.digest=sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+pass "an uppercase web image digest fails rendering"
+
 echo "all chart render checks passed"

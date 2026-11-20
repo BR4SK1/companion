@@ -1,0 +1,531 @@
+#!/usr/bin/env bash
+# Companion non-production ship deploy (repo-owned Step 4 entry point).
+#
+# Contract (fleet wrapper calls this exactly as `./scripts/ship-deploy <SHA>`
+# from the repository root after requiring HEAD == SHA and a clean tree):
+#   - Exactly one argument: the exact outgoing candidate SHA (40 lowercase
+#     hex characters). No other argument, environment selection, or staging
+#     endpoint inference is accepted. The target is the single predetermined
+#     non-production deployment (namespace companion-np, release companion);
+#     configuration files never select a different target.
+#   - Builds both images from the immutable candidate source only
+#     (`git archive <SHA>`, never the working tree), tags them with the full
+#     SHA, pushes them, records their registry digests, deploys the exact
+#     candidate chart with digest-pinned images, and verifies the Ready
+#     workloads run those digests.
+#   - On success, stdout is exactly one line: SHIP_DEPLOYED_SHA=<SHA>.
+#     Every other diagnostic goes to stderr.
+#
+# Fixed-target identity: live cluster identity (context, API server,
+# namespace/UID pins, approved registry repositories) is verified against a
+# fixed trusted local-only file (.private/deploy/ship-target-identity.json,
+# gitignored, 0600, owned by the operator). That file only supplies expected
+# fingerprints for comparison; it never selects the target. UIDs and the API
+# endpoint live only in that local file and are never tracked, logged, or
+# printed here. If the file is missing, untracked-check fails, permissions
+# are wrong, or the live cluster does not match, this script blocks.
+#
+# Serialization: a local lock directory (.git/ship-deploy.lock, atomic mkdir)
+# serializes ship entry points on this host/checkout so concurrent candidates
+# cannot race deploy and E2E. The lock is a handoff, not proof of
+# all-writer exclusivity: it cannot stop a manual kubectl/helm writer on
+# another host. Deployment therefore also requires the owner-coordinated
+# exclusive window (SHIP_DEPLOY_EXCLUSIVE_WINDOW=1, set by Cal only after
+# asking the user that no other writer, deploy, smoke, or manual operation
+# will touch companion-np during deploy+E2E). That assertion is operator
+# coordination, not system enforcement; this script never manufactures it.
+#   - ship-deploy holds the lock through build/deploy/verify and, on
+#     success, leaves it in phase "deployed" for the E2E runner to adopt.
+#     It does not remove the lock on success.
+#   - On failure before the Helm upgrade starts, the lock is removed.
+#   - On failure after the Helm upgrade starts, the lock is kept in phase
+#     "failed-after-helm" to block the next deploy until an operator
+#     inspects the cluster; nothing is auto-rolled-back or auto-cleaned.
+#   - If the E2E runner never runs, the "deployed" lock remains and blocks
+#     the next deploy until an operator verifies no E2E is running and
+#     removes only that lock directory.
+set -uo pipefail
+
+NAMESPACE="companion-np"
+RELEASE="companion"
+WEB_DEPLOY="companion-web"
+WORKER_DEPLOY="companion-worker"
+IDENTITY_FILE_REL=".private/deploy/ship-target-identity.json"
+VALUES_FILE_REL=".private/deploy/non-production-values.yaml"
+
+log() { printf 'ship-deploy: %s\n' "$*" >&2; }
+fail() { log "ERROR: $*"; exit 1; }
+
+pid_starttime() {
+  # /proc/<pid>/stat field 22 (starttime) after the comm field's closing paren.
+  local stat_file="/proc/$1/stat"
+  [[ -r "$stat_file" ]] || { printf 'gone'; return 0; }
+  local rest
+  rest="$(cat "$stat_file" 2>/dev/null)" || { printf 'gone'; return 0; }
+  rest="${rest##*) }"
+  # shellcheck disable=SC2086
+  set -- $rest
+  # After comm, fields are state,ppid,...; starttime is field 22 overall,
+  # i.e. index 20 in this remainder (1-based field 3 is $1 here).
+  printf '%s' "${20:-gone}"
+}
+
+# --- Global lock/temp state for the EXIT cleanup. ---
+REPO_ROOT=""
+GIT_DIR=""
+LOCK_DIR=""
+LOCK_OWNED=0
+PHASE="none"
+HELM_STARTED=0
+TMP_ROOT=""
+
+cleanup_on_exit() {
+  local rc=$?
+  if [[ -n "$TMP_ROOT" && -d "$TMP_ROOT" && ! -L "$TMP_ROOT" ]]; then
+    rm -rf -- "$TMP_ROOT" 2>/dev/null || true
+  fi
+  if [[ "$LOCK_OWNED" == "1" && "$PHASE" == "deploying" && -n "$LOCK_DIR" && -d "$LOCK_DIR" && ! -L "$LOCK_DIR" ]]; then
+    if [[ "$HELM_STARTED" == "0" ]]; then
+      rm -rf -- "$LOCK_DIR" 2>/dev/null || true
+    else
+      python3 - "$LOCK_DIR/owner.json" <<'PYEOF' 2>/dev/null || true
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+    data["phase"] = "failed-after-helm"
+    p.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+except Exception:
+    pass
+PYEOF
+    fi
+  fi
+  exit "$rc"
+}
+trap cleanup_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# --- Argument contract: exactly one 40-hex SHA, nothing else. ---
+[[ $# -eq 1 ]] || fail "takes exactly one argument: the outgoing candidate SHA (40 hex characters)"
+CANDIDATE="$1"
+[[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]] || fail "candidate SHA is not exactly 40 lowercase hex characters"
+if [[ -n "${HUSKY:-}" && "$HUSKY" == "0" ]]; then
+  fail "bypass disabled: HUSKY=0 would disable the Husky gates"
+fi
+# Owner-coordinated exclusive window: Cal sets this only after asking the
+# user. This script never sets it for itself and never treats the local
+# lock as proof of all-writer exclusivity.
+[[ "${SHIP_DEPLOY_EXCLUSIVE_WINDOW:-}" == "1" ]] || fail "requires SHIP_DEPLOY_EXCLUSIVE_WINDOW=1 confirming the owner-coordinated exclusive window for companion-np (Cal must ask the user; the local lock alone does not prove exclusivity)"
+
+# --- Repository and script provenance. ---
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "must run inside a Git repository"
+cd -- "$REPO_ROOT" || fail "cannot enter repository root"
+GIT_DIR="$(git rev-parse --absolute-git-dir)" || fail "not a Git repository"
+[[ -d "$GIT_DIR" && ! -L "$GIT_DIR" ]] || fail "unsafe Git layout: .git must be a directory, not a symlink"
+SCRIPT_SRC="${BASH_SOURCE[0]:-$0}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_SRC")" && pwd -P)" || fail "cannot resolve script directory"
+SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "$SCRIPT_SRC")"
+[[ -f "$SCRIPT_PATH" && ! -L "$SCRIPT_PATH" ]] || fail "scripts/ship-deploy must be a regular file, not a symlink"
+[[ "$SCRIPT_PATH" == "$REPO_ROOT/scripts/ship-deploy" ]] || fail "scripts/ship-deploy must be invoked from the repository root entry point"
+
+git cat-file -e "$CANDIDATE^{commit}" >/dev/null 2>&1 || fail "candidate SHA is not a commit present locally: $CANDIDATE"
+[[ "$(git rev-parse "$CANDIDATE")" == "$CANDIDATE" ]] || fail "candidate SHA does not resolve to itself"
+CANDIDATE_TREE="$(git rev-parse "$CANDIDATE^{tree}")" || fail "cannot resolve candidate tree"
+HEAD_SHA="$(git rev-parse HEAD)" || fail "cannot resolve HEAD"
+[[ "$HEAD_SHA" == "$CANDIDATE" ]] || fail "HEAD ($HEAD_SHA) does not equal the candidate ($CANDIDATE); refusing to deploy a moved HEAD"
+# The running script must be byte-identical to the candidate's tracked copy.
+git show "$CANDIDATE:scripts/ship-deploy" 2>/dev/null | cmp -s - "$SCRIPT_PATH" || fail "running scripts/ship-deploy differs from the candidate tree; refusing to deploy with an unverified entry point"
+for required in "package.json" "deploy/helm/companion/Chart.yaml" "deploy/docker/Dockerfile.web" "deploy/docker/Dockerfile.worker" "scripts/test-e2e.mjs"; do
+  git cat-file -e "$CANDIDATE:$required" >/dev/null 2>&1 || fail "candidate tree is missing required path: $required"
+done
+
+# --- Tooling: approved local build/deploy tools must already exist. ---
+for tool in git docker helm kubectl python3 tar cmp mktemp; do
+  command -v "$tool" >/dev/null 2>&1 || fail "required tooling missing: $tool (install the approved tooling; refusing to guess an alternative)"
+done
+docker info >/dev/null 2>&1 || fail "docker daemon is not available; refusing to build without the approved build tooling"
+
+# --- Local-only identity and values (fixed paths, never env-selected). ---
+IDENTITY_FILE="$REPO_ROOT/$IDENTITY_FILE_REL"
+VALUES_FILE="$REPO_ROOT/$VALUES_FILE_REL"
+[[ -f "$IDENTITY_FILE" && ! -L "$IDENTITY_FILE" ]] || fail "trusted local identity file is missing: $IDENTITY_FILE_REL (provision the fixed identity pins locally; refusing to guess cluster identity)"
+[[ -f "$VALUES_FILE" && ! -L "$VALUES_FILE" ]] || fail "local-only non-production values file is missing: $VALUES_FILE_REL (refusing to guess environment values)"
+if git ls-files --error-unmatch -- "$IDENTITY_FILE_REL" >/dev/null 2>&1; then
+  fail "identity file must not be tracked in git"
+fi
+if git ls-files --error-unmatch -- "$VALUES_FILE_REL" >/dev/null 2>&1; then
+  fail "non-production values file must not be tracked in git"
+fi
+git check-ignore -q -- "$IDENTITY_FILE_REL" || fail "identity file must be gitignored (local-only)"
+git check-ignore -q -- "$VALUES_FILE_REL" || fail "non-production values file must be gitignored (local-only)"
+
+# Parse and cross-check identity + values. Values themselves are never
+# printed; only the validated, non-secret pins needed below are emitted.
+PARSED="$(python3 - "$IDENTITY_FILE" "$VALUES_FILE" <<'PYEOF'
+import json, os, re, stat, sys
+from pathlib import Path
+
+def die(msg):
+    print(f"ship-deploy: ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+def load_identity(path):
+    p = Path(path)
+    st = p.lstat()
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        die("identity file must be a regular file, not a symlink")
+    if st.st_uid != os.geteuid():
+        die("identity file must be owned by the operator running the deploy")
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        die("identity file must have mode 0600 (owner read/write only)")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        die("identity file is not valid JSON")
+    return data
+
+ident = load_identity(sys.argv[1])
+def req_str(key, pattern=None):
+    val = ident.get(key)
+    if not isinstance(val, str) or not val:
+        die(f"identity file field {key} is missing or invalid")
+    if pattern and not re.fullmatch(pattern, val):
+        die(f"identity file field {key} has an invalid format")
+    return val
+
+context = req_str("context", r"[A-Za-z0-9_-]+")
+api_server = req_str("apiServer", r"https://[A-Za-z0-9._-]+:[0-9]+")
+kube_system_uid = req_str("kubeSystemUid", r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+namespace = req_str("namespace")
+namespace_uid = req_str("namespaceUid", r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+release = req_str("release")
+chart = req_str("chart")
+if namespace != "companion-np":
+    die("identity file namespace does not match the predetermined non-production namespace")
+if release != "companion" or chart != "companion":
+    die("identity file release/chart do not match the predetermined release")
+deployments = ident.get("deployments")
+repos = ident.get("registryRepositories")
+if not isinstance(deployments, dict) or deployments.get("web") != "companion-web" or deployments.get("worker") != "companion-worker":
+    die("identity file deployments do not match the predetermined workloads")
+if not isinstance(repos, dict):
+    die("identity file registry repositories are missing")
+web_repo = repos.get("web")
+worker_repo = repos.get("worker")
+for label, repo in (("web", web_repo), ("worker", worker_repo)):
+    if not isinstance(repo, str) or not repo or " " in repo or "@" in repo or repo.endswith(":") or ":" in repo.rsplit("/", 1)[-1]:
+        die(f"identity file {label} registry repository is invalid")
+
+try:
+    import yaml
+except ImportError:
+    die("python3 PyYAML is required to parse the local values file (install the approved tooling)")
+try:
+    values = yaml.safe_load(Path(sys.argv[2]).read_text(encoding="utf-8"))
+except Exception:
+    die("non-production values file is not valid YAML")
+if not isinstance(values, dict):
+    die("non-production values file must be a mapping")
+deployment = values.get("deployment") or {}
+if deployment.get("purpose") != "non-production":
+    die("non-production values must declare deployment.purpose=non-production")
+if deployment.get("namespace") != "companion-np":
+    die("non-production values must declare deployment.namespace=companion-np")
+web = values.get("web") or {}
+worker = values.get("worker") or {}
+if (web.get("image") or {}).get("repository") != web_repo:
+    die("non-production values web.image.repository does not match the approved registry repository in the identity file")
+if (worker.get("image") or {}).get("repository") != worker_repo:
+    die("non-production values worker.image.repository does not match the approved registry repository in the identity file")
+if worker.get("enabled") is not True:
+    die("non-production values must enable the worker")
+test_gate = web.get("testGate") or {}
+if test_gate.get("enabled") is not True:
+    die("non-production values must enable the web test-entry gate for deployed validation")
+gate_port = test_gate.get("port", 3100)
+if not isinstance(gate_port, int) or not (1 <= gate_port <= 65535):
+    die("non-production values gate port is invalid")
+for key, val in [
+    ("ID_CONTEXT", context), ("ID_API_SERVER", api_server),
+    ("ID_KUBE_SYSTEM_UID", kube_system_uid), ("ID_NAMESPACE_UID", namespace_uid),
+    ("ID_WEB_REPO", web_repo), ("ID_WORKER_REPO", worker_repo),
+    ("VAL_GATE_PORT", str(gate_port)),
+]:
+    print(f"{key}={val}")
+PYEOF
+)" || fail "local identity/values verification failed (see above; refusing to guess target, registry, or values)"
+while IFS='=' read -r parsed_key parsed_val; do
+  case "$parsed_key" in
+    ID_CONTEXT) ID_CONTEXT="$parsed_val" ;;
+    ID_API_SERVER) ID_API_SERVER="$parsed_val" ;;
+    ID_KUBE_SYSTEM_UID) ID_KUBE_SYSTEM_UID="$parsed_val" ;;
+    ID_NAMESPACE_UID) ID_NAMESPACE_UID="$parsed_val" ;;
+    ID_WEB_REPO) ID_WEB_REPO="$parsed_val" ;;
+    ID_WORKER_REPO) ID_WORKER_REPO="$parsed_val" ;;
+    VAL_GATE_PORT) VAL_GATE_PORT="$parsed_val" ;;
+    *) fail "unexpected identity parse output" ;;
+  esac
+done <<< "$PARSED"
+[[ -n "${ID_CONTEXT:-}" && -n "${ID_API_SERVER:-}" && -n "${ID_KUBE_SYSTEM_UID:-}" && -n "${ID_NAMESPACE_UID:-}" && -n "${ID_WEB_REPO:-}" && -n "${ID_WORKER_REPO:-}" && -n "${VAL_GATE_PORT:-}" ]] || fail "identity parse did not produce all required pins"
+
+# --- Local lock: atomic mkdir serializes ship entry points on this host. ---
+LOCK_DIR="$GIT_DIR/ship-deploy.lock"
+[[ -d "$GIT_DIR" && ! -L "$GIT_DIR" ]] || fail "unsafe Git layout for lock"
+if ! mkdir -- "$LOCK_DIR" 2>/dev/null; then
+  log "ERROR: ship deploy lock already exists at .git/ship-deploy.lock (another candidate deploy or E2E may be in progress, or a previous run left a handoff/failed lock)"
+  if [[ -f "$LOCK_DIR/owner.json" && ! -L "$LOCK_DIR/owner.json" ]]; then
+    log "lock owner (verify before removing only that directory):"
+    cat -- "$LOCK_DIR/owner.json" >&2 || true
+  fi
+  log "refusing to race another candidate; inspect the lock and cluster state, then remove only that lock directory if no live run owns it"
+  exit 1
+fi
+LOCK_OWNED=1
+PHASE="deploying"
+MY_PID="$$"
+MY_START="$(pid_starttime "$MY_PID")"
+write_lock() {
+  python3 - "$LOCK_DIR/owner.json" "$CANDIDATE" "$MY_PID" "$MY_START" "$PHASE" "$CANDIDATE_TREE" "${WEB_DIGEST:-}" "${WORKER_DIGEST:-}" "${WEB_POD:-}" "${WORKER_POD:-}" <<'PYEOF'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+sha, pid, start, phase, tree, web_digest, worker_digest, web_pod, worker_pod = sys.argv[2:11]
+payload = {
+    "sha": sha,
+    "pid": int(pid) if pid.isdigit() else pid,
+    "pid_starttime": start,
+    "phase": phase,
+    "tree": tree,
+    "namespace": "companion-np",
+    "release": "companion",
+}
+if web_digest:
+    payload["webDigest"] = web_digest
+if worker_digest:
+    payload["workerDigest"] = worker_digest
+if web_pod:
+    payload["webPod"] = web_pod
+if worker_pod:
+    payload["workerPod"] = worker_pod
+tmp = path.with_suffix(".tmp")
+tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+tmp.replace(path)
+PYEOF
+}
+write_lock || fail "cannot write ship deploy lock owner record"
+log "acquired local ship lock for candidate $CANDIDATE (phase=deploying); exclusive window asserted by operator, not proven by this lock"
+TMP_ROOT="$(mktemp -d)" || fail "cannot create temporary build directory"
+
+# --- Fixed cluster identity verification (read-only, before any mutation). ---
+CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null)" || fail "cannot read kubectl current-context"
+[[ "$CURRENT_CONTEXT" == "$ID_CONTEXT" ]] || fail "kubectl context does not match the fixed identity pin (refusing to deploy to an unverified cluster)"
+kubectl config view -o json > "$TMP_ROOT/kubeconfig.json" 2>/dev/null || fail "cannot read kubeconfig"
+python3 - "$TMP_ROOT/kubeconfig.json" "$ID_CONTEXT" "$ID_API_SERVER" <<'PYEOF' || fail "kubeconfig cluster server does not match the fixed identity pin or TLS verification is skipped"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+context_name, expected_server = sys.argv[2], sys.argv[3]
+ctx = next((c for c in data.get("contexts", []) if c.get("name") == context_name), None)
+if ctx is None:
+    sys.exit(1)
+cluster_name = (ctx.get("context") or {}).get("cluster")
+cluster = next((c for c in data.get("clusters", []) if c.get("name") == cluster_name), None)
+if cluster is None:
+    sys.exit(1)
+info = cluster.get("cluster") or {}
+if info.get("server") != expected_server:
+    sys.exit(1)
+if info.get("insecure-skip-tls-verify") is True:
+    sys.exit(1)
+PYEOF
+kubectl version -o json > "$TMP_ROOT/server-version.json" 2>/dev/null || fail "cannot read cluster server version"
+python3 - "$TMP_ROOT/server-version.json" <<'PYEOF' || fail "API server is not a K3s server (refusing to deploy to an unverified cluster)"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+version = ((data.get("serverVersion") or {}).get("gitVersion") or "")
+if "+k3s" not in version:
+    sys.exit(1)
+PYEOF
+KUBE_SYSTEM_UID="$(kubectl get namespace kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null)" || fail "cannot read kube-system namespace"
+[[ "$KUBE_SYSTEM_UID" == "$ID_KUBE_SYSTEM_UID" ]] || fail "kube-system UID does not match the fixed identity pin (refusing to deploy to an unverified cluster)"
+kubectl get namespace "$NAMESPACE" -o json > "$TMP_ROOT/namespace.json" 2>/dev/null || fail "namespace $NAMESPACE not found on the verified cluster"
+python3 - "$TMP_ROOT/namespace.json" "$ID_NAMESPACE_UID" <<'PYEOF' || fail "namespace UID does not match the fixed identity pin"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("metadata", {}).get("name") != "companion-np":
+    sys.exit(1)
+if data.get("metadata", {}).get("uid") != sys.argv[2]:
+    sys.exit(1)
+if (data.get("status") or {}).get("phase") != "Active":
+    sys.exit(1)
+PYEOF
+helm list -n "$NAMESPACE" -o json > "$TMP_ROOT/helm-list.json" 2>/dev/null || fail "cannot list Helm releases in $NAMESPACE"
+python3 - "$TMP_ROOT/helm-list.json" <<'PYEOF' || fail "Helm release $RELEASE not found in $NAMESPACE on the verified cluster"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+match = [r for r in data if r.get("name") == "companion" and r.get("namespace") == "companion-np"]
+if len(match) != 1:
+    sys.exit(1)
+if "companion" not in str(match[0].get("chart", "")):
+    sys.exit(1)
+PYEOF
+for deploy_name in "$WEB_DEPLOY" "$WORKER_DEPLOY"; do
+  kubectl get deploy "$deploy_name" -n "$NAMESPACE" -o name >/dev/null 2>&1 || fail "deployment $deploy_name not found in $NAMESPACE on the verified cluster"
+done
+log "fixed cluster identity verified (context, API server, kube-system, namespace, release, workloads); no identity values were printed"
+
+# --- Immutable candidate source: git archive only, never the working tree. ---
+SOURCE_DIR="$TMP_ROOT/source"
+mkdir -p -- "$SOURCE_DIR" || fail "cannot create candidate source directory"
+git archive "$CANDIDATE" | tar -x -C "$SOURCE_DIR" || fail "cannot extract immutable candidate source"
+cmp -s -- "$SOURCE_DIR/scripts/ship-deploy" "$SCRIPT_PATH" || fail "extracted candidate scripts/ship-deploy differs from the running entry point"
+git show "$CANDIDATE:package.json" 2>/dev/null | cmp -s - "$SOURCE_DIR/package.json" || fail "extracted candidate package.json does not match the candidate commit"
+[[ -f "$SOURCE_DIR/deploy/helm/companion/Chart.yaml" && -f "$SOURCE_DIR/deploy/docker/Dockerfile.web" && -f "$SOURCE_DIR/deploy/docker/Dockerfile.worker" ]] || fail "extracted candidate is missing chart or image definitions"
+log "candidate source extracted from $CANDIDATE (tree $CANDIDATE_TREE) for building"
+
+WEB_DIGEST=""
+WORKER_DIGEST=""
+WEB_POD=""
+WORKER_POD=""
+
+build_and_push() {
+  local label="$1" repo="$2" dockerfile="$3"
+  local ref="$repo:$CANDIDATE"
+  log "building $label image $ref from candidate source"
+  if docker manifest inspect "$ref" >/dev/null 2>&1; then
+    fail "immutable tag $ref already exists in the registry; refusing to overwrite it (investigate provenance before any retry)"
+  fi
+  docker build \
+    --label "org.opencontainers.image.revision=$CANDIDATE" \
+    --label "org.opencontainers.image.source=companion" \
+    --label "companion.ship.candidate=$CANDIDATE" \
+    -f "$SOURCE_DIR/$dockerfile" -t "$ref" "$SOURCE_DIR" >&2 \
+    || fail "docker build failed for $label"
+  python3 - "$ref" "$CANDIDATE" <<'PYEOF' || fail "built $label image provenance label does not match the candidate"
+import json, subprocess, sys
+ref, candidate = sys.argv[1], sys.argv[2]
+out = subprocess.run(["docker", "inspect", ref], capture_output=True, text=True)
+if out.returncode != 0:
+    sys.exit(1)
+data = json.loads(out.stdout)
+labels = ((data[0].get("Config") or {}).get("Labels") or {})
+if labels.get("org.opencontainers.image.revision") != candidate:
+    sys.exit(1)
+if labels.get("companion.ship.candidate") != candidate:
+    sys.exit(1)
+PYEOF
+  log "pushing $label image $ref"
+  docker push "$ref" >&2 || fail "docker push failed for $label"
+  local repo_digest
+  repo_digest="$(docker inspect "$ref" --format '{{index .RepoDigests 0}}' 2>/dev/null)" || fail "cannot inspect pushed $label image digest"
+  [[ "$repo_digest" == "$repo"@sha256:* ]] || fail "pushed $label image RepoDigest does not match the expected repository"
+  local digest="sha256:${repo_digest##*@sha256:}"
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "pushed $label image digest is not a sha256 digest"
+  printf '%s' "$digest"
+}
+
+WEB_DIGEST="$(build_and_push web "$ID_WEB_REPO" "deploy/docker/Dockerfile.web")" || exit 1
+log "web image digest recorded"
+WORKER_DIGEST="$(build_and_push worker "$ID_WORKER_REPO" "deploy/docker/Dockerfile.worker")" || exit 1
+log "worker image digest recorded"
+
+# --- Helm render from the exact candidate chart, then upgrade. ---
+CHART_DIR="$SOURCE_DIR/deploy/helm/companion"
+RENDERED="$TMP_ROOT/rendered.yaml"
+helm template "$RELEASE" "$CHART_DIR" -n "$NAMESPACE" -f "$VALUES_FILE" \
+  --set "web.image.tag=$CANDIDATE" --set "worker.image.tag=$CANDIDATE" \
+  --set "web.image.digest=$WEB_DIGEST" --set "worker.image.digest=$WORKER_DIGEST" \
+  > "$RENDERED" 2>"$TMP_ROOT/helm-template.err" \
+  || { cat -- "$TMP_ROOT/helm-template.err" >&2; fail "helm template with the candidate chart failed"; }
+python3 - "$RENDERED" "$ID_WEB_REPO" "$WEB_DIGEST" "$ID_WORKER_REPO" "$WORKER_DIGEST" <<'PYEOF' || fail "rendered candidate chart does not match the expected digest-pinned workloads"
+import sys
+import yaml
+path, web_repo, web_digest, worker_repo, worker_digest = sys.argv[1:6]
+docs = [d for d in yaml.safe_load_all(open(path, encoding="utf-8")) if d]
+if any(d.get("kind") == "Secret" for d in docs):
+    sys.exit(1)
+def dep(suffix):
+    m = [d for d in docs if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith(suffix)]
+    if len(m) != 1:
+        sys.exit(1)
+    return m[0]
+web = dep("-web")
+worker = dep("-worker")
+if web["spec"]["template"]["spec"]["containers"][0]["image"] != f"{web_repo}@{web_digest}":
+    sys.exit(1)
+if worker["spec"]["template"]["spec"]["containers"][0]["image"] != f"{worker_repo}@{worker_digest}":
+    sys.exit(1)
+for d in (web, worker):
+    if d["metadata"].get("namespace") != "companion-np":
+        sys.exit(1)
+    env = {e["name"]: e.get("value") for e in d["spec"]["template"]["spec"]["containers"][0]["env"] if "value" in e}
+    if env.get("COMPANION_DEPLOYMENT_PURPOSE") != "non-production":
+        sys.exit(1)
+    if env.get("COMPANION_DEPLOYMENT_NAMESPACE") != "companion-np":
+        sys.exit(1)
+web_env = {e["name"]: e.get("value") for e in web["spec"]["template"]["spec"]["containers"][0]["env"] if "value" in e}
+if web_env.get("WEB_TEST_GATE_ENABLED") != "true":
+    sys.exit(1)
+PYEOF
+log "candidate chart render verified (digest-pinned, no Secrets, gate enabled)"
+
+HELM_STARTED=1
+helm upgrade --install "$RELEASE" "$CHART_DIR" -n "$NAMESPACE" -f "$VALUES_FILE" \
+  --set "web.image.tag=$CANDIDATE" --set "worker.image.tag=$CANDIDATE" \
+  --set "web.image.digest=$WEB_DIGEST" --set "worker.image.digest=$WORKER_DIGEST" \
+  --wait --timeout 600s >&2 \
+  || fail "helm upgrade failed; deployment state is unknown and the lock is kept for operator inspection (no auto-rollback)"
+kubectl rollout status "deploy/$WEB_DEPLOY" -n "$NAMESPACE" --timeout=600s >&2 || fail "web rollout did not complete"
+kubectl rollout status "deploy/$WORKER_DEPLOY" -n "$NAMESPACE" --timeout=600s >&2 || fail "worker rollout did not complete"
+log "rollouts completed; verifying Ready pods run the expected digests"
+
+kubectl get pods -n "$NAMESPACE" -o json > "$TMP_ROOT/pods.json" 2>/dev/null || fail "cannot list pods in $NAMESPACE after rollout"
+python3 - "$TMP_ROOT/pods.json" "$ID_WEB_REPO" "$WEB_DIGEST" "$ID_WORKER_REPO" "$WORKER_DIGEST" > "$TMP_ROOT/pods.txt" <<'PYEOF' || fail "Ready pods do not match the expected candidate digests"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+web_repo, web_digest, worker_repo, worker_digest = sys.argv[2:6]
+def check(name, repo, digest):
+    pods = [
+        p for p in data.get("items", [])
+        if (p.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/name") == name
+        and (p.get("metadata", {}).get("labels") or {}).get("app.kubernetes.io/instance") == "companion"
+    ]
+    if len(pods) != 1:
+        sys.exit(1)
+    pod = pods[0]
+    if pod.get("status", {}).get("phase") != "Running":
+        sys.exit(1)
+    containers = pod["spec"]["containers"]
+    if len(containers) != 1 or containers[0]["image"] != f"{repo}@{digest}":
+        sys.exit(1)
+    statuses = pod["status"]["containerStatuses"]
+    if len(statuses) != 1 or statuses[0].get("ready") is not True:
+        sys.exit(1)
+    image_id = statuses[0].get("imageID") or ""
+    if "@" not in image_id or image_id.rsplit("@", 1)[-1] != digest:
+        sys.exit(1)
+    print(pod["metadata"]["name"])
+web_pod = check("web", web_repo, web_digest)
+worker_pod = check("worker", worker_repo, worker_digest)
+PYEOF
+POD_LINES="$(cat -- "$TMP_ROOT/pods.txt")"
+WEB_POD="$(printf '%s\n' "$POD_LINES" | sed -n '1p')"
+WORKER_POD="$(printf '%s\n' "$POD_LINES" | sed -n '2p')"
+[[ -n "$WEB_POD" && -n "$WORKER_POD" ]] || fail "pod verification did not record both pods"
+for deploy_name in "$WEB_DEPLOY" "$WORKER_DEPLOY"; do
+  kubectl get deploy "$deploy_name" -n "$NAMESPACE" -o json > "$TMP_ROOT/deploy.json" 2>/dev/null || fail "cannot read deployment $deploy_name after rollout"
+  python3 - "$TMP_ROOT/deploy.json" <<'PYEOF' || fail "deployment $deploy_name ready replicas do not match the rolled-out candidate"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if (data.get("status") or {}).get("readyReplicas") != 1:
+    sys.exit(1)
+if (data.get("status") or {}).get("replicas") != 1:
+    sys.exit(1)
+PYEOF
+done
+PHASE="deployed"
+write_lock || fail "cannot record deployed handoff in the ship lock"
+log "deployed candidate $CANDIDATE verified Ready on expected digests (web pod $WEB_POD, worker pod $WORKER_POD); lock left in phase=deployed for the E2E runner"
+# Only stdout output of the whole script.
+printf 'SHIP_DEPLOYED_SHA=%s\n' "$CANDIDATE"

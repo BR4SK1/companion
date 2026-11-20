@@ -28,8 +28,12 @@ coordinated with shared capacity.
 
 ## Current state
 
-- The chart and container image definitions exist; there is still no
-  deployment trigger or controller, so installs are performed manually.
+- The chart and container image definitions exist. The chart itself has no
+  deployment trigger or controller; non-production ship installs run
+  through the repo-owned `scripts/ship-deploy` entry point on push
+  (exact-SHA, digest-pinned, serialized by the local ship lock plus an
+  owner-coordinated exclusive window), and other installs are performed
+  manually.
 - Environment-specific values (registry path, image tag, ingress hostname,
   middleware names, model ids) are maintained in a local-only values file
   excluded from version control, per [`../README.md`](../README.md).
