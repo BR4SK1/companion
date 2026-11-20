@@ -5,14 +5,20 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  NAMESPACE,
   STEPS,
+  E2E_LOCAL_FILE_REL,
+  EMBEDDING_STEP_IDS,
   assertBaselineCurrent,
+  buildChildEnv,
   captureVerifiedBaseline,
   checkLivePod,
   digestFromImageId,
+  loadEmbeddingBaseUrl,
   registryManifestUrl,
   resolveExpectedDigests,
   resolveRegistryDigest,
+  validateEmbeddingOrigin,
   validateShipEnv,
   validateVerifiedBaseline,
 } from "../../scripts/test-e2e.mjs";
@@ -297,6 +303,106 @@ test("STEPS inventory is complete, ordered, and contains no filtering or skip ar
   const smoke = STEPS.find((step) => step.id === "deployed-smoke");
   assert.deepEqual(smoke.args, ["--filter", "@companion/e2e", "test:deployed-smoke"]);
   assert.equal(smoke.envMode, "deployedSmoke");
+});
+
+function writeFixtureValuesRoot(dir, e2eValue) {
+  const localFile = path.join(dir, E2E_LOCAL_FILE_REL);
+  fs.mkdirSync(path.dirname(localFile), { recursive: true });
+  const body = e2eValue === undefined
+    ? "{}\n"
+    : `${JSON.stringify({ localEmbeddingBaseUrl: e2eValue }, null, 2)}\n`;
+  fs.writeFileSync(localFile, body);
+  return localFile;
+}
+
+test("validateEmbeddingOrigin requires an HTTP(S) origin and never echoes the value", () => {
+  assert.equal(validateEmbeddingOrigin("https://embedding.example.test/"), "https://embedding.example.test");
+  assert.equal(validateEmbeddingOrigin("http://embedding.example.test"), "http://embedding.example.test");
+  for (const invalid of [
+    "https://user:password@embedding.example.test/",
+    "https://embedding.example.test/path",
+    "https://embedding.example.test/?token=synthetic",
+    "https://embedding.example.test/#frag",
+    "ftp://embedding.example.test",
+    "not-a-url",
+    "",
+  ]) {
+    assert.throws(() => validateEmbeddingOrigin(invalid), /WORKER_MEMORY_EMBEDDING_BASE_URL/);
+  }
+  assert.throws(() => validateEmbeddingOrigin("https://user:password@embedding.example.test/"), (error) => !error.message.includes("password"));
+});
+
+test("loadEmbeddingBaseUrl prefers explicit env and falls back to localEmbeddingBaseUrl", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ship-runner-embedding-"));
+  try {
+    writeFixtureValuesRoot(dir, "https://file.example.test/");
+    assert.equal(loadEmbeddingBaseUrl(dir, {}), "https://file.example.test");
+    assert.equal(loadEmbeddingBaseUrl(dir, { WORKER_MEMORY_EMBEDDING_BASE_URL: "" }), "https://file.example.test");
+    assert.equal(
+      loadEmbeddingBaseUrl(dir, { WORKER_MEMORY_EMBEDDING_BASE_URL: "https://env.example.test/" }),
+      "https://env.example.test",
+    );
+    assert.throws(
+      () => loadEmbeddingBaseUrl(dir, { WORKER_MEMORY_EMBEDDING_BASE_URL: "https://user:password@env.example.test/" }),
+      (error) => /origin without credentials/.test(error.message) && !error.message.includes("password"),
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadEmbeddingBaseUrl fails closed without guessing when neither source provides a value", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ship-runner-embedding-"));
+  try {
+    assert.throws(() => loadEmbeddingBaseUrl(dir, {}), /E2E config is missing/);
+    writeFixtureValuesRoot(dir, undefined);
+    assert.throws(() => loadEmbeddingBaseUrl(dir, {}), /localEmbeddingBaseUrl is missing or invalid/);
+    writeFixtureValuesRoot(dir, "https://user:password@file.example.test/path");
+    assert.throws(
+      () => loadEmbeddingBaseUrl(dir, {}),
+      (error) => /localEmbeddingBaseUrl in the local E2E config is invalid/.test(error.message) && !error.message.includes("password"),
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("buildChildEnv injects the resolved embedding value only into steps that need it", () => {
+  assert.deepEqual(EMBEDDING_STEP_IDS, ["playwright", "stack-ops", "embedding-integration"]);
+  const runsBase = fs.mkdtempSync(path.join(os.tmpdir(), "ship-runner-childenv-"));
+  try {
+    const baseline = {
+      webDigest: WEB_DIGEST,
+      workerDigest: WORKER_DIGEST,
+      webPod: "companion-web-test-0",
+      workerPod: "companion-worker-test-0",
+      webPodUid: WEB_POD_UID,
+      workerPodUid: WORKER_POD_UID,
+    };
+    const embedding = "https://embedding.example.test";
+    for (const step of STEPS) {
+      const childEnv = buildChildEnv(step, { WORKER_TEST_DATABASE_URL: "postgres://synthetic" }, {
+        runsBase,
+        gatePort: 3100,
+        baseline,
+        pins: PINS,
+        embeddingBaseUrl: embedding,
+      });
+      assert.equal(childEnv.WORKER_TEST_DATABASE_URL, undefined, `${step.id} must strip WORKER_TEST_DATABASE_URL`);
+      if (EMBEDDING_STEP_IDS.includes(step.id)) {
+        assert.equal(childEnv.WORKER_MEMORY_EMBEDDING_BASE_URL, embedding, `${step.id} must inherit approved value`);
+      } else if (step.id !== "deployed-smoke") {
+        assert.equal(childEnv.WORKER_MEMORY_EMBEDDING_BASE_URL, undefined, `${step.id} must not receive file value`);
+      }
+    }
+    // Deployed-smoke pinning still applies alongside the embedding injection.
+    const smokeStep = STEPS.find((step) => step.id === "deployed-smoke");
+    const smokeEnv = buildChildEnv(smokeStep, {}, { runsBase, gatePort: 3100, baseline, pins: PINS, embeddingBaseUrl: embedding });
+    assert.equal(smokeEnv.E2E_DEPLOYED_SMOKE_ALLOWED, "1");
+    assert.equal(smokeEnv.E2E_DEPLOYED_NAMESPACE, NAMESPACE);
+  } finally {
+    fs.rmSync(runsBase, { recursive: true, force: true });
+  }
 });
 
 test("loadIdentityPins is covered via the runner module surface (pins live only in the local file)", async () => {

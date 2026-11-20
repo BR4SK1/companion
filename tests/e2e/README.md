@@ -31,11 +31,22 @@ run-owned directory until cleanup is verified; remove only that exact directory
 when no recovery marker or owned resource remains.
 
 The stack requires the existing `WORKER_MEMORY_EMBEDDING_BASE_URL` environment
-setting to identify the approved internal embedding service. Source it from
-private local infrastructure configuration; do not add its value to this
-README or any tracked fixture. For isolated maintenance/testing, set
-`E2E_RUNS_DIR` to a new task-owned directory so startup reconciliation and
-cleanup cannot inspect historical `.runs` entries.
+setting to identify the approved internal embedding service. For full runs,
+`scripts/test-e2e.mjs` resolves it without inventing a default: an explicitly
+inherited value takes precedence; otherwise the dedicated local-only
+`.private/e2e-local.json` supplies the host-local variant as
+`localEmbeddingBaseUrl` (documented LAN/host variant, never the in-cluster
+DNS). The runner validates an HTTP(S) origin with no credentials, path,
+query, or fragment, never prints the value, and injects the resolved value
+only into steps that read the host-local setting (`playwright`,
+`stack-ops`, `embedding-integration`). Direct local-only invocations
+(`pnpm --filter @companion/e2e test`) bypass the runner and therefore still
+require `WORKER_MEMORY_EMBEDDING_BASE_URL` to be set explicitly. Populate
+`localEmbeddingBaseUrl` in the JSON config from the approved private
+local-infrastructure source; do not add its value to this README or any
+tracked fixture. For isolated maintenance/testing, set `E2E_RUNS_DIR` to a
+new task-owned directory so startup reconciliation and cleanup cannot inspect
+historical `.runs` entries.
 
 ### Request scope: full E2E versus local-only
 

@@ -26,9 +26,15 @@
  *   - The trusted local identity pins and local-only values file used by
  *     ship-deploy, verified again here against the live cluster before any
  *     test runs. Identity values are never printed.
- *   - WORKER_MEMORY_EMBEDDING_BASE_URL from approved private local
- *     infrastructure configuration for the local stack and embedding check.
- *     This runner never invents or defaults it; the suites fail without it.
+ *   - WORKER_MEMORY_EMBEDDING_BASE_URL resolved without inventing a default:
+ *     an explicitly inherited value takes precedence when set; otherwise the
+ *     dedicated local-only `.private/e2e-local.json` `localEmbeddingBaseUrl`
+ *     (documented LAN / host variant, never the in-cluster DNS) supplies it.
+ *     Both are validated as an HTTP(S) origin without credentials, path,
+ *     query, or fragment, the value is never printed, and the runner fails
+ *     clearly without it. The resolved value is injected only into steps
+ *     that read the host-local setting (playwright, stack-ops,
+ *     embedding-integration).
  *
  * Inventory (every step must exit 0; the first failure stops the run and is
  * never reported as a pass):
@@ -69,6 +75,7 @@ export const NAMESPACE = "companion-np";
 export const RELEASE = "companion";
 export const IDENTITY_FILE_REL = ".private/deploy/ship-target-identity.json";
 export const VALUES_FILE_REL = ".private/deploy/non-production-values.yaml";
+export const E2E_LOCAL_FILE_REL = ".private/e2e-local.json";
 
 /**
  * The complete, ordered inventory. Each step is executed in full with no
@@ -417,6 +424,121 @@ export function loadGatePort(repoRoot) {
   return port;
 }
 
+/**
+ * Validate an embedding base URL as an HTTP(S) origin with no credentials,
+ * path, query, or fragment (same rule as `tests/e2e/helpers/config.mjs`).
+ * Returns the normalized `origin`. Failures never echo the value.
+ */
+export function validateEmbeddingOrigin(value) {
+  const name = "WORKER_MEMORY_EMBEDDING_BASE_URL";
+  if (typeof value !== "string" || value.length === 0) {
+    throw new Error(`${name} must be a valid HTTP(S) base URL`);
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${name} must be a valid HTTP(S) base URL`);
+  }
+  if (
+    !["http:", "https:"].includes(parsed.protocol) ||
+    parsed.username ||
+    parsed.password ||
+    parsed.pathname !== "/" ||
+    parsed.search ||
+    parsed.hash
+  ) {
+    throw new Error(`${name} must be an HTTP(S) origin without credentials, path, query, or fragment`);
+  }
+  return parsed.origin;
+}
+
+/**
+ * Resolve the host-local embedding base URL for the disposable stack.
+ * An explicit `WORKER_MEMORY_EMBEDDING_BASE_URL` takes precedence; otherwise
+ * fall back to `localEmbeddingBaseUrl` in the dedicated local-only
+ * `.private/e2e-local.json` (documented LAN/host variant). The deployed
+ * worker's in-cluster value is intentionally never used on the host. All
+ * failures fail closed without echoing the value.
+ */
+export function loadEmbeddingBaseUrl(repoRoot, env = process.env) {
+  const fromEnv = env.WORKER_MEMORY_EMBEDDING_BASE_URL;
+  if (fromEnv !== undefined && fromEnv.length > 0) {
+    return validateEmbeddingOrigin(fromEnv);
+  }
+  const localFile = path.join(repoRoot, E2E_LOCAL_FILE_REL);
+  let stat;
+  try {
+    stat = fs.lstatSync(localFile);
+  } catch {
+    throw new Error(
+      `local-only E2E config is missing: ${E2E_LOCAL_FILE_REL} (populate localEmbeddingBaseUrl from the approved local infrastructure source or set WORKER_MEMORY_EMBEDDING_BASE_URL; refusing to guess the embedding endpoint)`,
+    );
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`local-only E2E config must be a regular file, not a symlink: ${E2E_LOCAL_FILE_REL}`);
+  }
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(localFile, "utf8"));
+  } catch {
+    throw new Error(`local-only E2E config is not valid JSON: ${E2E_LOCAL_FILE_REL}`);
+  }
+  if (data === null || typeof data !== "object" || Array.isArray(data)) {
+    throw new Error(
+      "localEmbeddingBaseUrl is missing or invalid in the local E2E config (populate it from the approved local infrastructure source or set WORKER_MEMORY_EMBEDDING_BASE_URL; refusing to guess the embedding endpoint)",
+    );
+  }
+  const raw = data.localEmbeddingBaseUrl;
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw new Error(
+      "localEmbeddingBaseUrl is missing or invalid in the local E2E config (populate it from the approved local infrastructure source or set WORKER_MEMORY_EMBEDDING_BASE_URL; refusing to guess the embedding endpoint)",
+    );
+  }
+  try {
+    return validateEmbeddingOrigin(raw);
+  } catch {
+    throw new Error(
+      "localEmbeddingBaseUrl in the local E2E config is invalid (must be an HTTP(S) origin without credentials, path, query, or fragment)",
+    );
+  }
+}
+
+/** Steps that read the host-local embedding setting from their own env. */
+export const EMBEDDING_STEP_IDS = ["playwright", "stack-ops", "embedding-integration"];
+
+/**
+ * Build the child environment for one inventory step. Strips the
+ * destructive-suite target, injects the resolved host-local embedding
+ * value into steps that need it, and applies run-scoped settings.
+ * The value itself is never logged.
+ */
+export function buildChildEnv(step, baseEnv, { runsBase, gatePort, baseline, pins, embeddingBaseUrl } = {}) {
+  const childEnv = { ...baseEnv };
+  if (childEnv.WORKER_TEST_DATABASE_URL !== undefined) {
+    delete childEnv.WORKER_TEST_DATABASE_URL;
+  }
+  if (embeddingBaseUrl !== undefined && EMBEDDING_STEP_IDS.includes(step.id)) {
+    childEnv.WORKER_MEMORY_EMBEDDING_BASE_URL = embeddingBaseUrl;
+  }
+  if (step.envMode === "runsDir" || step.envMode === "deployedSmoke") {
+    childEnv.E2E_RUNS_DIR = fs.mkdtempSync(path.join(runsBase, `${step.id}-`));
+  }
+  if (step.envMode === "deployedSmoke") {
+    childEnv.E2E_DEPLOYED_SMOKE_ALLOWED = "1";
+    childEnv.E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS = "1";
+    childEnv.E2E_DEPLOYED_NAMESPACE = NAMESPACE;
+    childEnv.E2E_DEPLOYED_GATE_PORT = String(gatePort);
+    childEnv.E2E_DEPLOYED_EXPECT_WEB_POD = baseline.webPod;
+    childEnv.E2E_DEPLOYED_EXPECT_WORKER_POD = baseline.workerPod;
+    childEnv.E2E_DEPLOYED_EXPECT_WEB_POD_UID = baseline.webPodUid;
+    childEnv.E2E_DEPLOYED_EXPECT_WORKER_POD_UID = baseline.workerPodUid;
+    childEnv.E2E_DEPLOYED_EXPECT_WEB_IMAGE_ID = `${pins.registryRepositories.web}@${baseline.webDigest}`;
+    childEnv.E2E_DEPLOYED_EXPECT_WORKER_IMAGE_ID = `${pins.registryRepositories.worker}@${baseline.workerDigest}`;
+  }
+  return childEnv;
+}
+
 function log(message) {
   process.stderr.write(`[ship-e2e] ${message}\n`);
 }
@@ -448,15 +570,14 @@ function loadLiveState(root) {
   return { pods, webDeploy, workerDeploy };
 }
 
-function runStep(step, { root, runsBase, gatePort, baseline, pins }) {
+function runStep(step, { root, runsBase, gatePort, baseline, pins, embeddingBaseUrl }) {
   log(`step ${step.id}: ${step.label}`);
-  const childEnv = { ...process.env };
   // Destructive integration suites are not run by this runner; strip their
   // target so nothing in the runnable inventory can use an application DB.
-  if (childEnv.WORKER_TEST_DATABASE_URL !== undefined) {
+  if (process.env.WORKER_TEST_DATABASE_URL !== undefined) {
     log("WORKER_TEST_DATABASE_URL is set in the environment; removing it for all runnable steps (database-backed integration suites are not routine ship gates)");
-    delete childEnv.WORKER_TEST_DATABASE_URL;
   }
+  const childEnv = buildChildEnv(step, process.env, { runsBase, gatePort, baseline, pins, embeddingBaseUrl });
   let command;
   let args;
   if (step.kind === "pnpm") {
@@ -470,21 +591,6 @@ function runStep(step, { root, runsBase, gatePort, baseline, pins }) {
     args = step.args;
   } else {
     throw new Error(`unknown step kind for ${step.id}`);
-  }
-  if (step.envMode === "runsDir" || step.envMode === "deployedSmoke") {
-    childEnv.E2E_RUNS_DIR = fs.mkdtempSync(path.join(runsBase, `${step.id}-`));
-  }
-  if (step.envMode === "deployedSmoke") {
-    childEnv.E2E_DEPLOYED_SMOKE_ALLOWED = "1";
-    childEnv.E2E_DEPLOYED_SMOKE_EXCLUSIVE_DEV_ACCESS = "1";
-    childEnv.E2E_DEPLOYED_NAMESPACE = NAMESPACE;
-    childEnv.E2E_DEPLOYED_GATE_PORT = String(gatePort);
-    childEnv.E2E_DEPLOYED_EXPECT_WEB_POD = baseline.webPod;
-    childEnv.E2E_DEPLOYED_EXPECT_WORKER_POD = baseline.workerPod;
-    childEnv.E2E_DEPLOYED_EXPECT_WEB_POD_UID = baseline.webPodUid;
-    childEnv.E2E_DEPLOYED_EXPECT_WORKER_POD_UID = baseline.workerPodUid;
-    childEnv.E2E_DEPLOYED_EXPECT_WEB_IMAGE_ID = `${pins.registryRepositories.web}@${baseline.webDigest}`;
-    childEnv.E2E_DEPLOYED_EXPECT_WORKER_IMAGE_ID = `${pins.registryRepositories.worker}@${baseline.workerDigest}`;
   }
   const result = spawnSync(command, args, { cwd: root, env: childEnv, stdio: "inherit" });
   if (result.error) throw result.error;
@@ -511,6 +617,12 @@ async function main() {
 
   const pins = loadIdentityPins(root);
   const gatePort = loadGatePort(root);
+  const embeddingBaseUrl = loadEmbeddingBaseUrl(root, process.env);
+  log(
+    process.env.WORKER_MEMORY_EMBEDDING_BASE_URL
+      ? "embedding base URL resolved from explicit WORKER_MEMORY_EMBEDDING_BASE_URL (value not printed)"
+      : "embedding base URL resolved from local E2E config localEmbeddingBaseUrl (value not printed)",
+  );
 
   // No handoff file: resolve the expected immutable full-SHA digests
   // independently at the fixed registry, verify them against both the
@@ -525,7 +637,7 @@ async function main() {
   log(`E2E runs directory (task-owned, outside the repo): ${runsBase}`);
   log(`running the complete inventory (${STEPS.length} steps, no filtering, no skips) against ${sha}`);
   for (const step of STEPS) {
-    runStep(step, { root, runsBase, gatePort, baseline, pins });
+    runStep(step, { root, runsBase, gatePort, baseline, pins, embeddingBaseUrl });
   }
   // Re-verify the deployment is still the same verified pods/digests
   // after all suites (in particular after the deployed smoke).
