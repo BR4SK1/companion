@@ -10,6 +10,8 @@ import assert from "node:assert/strict";
 import {
   MEMORY_ERROR_CATEGORIES,
   memoryErrorCategory,
+  MemoryLlmTruncatedError,
+  MemorySourceBudgetError,
   OpenRouterTransportError,
 } from "../../apps/worker/src/memory/errors.ts";
 import { MemoryLlmOutputError } from "../../apps/worker/src/memory/prompts.ts";
@@ -31,7 +33,9 @@ describe("memory error categories", () => {
       "llm_network",
       "llm_invalid_json",
       "llm_output_invalid",
+      "llm_output_truncated",
       "llm_attribution_invalid",
+      "source_budget_exceeded",
       "db_error",
       "config_error",
       "internal_error",
@@ -53,9 +57,15 @@ describe("memory error categories", () => {
     );
   });
 
-  it("classifies typed output-validation and configuration errors", () => {
+  it("classifies typed output-validation, truncation, budget, and configuration errors", () => {
     const output = new MemoryLlmOutputError(`claim said ${CANARY}`);
     assert.equal(memoryErrorCategory(output), "llm_output_invalid");
+
+    const truncated = new MemoryLlmTruncatedError(`truncated ${CANARY}`);
+    assert.equal(memoryErrorCategory(truncated), "llm_output_truncated");
+
+    const budget = new MemorySourceBudgetError(`budget ${CANARY}`);
+    assert.equal(memoryErrorCategory(budget), "source_budget_exceeded");
 
     class FactExtractionAttributionError extends Error {
       constructor() {
@@ -98,6 +108,8 @@ describe("memory error categories", () => {
       transport("invalid_json"),
       transport("http_status", 500),
       new MemoryLlmOutputError(`response: ${CANARY}`),
+      new MemoryLlmTruncatedError(`truncated: ${CANARY}`),
+      new MemorySourceBudgetError(`budget: ${CANARY}`),
       new Error(`pg says ${CANARY}`),
       Object.assign(new Error(`boom ${CANARY}`), { code: "23-ish!" }),
     ];

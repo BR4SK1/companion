@@ -62,9 +62,13 @@ async function runAllProfiles(
         profileDeps,
         subject.id,
       );
+      const trimmedSuffix =
+        result.trimmedCount !== undefined && result.trimmedCount > 0
+          ? ` trimmed=${String(result.trimmedCount)}`
+          : "";
       if (result.regenerated) {
         log(
-          `[MEMORY] profile ${subject.id} regenerated (${trigger}): sources=${String(result.sourceCount)}` +
+          `[MEMORY] profile ${subject.id} regenerated (${trigger}): sources=${String(result.sourceCount)}${trimmedSuffix}` +
             `${result.skippedReason !== undefined ? ` [${result.skippedReason}]` : ""}`,
         );
       }
@@ -74,7 +78,7 @@ async function runAllProfiles(
         outcome: "ok",
         detail: `trigger=${trigger} regenerated=${String(result.regenerated)}` +
           `${result.skippedReason !== undefined ? ` skipped=${result.skippedReason}` : ""}` +
-          ` sources=${String(result.sourceCount)}`,
+          ` sources=${String(result.sourceCount)}${trimmedSuffix}`,
       });
     } catch (error) {
       const category = memoryErrorCategory(error);

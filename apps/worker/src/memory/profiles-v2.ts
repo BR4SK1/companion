@@ -21,6 +21,7 @@ import type { MemoryConfig } from "./config.ts";
 /** Anything that can execute a query: the pool or one transaction client. */
 type SqlExecutor = PostgresPool | import("@companion/postgres").PostgresPoolClient;
 import { taskPresets, type MemoryLlmCaller } from "./llm.ts";
+import { MemoryLlmTruncatedError, MemorySourceBudgetError } from "./errors.ts";
 import { promptContentHash } from "./prompts.ts";
 import {
   buildObservationProfilePrompt,
@@ -31,7 +32,6 @@ import {
 import type { ObservationProfile, ProfileSourceObservation } from "./types.ts";
 
 const MAX_SOURCE_OBSERVATIONS = 400;
-const MAX_SOURCE_CHARS = 24_000;
 
 export interface ProfileV2Deps {
   readonly pool: PostgresPool;
@@ -48,6 +48,14 @@ export interface ProfileGenerateSummary {
   readonly regenerated: boolean;
   readonly skippedReason?: "unchanged" | "no-source" | "stale-at-save";
   readonly sourceCount: number;
+  /** Number of older active observations omitted to fit `profileMaxSourceChars`. */
+  readonly trimmedCount?: number;
+}
+
+export interface FittedProfileObservations {
+  readonly selected: ProfileSourceObservation[];
+  readonly droppedCount: number;
+  readonly sourceChars: number;
 }
 
 /** Active canonical observations for one subject, newest first, bounded. */
@@ -75,7 +83,7 @@ export async function loadProfileObservations(
             evidence_strength, distinct_day_count, last_observed_at
      FROM memory_canonical_observation
      WHERE status = 'active' AND subject_id = $1
-     ORDER BY last_observed_at DESC
+     ORDER BY last_observed_at DESC, canonical_observation_id ASC
      LIMIT $2`,
     [subjectId, MAX_SOURCE_OBSERVATIONS],
   );
@@ -140,6 +148,23 @@ export function computeProfileFingerprint(
     .slice(0, 32);
 }
 
+function toProfileSourceEntry(observation: ProfileSourceObservation) {
+  return {
+    id: observation.observationId,
+    kind: observation.kind,
+    claim: observation.claim,
+    ...(observation.condition !== undefined
+      ? { condition: observation.condition }
+      : {}),
+    ...(observation.consequence !== undefined
+      ? { consequence: observation.consequence }
+      : {}),
+    topics: observation.topics,
+    evidenceStrength: observation.evidenceStrength,
+    distinctDayCount: observation.distinctDayCount,
+  };
+}
+
 /**
  * Compact JSON source material. Claims stay verbatim so the generator can
  * restate them without drift.
@@ -147,22 +172,48 @@ export function computeProfileFingerprint(
 export function renderProfileSource(
   observations: readonly ProfileSourceObservation[],
 ): string {
-  return JSON.stringify(
-    observations.map((observation) => ({
-      id: observation.observationId,
-      kind: observation.kind,
-      claim: observation.claim,
-      ...(observation.condition !== undefined
-        ? { condition: observation.condition }
-        : {}),
-      ...(observation.consequence !== undefined
-        ? { consequence: observation.consequence }
-        : {}),
-      topics: observation.topics,
-      evidenceStrength: observation.evidenceStrength,
-      distinctDayCount: observation.distinctDayCount,
-    })),
-  );
+  return JSON.stringify(observations.map(toProfileSourceEntry));
+}
+
+/**
+ * Fit the newest contiguous prefix of active observations into
+ * `maxSourceChars` (measured by `renderProfileSource`).
+ *
+ * `observations` is newest-first (as returned by `loadProfileObservations`).
+ * When all observations fit, they are returned unchanged. Otherwise oldest
+ * observations are dropped until the rendered JSON fits within the budget.
+ * Throws `MemorySourceBudgetError` if even the newest observation cannot fit.
+ */
+export function fitObservationsToProfileBudget(
+  observations: readonly ProfileSourceObservation[],
+  maxSourceChars: number,
+): FittedProfileObservations {
+  if (observations.length === 0) {
+    return { selected: [], droppedCount: 0, sourceChars: 2 };
+  }
+  const selected: ProfileSourceObservation[] = [];
+  let sourceChars = 2; // "[]"
+  for (const observation of observations) {
+    const entryLength = JSON.stringify(toProfileSourceEntry(observation)).length;
+    const nextChars = selected.length === 0
+      ? 2 + entryLength
+      : sourceChars + 1 + entryLength;
+    if (nextChars > maxSourceChars) {
+      break;
+    }
+    selected.push(observation);
+    sourceChars = nextChars;
+  }
+  if (selected.length === 0) {
+    throw new MemorySourceBudgetError(
+      `Profile source exceeds character budget (limit ${String(maxSourceChars)})`,
+    );
+  }
+  return {
+    selected,
+    droppedCount: observations.length - selected.length,
+    sourceChars,
+  };
 }
 
 interface ProfileRow {
@@ -312,6 +363,8 @@ async function upsertProfile(
     }>;
     /** Generation-affecting configuration at generation time (fingerprint). */
     generation: { readonly model: string; readonly maxOutputTokens: number };
+    /** Source budget used to fit the active observation set before fingerprinting. */
+    maxSourceChars: number;
     sourceCount: number;
     model: string | null;
   },
@@ -320,11 +373,14 @@ async function upsertProfile(
   const wasGenerated = fields.sourceCount > 0;
   // One transaction, with a save-time recheck: the LLM call above took time,
   // and a retraction can commit in that window. The profile is only written
-  // when the observation set it was generated from still matches the current
-  // active set (same fingerprint); otherwise the write is skipped so a
+  // when the fitted observation set it was generated from still matches the
+  // current active set (same fingerprint); otherwise the write is skipped so a
   // concurrent generation can never restore prose citing retracted sources.
   return withTransaction(pool, async (client) => {
-    const fresh = await loadProfileObservations(client, fields.subjectId);
+    const freshAll = await loadProfileObservations(client, fields.subjectId);
+    const fresh = freshAll.length === 0
+      ? []
+      : fitObservationsToProfileBudget(freshAll, fields.maxSourceChars).selected;
     const freshFingerprint = computeProfileFingerprint(
       MEMORY_PROFILE_PROMPT_VERSION,
       fresh,
@@ -404,7 +460,13 @@ export async function generateProfileIfNeeded(
   deps: ProfileV2Deps,
   subjectId: string,
 ): Promise<ProfileGenerateSummary> {
-  const observations = await loadProfileObservations(deps.pool, subjectId);
+  const allObservations = await loadProfileObservations(deps.pool, subjectId);
+  const fitted = fitObservationsToProfileBudget(
+    allObservations,
+    deps.config.profileMaxSourceChars,
+  );
+  const observations = fitted.selected;
+  const trimmedField = fitted.droppedCount > 0 ? { trimmedCount: fitted.droppedCount } : {};
   const currentFingerprint = computeProfileFingerprint(
     MEMORY_PROFILE_PROMPT_VERSION,
     observations,
@@ -421,6 +483,7 @@ export async function generateProfileIfNeeded(
       regenerated: false,
       skippedReason: "unchanged",
       sourceCount: observations.length,
+      ...trimmedField,
     };
   }
   if (observations.length === 0) {
@@ -432,6 +495,7 @@ export async function generateProfileIfNeeded(
       claims: [],
       sources: [],
       generation: profileGeneration(deps.config),
+      maxSourceChars: deps.config.profileMaxSourceChars,
       sourceCount: 0,
       model: null,
     });
@@ -458,7 +522,7 @@ export async function generateProfileIfNeeded(
   }
   const source = renderProfileSource(observations);
   if (source.length > deps.config.profileMaxSourceChars) {
-    throw new Error(
+    throw new MemorySourceBudgetError(
       `Profile source for ${subjectId} is ${String(source.length)} characters (limit ${String(deps.config.profileMaxSourceChars)})`,
     );
   }
@@ -486,7 +550,7 @@ export async function generateProfileIfNeeded(
     responseFormat: buildObservationProfileResponseFormat(),
   });
   if (result.finishReason === "length") {
-    throw new Error(
+    throw new MemoryLlmTruncatedError(
       "Profile generation response was truncated; reduce the observation set or raise the output cap",
     );
   }
@@ -512,6 +576,7 @@ export async function generateProfileIfNeeded(
       contentHash: observation.contentHash,
     })),
     generation: profileGeneration(deps.config),
+    maxSourceChars: deps.config.profileMaxSourceChars,
     sourceCount: observations.length,
     model: result.model || deps.config.model,
   });
@@ -524,6 +589,7 @@ export async function generateProfileIfNeeded(
       regenerated: false,
       skippedReason: "stale-at-save",
       sourceCount: observations.length,
+      ...trimmedField,
     };
   }
   return {
@@ -533,5 +599,6 @@ export async function generateProfileIfNeeded(
     claims,
     regenerated: true,
     sourceCount: observations.length,
+    ...trimmedField,
   };
 }
