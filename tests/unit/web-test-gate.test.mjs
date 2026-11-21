@@ -15,19 +15,10 @@ import { networkInterfaces } from "node:os";
 import { request as httpRequest } from "node:http";
 
 import {
-  AUTHORIZED_NON_PRODUCTION_NAMESPACE,
-  DEPLOYMENT_NAMESPACE_ENV,
-  DEPLOYMENT_PURPOSE_ENV,
   hasTestChannelForbiddenHeaders,
   isExpectedTestHost,
   isLoopbackRemoteAddress,
-  KUBERNET_SERVICE_PORT_ENV,
-  KUBERNETES_SERVICE_HOST_ENV,
   parseTestGateEnv,
-  PURPOSE_NON_PRODUCTION,
-  PURPOSE_PRODUCTION,
-  POD_NAMESPACE_ENV,
-  resolveDeploymentPurpose,
   TEST_ATTESTATION_HEADER,
   TEST_CHANNEL_FORBIDDEN_HEADERS,
   TEST_CHANNEL_TOKEN_GLOBAL_KEY,
@@ -35,7 +26,6 @@ import {
   TEST_GATE_PORT_ENV,
   TEST_GATE_SESSION_SECRET_ENV,
   TEST_GATE_SESSION_TTL_ENV,
-  TEST_GATE_TRUSTED_LOCAL_ENV,
 } from "../../apps/web/server/gate-env.mjs";
 import {
   createTestEntryListener,
@@ -76,18 +66,10 @@ const baseEnv = {
   WEB_WORKER_TOKEN: "service-token",
 };
 
-/** A chart-attested non-production deployment's environment. */
-const k8sAttestation = {
-  COMPANION_DEPLOYMENT_PURPOSE: "non-production",
-  COMPANION_DEPLOYMENT_NAMESPACE: "companion-np",
-  COMPANION_POD_NAMESPACE: "companion-np",
-};
-
 const gateEnv = {
   [TEST_GATE_ENABLED_ENV]: "true",
   [TEST_GATE_PORT_ENV]: "3100",
   [TEST_GATE_SESSION_SECRET_ENV]: GATE_SECRET,
-  ...k8sAttestation,
 };
 
 describe("test gate environment parsing", () => {
@@ -152,177 +134,6 @@ describe("test gate environment parsing", () => {
       assert.deepEqual(parseTestGateEnv({ NODE_ENV: nodeEnv }), { enabled: false });
       assert.equal(parseTestGateEnv({ ...gateEnv, NODE_ENV: nodeEnv }).enabled, true);
     }
-  });
-});
-
-describe("deployment-purpose attestation", () => {
-  const localEnv = { [TEST_GATE_TRUSTED_LOCAL_ENV]: "true" };
-
-  it("accepts a chart-attested non-production deployment with matching namespaces", () => {
-    assert.deepEqual(resolveDeploymentPurpose(k8sAttestation), {
-      kind: "kubernetes",
-      purpose: PURPOSE_NON_PRODUCTION,
-      namespace: "companion-np",
-    });
-    assert.equal(parseTestGateEnv({ ...gateEnv }).enabled, true);
-  });
-
-  it("accepts an explicit local run only when no chart attestation is present", () => {
-    assert.deepEqual(resolveDeploymentPurpose(localEnv), { kind: "local" });
-    const localGate = {
-      [TEST_GATE_ENABLED_ENV]: "true",
-      [TEST_GATE_PORT_ENV]: "3100",
-      [TEST_GATE_SESSION_SECRET_ENV]: GATE_SECRET,
-      [TEST_GATE_TRUSTED_LOCAL_ENV]: "true",
-    };
-    assert.equal(parseTestGateEnv(localGate).enabled, true);
-  });
-
-  it("refuses the local declaration when Kubernetes context indicators are present", () => {
-    // The kubelet sets these in every pod; a container inside Kubernetes
-    // cannot truthfully declare itself a run outside Kubernetes.
-    for (const indicator of [KUBERNETES_SERVICE_HOST_ENV, KUBERNET_SERVICE_PORT_ENV]) {
-      const env = { ...localEnv, [indicator]: "10.43.0.1" };
-      assert.equal(resolveDeploymentPurpose(env).kind, "invalid", indicator);
-      assert.throws(
-        () => parseTestGateEnv({
-          [TEST_GATE_ENABLED_ENV]: "true",
-          [TEST_GATE_PORT_ENV]: "3100",
-          [TEST_GATE_SESSION_SECRET_ENV]: GATE_SECRET,
-          [TEST_GATE_TRUSTED_LOCAL_ENV]: "true",
-          [indicator]: "10.43.0.1",
-        }),
-        (error) => {
-          assert.ok(error.message.includes("may not attest a local run inside Kubernetes"), error.message);
-          return true;
-        },
-        indicator,
-      );
-    }
-  });
-
-  it("rejects a non-production purpose from any namespace but the authorized one", () => {
-    // Purpose plus downward-API agreement alone would let any namespace
-    // self-declare itself non-production; only the pinned namespace is
-    // authorized.
-    for (const namespace of ["companion-prod", "companion-dev", "default", "companion"]) {
-      const attestation = {
-        [DEPLOYMENT_PURPOSE_ENV]: PURPOSE_NON_PRODUCTION,
-        [DEPLOYMENT_NAMESPACE_ENV]: namespace,
-        [POD_NAMESPACE_ENV]: namespace,
-      };
-      const resolved = resolveDeploymentPurpose(attestation);
-      assert.equal(resolved.kind, "invalid", namespace);
-      assert.ok(
-        resolved.reason.includes("is not the authorized non-production namespace"),
-        `${namespace}: ${resolved.reason}`,
-      );
-      assert.throws(
-        () => parseTestGateEnv({
-          [TEST_GATE_ENABLED_ENV]: "true",
-          [TEST_GATE_PORT_ENV]: "3100",
-          [TEST_GATE_SESSION_SECRET_ENV]: GATE_SECRET,
-          ...attestation,
-        }),
-        (error) => error.message.includes("is not the authorized non-production namespace"),
-        namespace,
-      );
-    }
-    assert.equal(AUTHORIZED_NON_PRODUCTION_NAMESPACE, "companion-np");
-  });
-
-  it("rejects a production deployment explicitly", () => {
-    const production = { ...k8sAttestation, [DEPLOYMENT_PURPOSE_ENV]: PURPOSE_PRODUCTION };
-    assert.deepEqual(resolveDeploymentPurpose(production), {
-      kind: "kubernetes",
-      purpose: PURPOSE_PRODUCTION,
-      namespace: "companion-np",
-    });
-    assert.throws(
-      () => parseTestGateEnv({ ...gateEnv, [DEPLOYMENT_PURPOSE_ENV]: PURPOSE_PRODUCTION }),
-      (error) => {
-        assert.ok(error.message.includes("must never run in a production deployment"), error.message);
-        return true;
-      },
-    );
-    // The local declaration cannot override a rendered deployment's purpose.
-    assert.throws(
-      () => parseTestGateEnv({ ...gateEnv, [DEPLOYMENT_PURPOSE_ENV]: PURPOSE_PRODUCTION, [TEST_GATE_TRUSTED_LOCAL_ENV]: "true" }),
-      (error) => error.message.includes("must never run in a production deployment"),
-    );
-  });
-
-  it("rejects unknown and missing purposes and namespace mismatches", () => {
-    const cases = [
-      // Unknown purpose value.
-      [{ ...gateEnv, [DEPLOYMENT_PURPOSE_ENV]: "canary" }, "must be exactly"],
-      // Missing purpose entirely, with no other attestation present.
-      [
-        {
-          [TEST_GATE_ENABLED_ENV]: "true",
-          [TEST_GATE_PORT_ENV]: "3100",
-          [TEST_GATE_SESSION_SECRET_ENV]: GATE_SECRET,
-        },
-        "requires a deployment-purpose attestation",
-      ],
-      // Purpose removed while namespace attestation values remain.
-      [{ ...gateEnv, [DEPLOYMENT_PURPOSE_ENV]: undefined }, "requires COMPANION_DEPLOYMENT_PURPOSE"],
-      // Namespace attestation incomplete or mismatched.
-      [{ ...gateEnv, [POD_NAMESPACE_ENV]: undefined }, "must be present"],
-      [{ ...gateEnv, [DEPLOYMENT_NAMESPACE_ENV]: undefined }, "must be present"],
-      [{ ...gateEnv, [DEPLOYMENT_NAMESPACE_ENV]: "other-ns" }, "does not match the pod's actual namespace"],
-      // Namespace envs without a purpose: incomplete attestation.
-      [
-        {
-          [TEST_GATE_ENABLED_ENV]: "true",
-          [TEST_GATE_PORT_ENV]: "3100",
-          [TEST_GATE_SESSION_SECRET_ENV]: GATE_SECRET,
-          [DEPLOYMENT_NAMESPACE_ENV]: "companion-np",
-          [POD_NAMESPACE_ENV]: "companion-np",
-        },
-        "requires COMPANION_DEPLOYMENT_PURPOSE",
-      ],
-      // Local declaration cannot coexist with a chart-injected attestation.
-      [
-        {
-          [TEST_GATE_ENABLED_ENV]: "true",
-          [TEST_GATE_PORT_ENV]: "3100",
-          [TEST_GATE_SESSION_SECRET_ENV]: GATE_SECRET,
-          [TEST_GATE_TRUSTED_LOCAL_ENV]: "true",
-          [DEPLOYMENT_NAMESPACE_ENV]: "companion-np",
-          [POD_NAMESPACE_ENV]: "companion-np",
-        },
-        "requires COMPANION_DEPLOYMENT_PURPOSE",
-      ],
-      // A value other than the exact "true" is not a local attestation.
-      [
-        {
-          [TEST_GATE_ENABLED_ENV]: "true",
-          [TEST_GATE_PORT_ENV]: "3100",
-          [TEST_GATE_SESSION_SECRET_ENV]: GATE_SECRET,
-          [TEST_GATE_TRUSTED_LOCAL_ENV]: "1",
-        },
-        "requires a deployment-purpose attestation",
-      ],
-    ];
-    for (const [env, fragment] of cases) {
-      assert.throws(() => parseTestGateEnv(env), (error) => {
-        assert.ok(error.message.includes(fragment), error.message);
-        return true;
-      }, fragment);
-    }
-  });
-
-  it("is not inferred from NODE_ENV", () => {
-    for (const nodeEnv of ["production", "development", "test"]) {
-      assert.equal(resolveDeploymentPurpose({ NODE_ENV: nodeEnv }).kind, "none");
-      assert.deepEqual(resolveDeploymentPurpose({ ...k8sAttestation, NODE_ENV: nodeEnv }).purpose, PURPOSE_NON_PRODUCTION);
-    }
-  });
-
-  it("leaves a disabled gate alone regardless of the attestation", () => {
-    assert.deepEqual(parseTestGateEnv({ ...k8sAttestation, [DEPLOYMENT_PURPOSE_ENV]: PURPOSE_PRODUCTION }), { enabled: false });
-    assert.deepEqual(parseTestGateEnv({}), { enabled: false });
   });
 });
 
@@ -408,7 +219,7 @@ describe("test gate configuration in the BFF config", () => {
     assert.equal(config.testGate, null);
   });
 
-  it("is populated when explicitly enabled with a valid attestation", () => {
+  it("is populated when explicitly enabled", () => {
     const config = loadWebConfig({ ...baseEnv, ...gateEnv });
     assert.notEqual(config.testGate, null);
     assert.equal(config.testGate.port, 3100);
@@ -443,33 +254,6 @@ describe("test gate configuration in the BFF config", () => {
     assert.throws(
       () => loadWebConfig({ ...baseEnv, ...gateEnv, [TEST_GATE_SESSION_SECRET_ENV]: "short" }),
       WebConfigError,
-    );
-  });
-
-  it("fails the whole configuration for production or unattested deployments", () => {
-    assert.throws(
-      () => loadWebConfig({
-        ...baseEnv,
-        ...gateEnv,
-        [DEPLOYMENT_PURPOSE_ENV]: PURPOSE_PRODUCTION,
-      }),
-      (error) => error.message.includes("must never run in a production deployment"),
-    );
-    assert.throws(
-      () => loadWebConfig({
-        ...baseEnv,
-        ...gateEnv,
-        [DEPLOYMENT_PURPOSE_ENV]: undefined,
-      }),
-      WebConfigError,
-    );
-    assert.throws(
-      () => loadWebConfig({
-        ...baseEnv,
-        ...gateEnv,
-        [DEPLOYMENT_NAMESPACE_ENV]: "other-ns",
-      }),
-      (error) => error.message.includes("does not match the pod's actual namespace"),
     );
   });
 

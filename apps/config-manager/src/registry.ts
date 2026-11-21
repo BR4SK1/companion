@@ -1,8 +1,7 @@
 /**
  * DB-backed configuration registry for the local config manager.
  *
- * The set of tables is exactly the worker's provisioned-configuration set
- * (the same table list the deployed-smoke configuration fingerprint covers):
+ * The set of tables is exactly the worker's provisioned-configuration set:
  * owner-authored prompts, patterns, modules, bands, schedules, and per-domain
  * behavior rows. Deployment environment values (model ids, endpoints,
  * timeouts, secrets), learned state (conversation records, traces, memory

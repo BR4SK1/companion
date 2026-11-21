@@ -7,22 +7,6 @@
 # ../environments/README.md). Secret values are never accepted here; the
 # deployables read them from existing Kubernetes Secrets referenced by name.
 
-# Deployment-purpose attestation, fail closed: every install must declare
-# exactly what it is and where it runs; unknown or missing values fail
-# rendering.
-deployment:
-  # Exactly "non-production" or "production". Deployment-specific
-  # capabilities key off it: the web test-entry gate renders only for
-  # "non-production", and the application refuses to open the gate for a
-  # "production" deployment at runtime.
-  purpose: ""
-  # The exact namespace this release is installed into. The chart fails
-  # rendering when it differs from the release namespace. The value is
-  # carried into the container, where the application re-verifies it against
-  # the Kubernetes-provided pod namespace (downward API) before the
-  # test-entry gate may open.
-  namespace: ""
-
 web:
   enabled: true
   image:
@@ -52,21 +36,10 @@ web:
   # Traefik ingress and every middleware configured on it. See the chart
   # README for the health and security implications of that direct path.
   loadBalancer:
-    # Disabled by default, and production-gated: the chart refuses to render
-    # it unless deployment.purpose is exactly "production", so a
-    # non-production release can never expose the web client on a host port
-    # (its only public route is the Traefik Ingress). Because the
-    # non-production-only test gate requires a non-production purpose, the
-    # gate and this Service can never render in the same release.
+    # Disabled by default and mutually exclusive with web.testGate.enabled.
     enabled: false
-    # Node host port that K3s ServiceLB binds for the web client (the
-    # Service's published port; traffic reaches the web container's HTTP
-    # port). Required when enabled — there is deliberately no default — and
-    # it must be an integer between 1 and 65535 that differs from
-    # web.service.port. Choose it under the hosting environment's host-port
-    # policy and keep it unique across that environment's published
-    # services; the chart cannot detect a host-port collision between
-    # different releases.
+    # Node host port that K3s ServiceLB binds for the web client. Required when
+    # enabled (integer 1..65535, distinct from web.service.port).
     hostPort: ""
   # Name of an existing Secret in the release namespace that must provide the
   # keys WEB_OIDC_CLIENT_SECRET, WEB_SESSION_SECRET, and WEB_WORKER_TOKEN.
@@ -96,10 +69,9 @@ web:
   # apps/web/README.md for the security model and the safe access
   # procedure.
   testGate:
-    # Production deployments must leave this disabled: the chart refuses to
-    # render the gate for a deployment.purpose of "production". Even when
-    # enabled, the listener is loopback-only and no Service, Ingress, or
-    # other route to it is ever created by this chart.
+    # Non-production-only loopback test-entry gate (NEVER enable in production;
+    # mutually exclusive with web.loadBalancer.enabled). Even when enabled, the
+    # listener binds strictly to 127.0.0.1 and no Service or Ingress is created.
     enabled: false
     # Loopback listener port inside the pod; must differ from
     # web.containerPort and web.service.port. Access with

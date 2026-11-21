@@ -20,6 +20,5 @@ dist/
 coverage/
 playwright-report/
 test-results/
-tests/e2e/.runs/
 *.log
 .DS_Store

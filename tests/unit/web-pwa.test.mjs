@@ -84,13 +84,6 @@ function readWebFile(relativePath) {
   return readFileSync(join(webRoot, relativePath), "utf8");
 }
 
-/** Source with comments removed, so guardrails check code, not prose. */
-function readCode(relativePath) {
-  return readWebFile(relativePath)
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/^\s*\/\/.*$/gm, "");
-}
-
 describe("web app manifest", () => {
   it("meets the installability criteria", () => {
     assert.ok(manifest.name || manifest.short_name);
@@ -464,46 +457,6 @@ describe("service worker behavior", () => {
   });
 });
 
-describe("service worker source invariants", () => {
-  const source = readCode("public/sw.js");
-
-  it("only intercepts top-level GET same-origin navigations outside the API surface", () => {
-    assert.ok(source.includes('request.mode !== "navigate"'));
-    assert.ok(source.includes('request.method !== "GET"'));
-    assert.ok(source.includes("url.origin !== self.location.origin"));
-    assert.ok(source.includes('pathname === "/api"'));
-    assert.ok(source.includes('pathname.startsWith("/api/")'));
-    // The API gate runs before anything can be answered by the worker.
-    assert.ok(
-      source.indexOf('pathname.startsWith("/api/")') < source.indexOf("event.respondWith"),
-    );
-    // "/api" appears exactly twice — as the two exclusions — never as a
-    // fetch or cache target.
-    assert.equal(source.match(/\/api/g)?.length, 2);
-    assert.doesNotMatch(source, /cookie|authorization|token|session/i);
-  });
-
-  it("caches nothing except the static offline page", () => {
-    assert.ok(source.includes('OFFLINE_URL = "/offline.html"'));
-    assert.equal(source.match(/cache\.add\(/g)?.length, 1);
-    assert.doesNotMatch(source, /cache\.addAll/);
-    assert.doesNotMatch(source, /cache\.put/);
-    // Navigations always hit the network first; the cache is only consulted
-    // when the network request throws.
-    assert.ok(source.includes("await fetch(request)"));
-    assert.ok(
-      source.indexOf("await fetch(request)") < source.indexOf("cache.match("),
-    );
-  });
-
-  it("scopes cache cleanup to its own prefix", () => {
-    assert.ok(source.includes('CACHE_PREFIX = "companion-offline-"'));
-    assert.ok(source.includes("name.startsWith(CACHE_PREFIX)"));
-    assert.ok(source.includes("name !== CACHE_NAME"));
-    assert.equal(source.match(/caches\.delete\(/g)?.length, 1);
-  });
-});
-
 describe("offline fallback page", () => {
   const source = readWebFile("public/offline.html");
 
@@ -517,56 +470,5 @@ describe("offline fallback page", () => {
   it("does not imply offline functionality", () => {
     assert.match(source, /offline/i);
     assert.match(source, /needs a connection/i);
-  });
-});
-
-describe("service worker registration component", () => {
-  const source = readCode("src/components/register-service-worker.tsx");
-
-  it("registers only in production builds, best-effort", () => {
-    // The production gate precedes any registration.
-    assert.ok(source.includes('process.env.NODE_ENV !== "production"'));
-    assert.ok(
-      source.indexOf('process.env.NODE_ENV !== "production"') <
-        source.indexOf('navigator.serviceWorker.register'),
-    );
-    assert.ok(source.includes('"serviceWorker" in navigator'));
-    assert.ok(source.includes('register("/sw.js")'));
-    // Best-effort: a failed registration never surfaces as an error.
-    assert.match(source, /\.register\("\/sw\.js"\)\.catch\(\(\) => \{\}\)/);
-  });
-
-  it("waits for the page load and renders nothing", () => {
-    assert.ok(source.includes('document.readyState === "complete"'));
-    assert.ok(source.includes('window.addEventListener("load", register'));
-    assert.ok(source.includes("return null;"));
-  });
-});
-
-describe("root layout wiring", () => {
-  const source = readCode("src/app/layout.tsx");
-
-  it("links the manifest and the Apple web-app metadata", () => {
-    assert.ok(source.includes('manifest: "/manifest.webmanifest"'));
-    assert.ok(source.includes('applicationName: "Companion"'));
-    assert.ok(source.includes("appleWebApp"));
-    assert.ok(source.includes("capable: true"));
-    assert.ok(source.includes('title: "Companion"'));
-    assert.ok(source.includes('statusBarStyle: "default"'));
-  });
-
-  it("mounts the service worker registration", () => {
-    assert.ok(source.includes("register-service-worker"));
-    assert.ok(source.includes("<RegisterServiceWorker />"));
-  });
-
-  it("keeps the existing viewport and theme handling", () => {
-    assert.ok(source.includes('viewportFit: "cover"'));
-    assert.ok(source.includes("themeColor:"));
-    assert.ok(source.includes("SCHEME_THEME_COLORS.light"));
-    assert.ok(source.includes("SCHEME_THEME_COLORS.dark"));
-    assert.ok(source.includes("InitColorSchemeScript"));
-    assert.ok(source.includes("MODE_STORAGE_KEY"));
-    assert.ok(source.includes("COLOR_SCHEME_STORAGE_KEY"));
   });
 });

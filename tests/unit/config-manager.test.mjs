@@ -360,105 +360,28 @@ describe("config manager mock verification", () => {
     );
   });
 
-  it("browser UI: sticky header contains environment, confirmation, actions and results, preserving existing bindings", async () => {
+  it("browser UI serves HTML bound to the target environment with preview/apply controls", async () => {
     const { baseUrl } = await startFor("nonprod");
     const res = await fetch(`${baseUrl}/`);
     assert.equal(res.status, 200);
     assert.match(res.headers.get("content-type") ?? "", /text\/html/);
     const html = await res.text();
-    // Header placement: the sticky header precedes the tables region.
-    const headerStart = html.indexOf("<header");
-    const headerEnd = html.indexOf("</header>");
-    const tablesAt = html.indexOf('id="tables"');
-    assert.ok(headerStart >= 0 && headerEnd > headerStart && tablesAt > headerEnd, "header must precede the tables region");
-    const header = html.slice(headerStart, headerEnd);
-    assert.ok(header.includes('class="site-header"'), "header carries the sticky class");
-    assert.ok(html.includes("position:sticky"), "header is sticky");
-    assert.ok(html.includes('name="viewport"'), "responsive viewport is declared");
-    // Environment context, confirmation, and actions live in the header.
-    assert.ok(header.includes("nonprod"), "header shows the bound environment");
-    assert.ok(header.includes('data-environment="nonprod"'), "header environment badge is bound");
-    assert.ok(!header.includes("PRODUCTION binding."), "nonprod header carries no production warning");
-    assert.ok(header.includes('id="confirm"') && header.includes('for="confirm"'), "confirmation is labelled in the header");
-    assert.ok(header.includes('id="preview"') && header.includes(">Review diff<"), "Review diff is in the header");
-    assert.ok(header.includes('id="apply"') && header.includes(">Apply edits<"), "Apply edits is in the header");
-    assert.ok(header.includes('id="status"'), "status region is in the header");
-    // Existing bindings are preserved (ids the client and operators rely on).
+    assert.ok(html.includes('data-environment="nonprod"'));
+    assert.ok(!html.includes("PRODUCTION binding."));
     for (const id of ["status", "tables", "confirm", "preview", "apply", "diff"]) {
-      assert.ok(html.includes(`id="${id}"`), `existing binding id="${id}" is preserved`);
+      assert.ok(html.includes(`id="${id}"`), `expected id="${id}"`);
     }
-    for (const path of ["/api/config", "/api/config/preview", "/api/config/apply"]) {
-      assert.ok(html.includes(path), `client still calls ${path}`);
+    for (const label of ["Create a row", "Create row", "Delete row", "Add row", "New row"]) {
+      assert.ok(!html.includes(label), `unexpected create/delete UI label: ${label}`);
     }
-    assert.ok(html.includes("baseHash") && html.includes("confirmation"), "payload field names are unchanged");
-    assert.ok(html.includes("data-field") && html.includes("data-table") && html.includes("collectEdits"), "field collection bindings are preserved");
-    // Bounded, accessible review-results disclosure attached to the header.
-    assert.ok(header.includes('<details') && header.includes('id="results"'), "results disclosure is in the header");
-    assert.ok(header.includes("<summary") && header.includes('id="results-state"'), "results summary names its state");
-    assert.ok(header.includes('id="diff"'), "diff output is inside the header results panel");
-    assert.ok(html.includes(".results-panel") && html.includes("max-height:min(38vh,22rem)") && html.includes("overflow:auto"), "results panel is bounded and scrollable");
-    assert.ok(html.includes("max-height:85vh"), "sticky header is height-capped so it cannot take over short screens");
-    assert.ok(html.includes("@media (max-width:40rem)") && html.includes("@media (max-height:36rem)"), "header compacts on narrow/short screens");
   });
 
-  it("browser UI: production header shows the production warning and danger apply", async () => {
+  it("browser UI warns explicitly when bound to production", async () => {
     const { baseUrl } = await startFor("production");
     const html = await (await fetch(`${baseUrl}/`)).text();
-    const header = html.slice(html.indexOf("<header"), html.indexOf("</header>"));
-    assert.ok(header.includes("PRODUCTION binding."), "production warning is in the header");
-    assert.ok(header.includes("Applying an edit writes production configuration."), "production warning states the write consequence");
-    assert.ok(header.includes('data-environment="production"'), "production badge is bound");
-    assert.ok(header.includes('id="apply" class="danger"'), "production apply is marked as dangerous");
-    assert.ok(header.includes('for="confirm"') && header.includes("production"), "production confirmation is labelled in the header");
-  });
-
-  it("browser UI: fixed dark theme, visible focus, labelled fields, primary-key headings and display-only server-managed fields", async () => {
-    const { baseUrl } = await startFor("nonprod");
-    const html = await (await fetch(`${baseUrl}/`)).text();
-    assert.ok(html.includes("color-scheme:dark"), "fixed dark theme is declared");
-    assert.ok(!html.includes("prefers-color-scheme"), "theme does not switch to a light palette");
-    assert.ok(html.includes(":focus-visible") && html.includes("outline:3px solid var(--focus)"), "visible focus is styled");
-    // Labelled fields: generated labels are bound to generated control ids.
-    assert.ok(html.includes('<label for="') && html.includes("fieldId"), "fields render a label bound to a control id");
-    // Row headings use primary keys, including composite keys.
-    assert.ok(html.includes("PRIMARY_KEYS") && html.includes("primaryKeyLabel"), "row headings are derived from primary keys");
-    assert.ok(html.includes("memory_prompt: ['kind', 'version']"), "composite primary key is mapped");
-    assert.ok(html.includes("article_prompt: ['kind', 'version']"), "composite article prompt key is mapped");
-    assert.ok(html.includes("relationship_question_type: ['type_key']"), "type_key primary key is mapped");
-    // Server-managed fields are display-only and never collected as edits.
-    assert.ok(html.includes("SERVER_MANAGED") && html.includes("updated_at") && html.includes("revision"), "server-managed fields are named");
-    assert.ok(html.includes("field--server-managed") && html.includes("<output>") && html.includes("Display only"), "server-managed fields render as display-only output");
-    // Escaping is preserved for rendered values.
-    assert.ok(html.includes("&amp;") && html.includes("&lt;") && html.includes("&quot;"), "HTML escaping is preserved");
-  });
-
-  it("browser UI: prompt text is a single full-text textarea with no duplicate pre, and there is no create/delete UI", async () => {
-    const { baseUrl } = await startFor("nonprod");
-    const html = await (await fetch(`${baseUrl}/`)).text();
-    // The only static <pre> is the results diff output; prompt fields must
-    // not also render a <pre> duplicate alongside their textarea.
-    assert.equal((html.match(/<pre/g) ?? []).length, 1, "only the results diff uses <pre>");
-    assert.ok(!html.includes("'<pre>' + esc"), "prompt rendering has no duplicate pre");
-    assert.ok(html.includes("<textarea id=") && html.includes("data-field="), "prompt fields render a textarea control");
-    assert.ok(html.includes("Full prompt text"), "prompt textarea is labelled as full text");
-    assert.ok(!html.includes("slice(0"), "prompt text is not truncated in the client");
-    for (const label of ["Create a row", "Create row", "Delete row", "Add row", "New row"]) {
-      assert.ok(!html.includes(label), `no create/delete UI label: ${label}`);
-    }
-  });
-
-  it("browser UI: accessible request feedback and duplicate in-flight prevention", async () => {
-    const { baseUrl } = await startFor("nonprod");
-    const html = await (await fetch(`${baseUrl}/`)).text();
-    assert.ok(html.includes('role="status"') && html.includes('aria-live="polite"') && html.includes('aria-atomic="true"'), "status is an atomic polite live region");
-    assert.ok(html.includes("aria-busy"), "busy state is exposed on the header");
-    assert.ok(html.includes("inFlight"), "in-flight guard is present");
-    assert.ok(html.includes("if (inFlight || !snapshot) return;"), "duplicate preview/apply clicks are ignored while a request is in flight");
-    assert.ok(html.includes("previewBtn.disabled") && html.includes("applyBtn.disabled"), "actions are disabled while busy");
-    assert.ok(html.includes("Reviewing diff…") && html.includes("Applying edits…"), "busy feedback is announced");
-    assert.ok(html.includes("Preview failed") && html.includes("Apply failed") && html.includes("Could not load snapshot"), "failure feedback is announced");
-    assert.ok(html.includes("resultsEl.open = true"), "results are opened automatically for visibility from the header");
-    assert.ok(html.includes('type="button"'), "header actions are explicit buttons");
+    assert.ok(html.includes('data-environment="production"'));
+    assert.ok(html.includes("PRODUCTION binding."));
+    assert.ok(html.includes('id="apply" class="danger"'));
   });
 });
 

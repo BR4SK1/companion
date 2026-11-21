@@ -14,28 +14,21 @@ README only; no values, manifests, secret references, deployment controller, or 
 
 ## Production values contract
 
-Production values must declare `deployment.purpose: production` (and the
-matching `deployment.namespace`), which are required for every install.
 Production values must leave `web.testGate.enabled` disabled (the chart
-default): the chart refuses to render the gate for a production purpose,
-and the non-production-only loopback test entry grants unauthenticated
-full-application access and has no place in production. Defense in depth
-if it were ever misconfigured anyway: the listener binds `127.0.0.1`
-inside the pod (no Service or Ingress can reach it), the gate is
-fail-closed at bind/issuance/use, the application re-verifies the declared
-purpose and the downward-API pod namespace at runtime and refuses to open
-the gate for a `production` deployment, and its sessions require a
-dedicated secret in a separate Secret — the chart refuses to render the
-gate pointing at the owner session secret.
+default): the non-production-only loopback test entry grants unauthenticated
+full-application access and has no place in production. Defense in depth:
+the chart makes `web.testGate.enabled` and `web.loadBalancer.enabled`
+mutually exclusive, the listener binds `127.0.0.1` inside the pod (no
+Service or Ingress can reach it), and its sessions require a dedicated
+secret in a separate Secret — the chart refuses to render the gate pointing
+at the owner session secret.
 
 Publishing the web client on a node host port (for example as a tunnel's
 target) uses the chart's optional `web.loadBalancer` Service, which is
-disabled by default and production-gated: it renders only for
-`deployment.purpose: production` with an explicit
-`web.loadBalancer.hostPort` (an integer from 1 to 65535 that must differ
-from `web.service.port`; the chart cannot detect a host-port collision
-between releases, so choose it under the hosting environment's host-port
-policy and keep it unique across that environment's published services).
+disabled by default and mutually exclusive with `web.testGate.enabled`. It
+requires an explicit `web.loadBalancer.hostPort` (an integer from 1 to 65535
+that must differ from `web.service.port`; choose it under the hosting
+environment's host-port policy and keep it unique across published services).
 Enabling it bypasses the Traefik ingress and its middlewares entirely:
 nothing Traefik enforces on the ingress route — rate limits, security
 headers, allowlists — applies on the LoadBalancer path, the published port

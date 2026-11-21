@@ -2,7 +2,7 @@
   "name": "companion",
   "version": "0.0.0",
   "private": true,
-  "description": "Repository tooling for the Companion project. The repository contains architecture documentation, shared-library code (OpenRouter transport and typed contracts; PostgreSQL connection and migration infrastructure), a first worker slice for durable conversation work, and a local-only web-client preview; this root package exists for contribution tooling.",
+  "description": "Companion — single-user, self-hosted conversational companion (Next.js web/BFF, durable PostgreSQL worker, shared OpenRouter/Postgres libraries, and K3s Helm chart).",
   "packageManager": "pnpm@10.18.1",
   "engines": {
     "node": ">=22.12.0"
@@ -12,8 +12,8 @@
     "format:check": "prettier --check package.json pnpm-workspace.yaml AGENTS.md README.md",
     "lint": "pnpm --filter @companion/web lint",
     "test:unit": "node --experimental-strip-types --test \"tests/unit/**/*.test.mjs\"",
-    "test:e2e": "node scripts/test-e2e.mjs",
-    "typecheck": "tsc -p libraries/openrouter && tsc -p libraries/postgres && tsc -p apps/worker && tsc -p apps/config-manager"
+    "test:e2e": "pnpm --filter @companion/e2e test",
+    "typecheck": "tsc -p libraries/openrouter && tsc -p libraries/postgres && tsc -p apps/worker && tsc -p apps/config-manager && pnpm --filter @companion/web typecheck"
   },
   "devDependencies": {
     "@commitlint/cli": "21.2.4",
