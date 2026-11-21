@@ -6,10 +6,14 @@ import type {
   RelationshipConfiguration,
   RelationshipExtractionItem,
   RelationshipParticipant,
+  RelationshipQuestion,
   RelationshipSummary,
   RelationshipTier,
 } from "./types.ts";
-import { summarizeRelationship } from "./runtime.ts";
+import {
+  selectUnansweredQuestionsForExtraction,
+  summarizeRelationship,
+} from "./runtime.ts";
 
 export class RelationshipConfigurationError extends Error {
   constructor(message: string) {
@@ -239,6 +243,7 @@ export function parseRelationshipExtraction(text: string): readonly Relationship
 
 function promptForExtraction(
   configuration: RelationshipConfiguration,
+  questions: readonly RelationshipQuestion[],
   userText: string,
   assistantText: string,
   currentAnswers: readonly {
@@ -257,7 +262,7 @@ function promptForExtraction(
       interpretation: "Give the best current interpretation when new-turn evidence is ambiguous or conflicts with a prior interpretation, and set clarificationNeeded=true. Do not invent facts. Attribute user answers only from the user's own statements and assistant answers only from the assistant reply. A prior interpretation is context for detecting change, not proof; omit slots without relevant new-turn evidence.",
     },
     current_interpretations: currentAnswers,
-    questions: configuration.questions.map((question) => ({
+    questions: questions.map((question) => ({
       questionKey: question.key,
       type: question.typeKey,
       typeGuidance: question.typeGuidance,
@@ -328,24 +333,36 @@ export function createRelationshipStore(input: {
     callLlm: MemoryLlmCaller;
     taskPreset: TaskPreset;
   }): Promise<readonly RelationshipExtractionItem[]> {
-    const currentAnswers = await pool.query<AnswerRow>(
+    const currentAnswerRows = await pool.query<AnswerRow>(
       `SELECT q.question_key, a.participant, a.current_answer, a.clarification_needed
        FROM relationship_answer a
        JOIN relationship_question q ON q.id = a.question_id
        WHERE q.enabled = true`,
     );
+    const currentAnswers = currentAnswerRows.rows.map((row) => ({
+      questionKey: row.question_key,
+      participant: row.participant as RelationshipParticipant,
+      answer: row.current_answer,
+      clarificationNeeded: row.clarification_needed,
+    }));
+    // Bound the extraction prompt to a few not-yet-fully-answered questions
+    // in configured rank order. The full enabled bank still defines slot
+    // eligibility and familiarity (summarizeRelationship), and which
+    // returned keys are accepted (knownQuestions below) and recorded
+    // (recordAnswers); only what is shown to the extractor is bounded.
+    const questions = selectUnansweredQuestionsForExtraction({
+      configuration,
+      answers: currentAnswers,
+    });
+    const selectedKeys = new Set(questions.map((question) => question.key));
     const result = await params.callLlm({
-      systemPrompt: "Extract only evidence from the supplied new conversation turn into the configured shared question slots. Follow the supplied runtime instructions and response contract.",
+      systemPrompt: "Extract only evidence from the supplied new conversation turn into the supplied shared-bank question slots. Follow the supplied runtime instructions and response contract.",
       userMessage: promptForExtraction(
         configuration,
+        questions,
         params.userText,
         params.assistantText,
-        currentAnswers.rows.map((row) => ({
-          questionKey: row.question_key,
-          participant: row.participant as RelationshipParticipant,
-          answer: row.current_answer,
-          clarificationNeeded: row.clarification_needed,
-        })),
+        currentAnswers.filter((answer) => selectedKeys.has(answer.questionKey)),
       ),
       taskPreset: params.taskPreset,
       responseFormat: { type: "json_object" },
