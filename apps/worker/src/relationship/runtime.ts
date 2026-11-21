@@ -1,5 +1,6 @@
 /** Pure relationship-day, familiarity, tier, and prompt rendering semantics. */
 
+import type { ChatReasoningEffort } from "@companion/openrouter/chat";
 import { behavioralDay } from "../memory/time.ts";
 import type { BehaviorTime } from "../memory/time.ts";
 import type {
@@ -61,24 +62,42 @@ export function relationshipDayStreaks(input: {
 }
 
 /**
- * Main reply output budget (provider `max_tokens`) by configured base
- * familiarity tier ordinal: 500 tokens at the first tier (ordinal 0,
- * also the value when relationship is disabled) plus 100 tokens per
- * successive tier. The ordinal is the tier's index in the configured
- * ordered tier list — not the transient effective tier, which can move
- * one tier up or down on streak/missed-day signals — so the budget
- * tracks familiarity specifically.
+ * Main reply output budget by configured base familiarity tier ordinal:
+ * 500 tokens at the first tier (ordinal 0, also the value when relationship
+ * is disabled) plus 100 tokens per successive tier. The ordinal is the tier's
+ * index in the configured ordered tier list — not the transient effective
+ * tier, which can move one tier up or down on streak/missed-day signals — so
+ * the budget tracks familiarity specifically.
  *
- * This is a provider cap, not a post-generation truncator: no reply
- * text is cut by the application. Reasoning tokens, when a reasoning
- * effort is configured for main chat, count against the same
- * `max_tokens` on OpenRouter, so operators using a high reasoning
- * effort should verify visible output is not starved at the lower
- * budgets. Other LLM tasks (memory, articles, decisions) keep their
- * own presets and are unaffected.
+ * This value is the visible-reply length target named in the relationship
+ * prompt chunk. Because OpenRouter counts hidden reasoning tokens against the
+ * same `max_tokens` cap, `mainReplyProviderMaxTokensForBaseTierOrdinal` adds
+ * effort-scaled reasoning headroom when a non-`none` reasoning effort is
+ * configured so reasoning cannot starve or truncate the visible reply.
+ * Other LLM tasks (memory, articles, decisions) keep their own presets and
+ * are unaffected.
  */
 export const MAIN_REPLY_MAX_TOKENS_BASE = 500;
 export const MAIN_REPLY_MAX_TOKENS_PER_TIER = 100;
+
+export const MAIN_REPLY_REASONING_HEADROOM_TOKENS: Readonly<
+  Record<ChatReasoningEffort, number>
+> = {
+  none: 0,
+  minimal: 500,
+  low: 1000,
+  medium: 2000,
+  high: 3500,
+  xhigh: 5000,
+  max: 8000,
+};
+
+export function mainReplyReasoningHeadroomTokens(
+  effort?: ChatReasoningEffort,
+): number {
+  if (effort === undefined) return 0;
+  return MAIN_REPLY_REASONING_HEADROOM_TOKENS[effort];
+}
 
 export function mainReplyMaxTokensForBaseTierOrdinal(ordinal: number): number {
   if (!Number.isInteger(ordinal) || ordinal < 0) {
@@ -87,6 +106,16 @@ export function mainReplyMaxTokensForBaseTierOrdinal(ordinal: number): number {
     );
   }
   return MAIN_REPLY_MAX_TOKENS_BASE + ordinal * MAIN_REPLY_MAX_TOKENS_PER_TIER;
+}
+
+export function mainReplyProviderMaxTokensForBaseTierOrdinal(
+  ordinal: number,
+  reasoningEffort?: ChatReasoningEffort,
+): number {
+  return (
+    mainReplyMaxTokensForBaseTierOrdinal(ordinal) +
+    mainReplyReasoningHeadroomTokens(reasoningEffort)
+  );
 }
 
 export function mainReplyMaxTokensForSummary(

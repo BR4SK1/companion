@@ -86,7 +86,7 @@ import {
 } from "../articles/share.ts";
 import type { ArticleMemoryCandidate } from "../articles/types.ts";
 import type { RelationshipExtractionItem } from "../relationship/types.ts";
-import { mainReplyMaxTokensForBaseTierOrdinal } from "../relationship/runtime.ts";
+import { mainReplyProviderMaxTokensForBaseTierOrdinal } from "../relationship/runtime.ts";
 import { OpenRouterTransportError } from "@companion/openrouter/transport";
 import type {
   ChatReasoningEffort,
@@ -824,18 +824,22 @@ export async function processTurnWork(
       : `${temporal.promptText}\n\nRecent temporal memory:\n${temporalChunk}`;
 
   // Main reply output budget: when the relationship loader supplied a
-  // base tier ordinal, the budget is 500 + 100 per successive base tier
-  // (first tier / disabled relationship = 500). The ordinal tracks
-  // familiarity (base tier), never the transient effective tier. An
-  // explicit static `deps.maxTokens` override still applies when no
-  // ordinal was supplied; when neither is present no `max_tokens` is
-  // sent (legacy injected callers). The resolved value flows into the
-  // assembled request below, so the chat trace records the exact
-  // `max_tokens` sent. No post-generation truncation is applied, and
-  // other LLM tasks (decisions, memory, articles) keep their own caps.
+  // base tier ordinal, the visible-reply budget is 500 + 100 per
+  // successive base tier (first tier / disabled relationship = 500),
+  // plus effort-scaled reasoning headroom when a non-`none` chat
+  // reasoning effort is configured (OpenRouter counts hidden reasoning
+  // tokens against `max_tokens`). The ordinal tracks familiarity (base
+  // tier), never the transient effective tier. An explicit static
+  // `deps.maxTokens` override still applies verbatim when no ordinal was
+  // supplied; when neither is present no `max_tokens` is sent (legacy
+  // injected callers). The resolved value flows into the assembled
+  // request below, so the chat trace records the exact `max_tokens` sent.
   const resolvedMaxTokens =
     relationshipBaseTierOrdinal !== undefined
-      ? mainReplyMaxTokensForBaseTierOrdinal(relationshipBaseTierOrdinal)
+      ? mainReplyProviderMaxTokensForBaseTierOrdinal(
+          relationshipBaseTierOrdinal,
+          deps.chatReasoningEffort,
+        )
       : deps.maxTokens;
 
   // The assembled prompt is the single source of truth for the wire request

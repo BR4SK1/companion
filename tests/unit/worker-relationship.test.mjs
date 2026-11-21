@@ -9,6 +9,8 @@ import {
   renderRelationshipContext,
   mainReplyMaxTokensForBaseTierOrdinal,
   mainReplyMaxTokensForSummary,
+  mainReplyProviderMaxTokensForBaseTierOrdinal,
+  mainReplyReasoningHeadroomTokens,
 } from "../../apps/worker/src/relationship/runtime.ts";
 import {
   createRelationshipStore,
@@ -733,5 +735,64 @@ describe("main reply output budget by base familiarity tier", () => {
       loadRelationshipContext: async () => "legacy string context",
     });
     assert.equal(overrideRequest.max_tokens, 1234);
+  });
+
+  it("adds effort-scaled reasoning headroom to tier-derived provider max_tokens without changing visible prompt target", async () => {
+    assert.equal(mainReplyReasoningHeadroomTokens(undefined), 0);
+    assert.equal(mainReplyReasoningHeadroomTokens("none"), 0);
+    assert.equal(mainReplyReasoningHeadroomTokens("minimal"), 500);
+    assert.equal(mainReplyReasoningHeadroomTokens("low"), 1000);
+    assert.equal(mainReplyReasoningHeadroomTokens("medium"), 2000);
+    assert.equal(mainReplyReasoningHeadroomTokens("high"), 3500);
+    assert.equal(mainReplyReasoningHeadroomTokens("xhigh"), 5000);
+    assert.equal(mainReplyReasoningHeadroomTokens("max"), 8000);
+
+    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(1, undefined), 600);
+    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(1, "none"), 600);
+    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(1, "high"), 4100);
+    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(0, "high"), 4000);
+
+    const work = {
+      turn: { id: "turn-reasoning-headroom", status: "in_flight", attempt: 1 },
+      messages: [message("1", "user", "hello")],
+    };
+    const base = {
+      decisionModel: "fake-decision",
+      chatModel: "fake-chat",
+      callDecisions: async () => { throw new Error("not expected"); },
+      loadPatterns: async () => [],
+      loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
+      loadContext: async () => [],
+    };
+
+    let highRequest;
+    await processTurnWork(work, {
+      ...base,
+      chatReasoningEffort: "high",
+      callChat: async (request) => { highRequest = request; return chatResponse("reply"); },
+      loadRelationshipContext: async () => ({ context: "RELATIONSHIP", baseTierOrdinal: 1 }),
+    });
+    assert.equal(highRequest.max_tokens, 4100);
+    assert.deepEqual(highRequest.reasoning, { effort: "high", exclude: true });
+
+    let noneRequest;
+    await processTurnWork(work, {
+      ...base,
+      chatReasoningEffort: "none",
+      callChat: async (request) => { noneRequest = request; return chatResponse("reply"); },
+      loadRelationshipContext: async () => ({ context: "RELATIONSHIP", baseTierOrdinal: 1 }),
+    });
+    assert.equal(noneRequest.max_tokens, 600);
+
+    // Explicit static maxTokens override without a tier ordinal stays verbatim.
+    let staticRequest;
+    await processTurnWork(work, {
+      ...base,
+      chatReasoningEffort: "high",
+      maxTokens: 1234,
+      callChat: async (request) => { staticRequest = request; return chatResponse("reply"); },
+      loadRelationshipContext: async () => "legacy string context",
+    });
+    assert.equal(staticRequest.max_tokens, 1234);
   });
 });
