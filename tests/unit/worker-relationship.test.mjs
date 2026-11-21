@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   relationshipDayStreaks,
   relationshipDayStreaksForDays,
+  selectUnansweredQuestionsForExtraction,
   summarizeRelationship,
   renderRelationshipContext,
   mainReplyMaxTokensForBaseTierOrdinal,
@@ -354,6 +355,193 @@ describe("relationship familiarity semantics", () => {
     assert.equal(statements.length, 2);
     assert.ok(statements.every(({ sql }) => sql.includes("INSERT INTO relationship_answer") && sql.includes("ON CONFLICT (question_id, participant) DO UPDATE")));
     assert.deepEqual(statements.map(({ values }) => values.slice(0, 2)), [["q1", "user"], ["q1", "assistant"]]);
+  });
+});
+
+describe("relationship extraction question bound", () => {
+  function syntheticQuestion(key, tierPosition, position) {
+    return {
+      id: `id-${key}`,
+      key,
+      typeKey: "kind",
+      typeGuidance: "guidance",
+      tierId: "t0",
+      tierPosition,
+      text: `${key}?`,
+      position,
+    };
+  }
+
+  function bankOf(...questions) {
+    return { ...configuration, questions };
+  }
+
+  function largeBank(count) {
+    return bankOf(...Array.from({ length: count }, (_, index) =>
+      syntheticQuestion(`question-${index}`, 0, index),
+    ));
+  }
+
+  it("bounds a large bank to the first five by configured rank order", () => {
+    const selected = selectUnansweredQuestionsForExtraction({
+      configuration: largeBank(200),
+      answers: [],
+    });
+    assert.equal(selected.length, 5);
+    assert.deepEqual(
+      selected.map((question) => question.key),
+      ["question-0", "question-1", "question-2", "question-3", "question-4"],
+    );
+  });
+
+  it("ranks by tier position, then question position, then question key", () => {
+    const selected = selectUnansweredQuestionsForExtraction({
+      configuration: bankOf(
+        syntheticQuestion("question-b", 1, 0),
+        syntheticQuestion("question-a", 0, 5),
+        syntheticQuestion("question-d", 0, 3),
+        syntheticQuestion("question-c", 0, 3),
+      ),
+      answers: [],
+      limit: 4,
+    });
+    assert.deepEqual(
+      selected.map((question) => question.key),
+      ["question-c", "question-d", "question-a", "question-b"],
+    );
+  });
+
+  it("excludes fully answered questions but keeps partially answered ones", () => {
+    const selected = selectUnansweredQuestionsForExtraction({
+      configuration: largeBank(6),
+      answers: [
+        { questionKey: "question-0", participant: "user" },
+        { questionKey: "question-0", participant: "assistant" },
+        { questionKey: "question-1", participant: "user" },
+        { questionKey: "question-1", participant: "assistant" },
+        { questionKey: "question-2", participant: "user" },
+        { questionKey: "question-3", participant: "assistant" },
+      ],
+    });
+    assert.deepEqual(
+      selected.map((question) => question.key),
+      ["question-2", "question-3", "question-4", "question-5"],
+    );
+  });
+
+  it("handles small, empty, and fully answered banks, and honors the limit", () => {
+    assert.deepEqual(
+      selectUnansweredQuestionsForExtraction({ configuration: bankOf(), answers: [] }),
+      [],
+    );
+    assert.deepEqual(
+      selectUnansweredQuestionsForExtraction({
+        configuration: bankOf(syntheticQuestion("question-only", 0, 0)),
+        answers: [],
+      }).map((question) => question.key),
+      ["question-only"],
+    );
+    assert.deepEqual(
+      selectUnansweredQuestionsForExtraction({
+        configuration: bankOf(syntheticQuestion("question-only", 0, 0)),
+        answers: [
+          { questionKey: "question-only", participant: "user" },
+          { questionKey: "question-only", participant: "assistant" },
+        ],
+      }),
+      [],
+    );
+    assert.deepEqual(
+      selectUnansweredQuestionsForExtraction({
+        configuration: bankOf(
+          syntheticQuestion("question-a", 0, 0),
+          syntheticQuestion("question-b", 0, 1),
+        ),
+        answers: [],
+        limit: 1,
+      }).map((question) => question.key),
+      ["question-a"],
+    );
+    assert.deepEqual(
+      selectUnansweredQuestionsForExtraction({
+        configuration: bankOf(syntheticQuestion("question-a", 0, 0)),
+        answers: [],
+        limit: 0,
+      }),
+      [],
+    );
+    assert.throws(
+      () => selectUnansweredQuestionsForExtraction({
+        configuration: bankOf(syntheticQuestion("question-a", 0, 0)),
+        answers: [],
+        limit: -1,
+      }),
+      RangeError,
+    );
+  });
+
+  it("bounds the actual extraction prompt and filters prior interpretations to it", async () => {
+    let prompt;
+    const pool = {
+      query: async () => ({ rows: [
+        { question_key: "question-0", participant: "user", current_answer: "answered zero user", clarification_needed: false },
+        { question_key: "question-0", participant: "assistant", current_answer: "answered zero assistant", clarification_needed: false },
+        { question_key: "question-1", participant: "user", current_answer: "prior one", clarification_needed: true },
+      ] }),
+    };
+    const store = createRelationshipStore({ pool, configuration: largeBank(200) });
+    const updates = await store.extractAnswers({
+      userText: "hello",
+      assistantText: "reply",
+      callLlm: async (input) => {
+        prompt = JSON.parse(input.userMessage);
+        return { text: JSON.stringify({ answers: [] }), finishReason: "stop" };
+      },
+      taskPreset: { maxTokens: 100 },
+    });
+    assert.deepEqual(
+      prompt.questions.map((question) => question.questionKey),
+      ["question-1", "question-2", "question-3", "question-4", "question-5"],
+    );
+    assert.deepEqual(prompt.current_interpretations, [
+      { questionKey: "question-1", participant: "user", answer: "prior one", clarificationNeeded: true },
+    ]);
+    assert.deepEqual(updates, []);
+  });
+
+  it("still accepts returned keys from the full bank", async () => {
+    const pool = {
+      query: async () => ({ rows: [] }),
+    };
+    const store = createRelationshipStore({ pool, configuration: largeBank(200) });
+    const updates = await store.extractAnswers({
+      userText: "hello",
+      assistantText: "reply",
+      callLlm: async () => ({
+        text: JSON.stringify({ answers: [
+          { questionKey: "question-100", participant: "user", answer: "accepted", clarificationNeeded: false },
+          { questionKey: "unconfigured", participant: "user", answer: "ignored", clarificationNeeded: false },
+        ] }),
+        finishReason: "stop",
+      }),
+      taskPreset: { maxTokens: 100 },
+    });
+    assert.deepEqual(updates.map((item) => item.questionKey), ["question-100"]);
+  });
+
+  it("keeps the unanswered bank out of the ordinary chat context", () => {
+    const summary = summarizeRelationship({
+      configuration,
+      firstConversationAt: new Date("2026-01-07T12:00:00.000Z"),
+      userActivityAt: [],
+      now: new Date("2026-01-10T12:00:00.000Z"),
+      answers: [
+        { questionId: "q1", questionKey: "question-a", questionText: "Question A?", participant: "user", answer: "A", clarificationNeeded: false },
+      ],
+    });
+    const rendered = renderRelationshipContext(summary);
+    assert.ok(rendered.includes("Question A?"), "learned answers stay in ordinary chat context");
+    assert.ok(!rendered.includes("Question B?"), "unanswered bank questions are not injected into ordinary chat context");
   });
 });
 

@@ -5,6 +5,8 @@ import type { BehaviorTime } from "../memory/time.ts";
 import type {
   RelationshipAnswer,
   RelationshipConfiguration,
+  RelationshipParticipant,
+  RelationshipQuestion,
   RelationshipSummary,
 } from "./types.ts";
 
@@ -191,6 +193,65 @@ export function summarizeRelationship(input: {
     ...tiers,
     answers: input.answers,
   };
+}
+
+/**
+ * How many not-yet-fully-answered shared-bank questions one answer
+ * extraction considers. The bank itself is unchanged: slot eligibility,
+ * familiarity, and answer acceptance always use the full enabled bank;
+ * only the extraction prompt is bounded, so a large bank does not fill
+ * every turn's extraction request.
+ */
+export const RELATIONSHIP_EXTRACTION_QUESTION_LIMIT = 5;
+
+/** Each enabled question contributes one slot per participant. */
+const PARTICIPANT_SLOTS_PER_QUESTION = 2;
+
+/**
+ * Select the not-yet-fully-answered questions one extraction pass may
+ * consider, in configured rank order (tier position, question position,
+ * then question key — the order the configuration loader returns).
+ * A question is still eligible while either participant slot has no
+ * recorded answer; a question with both slots answered drops out, so the
+ * bank is consumed progressively rather than re-shown every turn.
+ */
+export function selectUnansweredQuestionsForExtraction(input: {
+  readonly configuration: RelationshipConfiguration;
+  /** Recorded answers by question key and participant; repeats collapse per slot. */
+  readonly answers: readonly {
+    readonly questionKey: string;
+    readonly participant: RelationshipParticipant;
+  }[];
+  readonly limit?: number;
+}): readonly RelationshipQuestion[] {
+  const limit = input.limit ?? RELATIONSHIP_EXTRACTION_QUESTION_LIMIT;
+  if (!Number.isInteger(limit) || limit < 0) {
+    throw new RangeError(
+      `extraction question limit must be a non-negative integer, got ${String(limit)}`,
+    );
+  }
+  const answeredSlotsByKey = new Map<string, Set<RelationshipParticipant>>();
+  for (const answer of input.answers) {
+    let slots = answeredSlotsByKey.get(answer.questionKey);
+    if (slots === undefined) {
+      slots = new Set();
+      answeredSlotsByKey.set(answer.questionKey, slots);
+    }
+    slots.add(answer.participant);
+  }
+  return [...input.configuration.questions]
+    .sort(
+      (left, right) =>
+        left.tierPosition - right.tierPosition ||
+        left.position - right.position ||
+        (left.key < right.key ? -1 : left.key > right.key ? 1 : 0),
+    )
+    .filter(
+      (question) =>
+        (answeredSlotsByKey.get(question.key)?.size ?? 0) <
+        PARTICIPANT_SLOTS_PER_QUESTION,
+    )
+    .slice(0, limit);
 }
 
 /** A separate system chunk; all personal wording comes from runtime config. */
