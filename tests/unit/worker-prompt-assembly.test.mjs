@@ -15,8 +15,13 @@ import {
   buildChatPrompt,
   buildChatRequest,
 } from "../../apps/worker/src/work/chat.ts";
+import { buildDynamicInitiativePrompt } from "../../apps/worker/src/work/initiative.ts";
 import { processTurnWork } from "../../apps/worker/src/work/processor.ts";
 import { DECISION_QUESTION_ID } from "../../apps/worker/src/work/decision.ts";
+import {
+  ARTICLE_SHARE_NONE_CHOICE,
+  ARTICLE_SHARE_QUESTION_ID,
+} from "../../apps/worker/src/articles/share.ts";
 import {
   IdentityConfigurationError,
 } from "../../apps/worker/src/conversation/types.ts";
@@ -536,5 +541,198 @@ describe("processor: modular assembly with memory, patterns, and trace metadata"
       conversation.map((m) => m.role),
       [...longHistory.map((m) => m.role), "user"],
     );
+  });
+
+  it("orders all sections as identity -> profiles -> relationship -> temporal -> recall -> guidance -> time -> routine -> prompt_module -> conversation", () => {
+    const { messages } = buildChatPrompt({
+      model: "chat-model",
+      identity: "IDENTITY",
+      profiles: "PROFILES",
+      relationship: "FAMILIARITY",
+      temporal: "TEMPORAL MEMORY",
+      recall: "RELATED MEMORIES",
+      guidance: "DYNAMIC INITIATIVE",
+      time: "CURRENT TIME",
+      routine: "ROUTINE STATE",
+      promptModules: [
+        { moduleId: "mod-outfit", content: "OUTFIT STATE", outputKind: "authoritative_context" },
+      ],
+      history: [message(1, "user", "q1"), message(2, "assistant", "a1")],
+      turnMessages: [message(3, "user", "q2")],
+    });
+    assert.deepEqual(
+      messages.map((m) => m.chunk),
+      [
+        "identity",
+        "profiles",
+        "relationship",
+        "temporal",
+        "recall",
+        "guidance",
+        "time",
+        "routine",
+        "prompt_module",
+        "conversation",
+        "conversation",
+        "conversation",
+      ],
+    );
+  });
+
+  it("omits empty or whitespace-only guidance so lean normal chat turns stay uncluttered", () => {
+    const { messages } = buildChatPrompt({
+      model: "chat-model",
+      identity: "IDENTITY",
+      guidance: "   ",
+      history: [],
+      turnMessages: [message(1, "user", "hi")],
+    });
+    assert.deepEqual(messages.map((m) => m.chunk), ["identity", "conversation"]);
+  });
+
+  it("decouples wall-clock time from temporal memory in processor assembly", async () => {
+    let trace;
+    await processTurnWork(work, baseDeps({
+      now: () => new Date("2026-11-21T21:57:00.000Z"),
+      temporalSettings: {
+        timezone: "America/New_York",
+        seasonHemisphere: null,
+        birthdayMonth: null,
+        birthdayDay: null,
+      },
+      loadMemoryContext: async () => ({
+        profileSection: "PROFILE",
+        temporalContext: "<last_night>Talked about music.</last_night>",
+        memoryContext: "RELATED",
+      }),
+      loadRelationshipContext: async () => ({ context: "FAMILIARITY", baseTierOrdinal: 0 }),
+      recordChatRequest: async (payload) => { trace = payload; },
+    }));
+    assert.deepEqual(trace.messageChunks, [
+      "identity",
+      "profiles",
+      "relationship",
+      "temporal",
+      "recall",
+      "time",
+      "conversation",
+      "conversation",
+      "conversation",
+      "conversation",
+    ]);
+    const temporalMsg = trace.request.messages[3];
+    const timeMsg = trace.request.messages[5];
+    assert.equal(temporalMsg.content, "<last_night>Talked about music.</last_night>");
+    assert.match(timeMsg.content, /^Current local date and time:/);
+  });
+
+  it("assembles dynamic initiative prompt with article and curated questions only when includeInitiativeContext is true", async () => {
+    const candidate = {
+      reactionId: "9e3d1f5e-1111-4222-8333-444455556666",
+      itemId: "8a2c0e4d-0000-4111-7222-333344445555",
+      url: "https://example.com/music",
+      title: "Why vinyl keeps growing",
+      feedId: "feed-1",
+      reaction: "Really liked how it talked about tactile listening.",
+      factKey: "article:00000000-0000-4000-8000-000000000001",
+      publishedAt: "2026-11-20T00:00:00.000Z",
+      generatedAt: "2026-11-21T18:00:00.000Z",
+    };
+    const inclusions = [];
+    let initiativeCalls = 0;
+    let trace;
+    await processTurnWork(work, baseDeps({
+      now: () => new Date("2026-11-21T21:00:00.000Z"),
+      loadPatterns: async () => [
+        {
+          id: "chat",
+          selectionDescription: "Normal conversation.",
+          responseGuidance: "",
+          position: 0,
+          includeInitiativeContext: false,
+        },
+        {
+          id: "take_initiative",
+          selectionDescription: "Conversation is dying.",
+          responseGuidance: "The user seems distracted; try talking about something specific.",
+          position: 1,
+          includeInitiativeContext: true,
+        },
+      ],
+      loadArticleShareCandidates: async () => [candidate],
+      recordArticleShareInclusion: async (entry) => inclusions.push(entry),
+      loadInitiativeQuestions: async ({ recentText }) => {
+        initiativeCalls += 1;
+        assert.ok(recentText.includes("part one"));
+        return [
+          { questionKey: "fav-color", questionText: "What is the user's favorite color?", reason: "unanswered" },
+          { questionKey: "fav-band", questionText: "What is the user's favorite band?", reason: "revisit", priorAnswer: "Radiohead", priorAnswerAgeDays: 45 },
+        ];
+      },
+      callDecisions: async () => ({
+        model: "decision-model-build",
+        answers: {
+          [DECISION_QUESTION_ID]: { type: "choice", choice: "take_initiative" },
+          // Even when article_memory_share returns none on a dying conversation,
+          // initiative pulls the cooldown-eligible candidate into the dynamic prompt.
+          [ARTICLE_SHARE_QUESTION_ID]: { type: "choice", choice: ARTICLE_SHARE_NONE_CHOICE },
+        },
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }),
+      recordChatRequest: async (payload) => { trace = payload; },
+    }));
+    assert.equal(initiativeCalls, 1);
+    assert.deepEqual(inclusions, [{ turnId: "turn-1", reactionId: candidate.reactionId }]);
+    assert.ok(!trace.messageChunks.includes("article"), "article is folded into dynamic guidance without duplication");
+    const guidanceIndex = trace.messageChunks.indexOf("guidance");
+    assert.ok(guidanceIndex > 0);
+    const guidanceText = trace.request.messages[guidanceIndex].content;
+    assert.match(guidanceText, /The user seems distracted/);
+    assert.match(guidanceText, /Why vinyl keeps growing/);
+    assert.match(guidanceText, /tactile listening/);
+    assert.match(guidanceText, /favorite color/);
+    assert.match(guidanceText, /answered 45d ago as "Radiohead"/);
+    assert.match(guidanceText, /Ask one of these questions or bring up/);
+
+    // On a normal chat turn, questions are omitted completely and blank guidance emits no chunk.
+    let normalInitiativeCalls = 0;
+    let normalTrace;
+    await processTurnWork(work, baseDeps({
+      loadPatterns: async () => [
+        {
+          id: "chat",
+          selectionDescription: "Normal conversation.",
+          responseGuidance: "",
+          position: 0,
+          includeInitiativeContext: false,
+        },
+      ],
+      loadInitiativeQuestions: async () => {
+        normalInitiativeCalls += 1;
+        return [{ questionKey: "q", questionText: "Should not appear", reason: "unanswered" }];
+      },
+      callDecisions: async () => decisionResponse("chat"),
+      recordChatRequest: async (payload) => { normalTrace = payload; },
+    }));
+    assert.equal(normalInitiativeCalls, 0);
+    assert.ok(!normalTrace.messageChunks.includes("guidance"));
+  });
+
+  it("buildDynamicInitiativePrompt handles questions-only and article-only cleanly", () => {
+    const questionsOnly = buildDynamicInitiativePrompt({
+      guidance: "Keep it going.",
+      article: null,
+      questions: [{ questionKey: "q1", questionText: "Favorite movie?", reason: "unanswered" }],
+    });
+    assert.match(questionsOnly, /Favorite movie\?/);
+    assert.match(questionsOnly, /Ask one of these questions naturally/);
+    assert.ok(!questionsOnly.includes("bring up"));
+
+    const empty = buildDynamicInitiativePrompt({
+      guidance: "   ",
+      article: null,
+      questions: [],
+    });
+    assert.equal(empty, null);
   });
 });

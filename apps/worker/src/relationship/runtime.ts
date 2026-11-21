@@ -9,6 +9,7 @@ import type {
   RelationshipParticipant,
   RelationshipQuestion,
   RelationshipSummary,
+  SelectedInitiativeQuestion,
 } from "./types.ts";
 
 function dayOrdinal(day: string): number {
@@ -283,30 +284,273 @@ export function selectUnansweredQuestionsForExtraction(input: {
     .slice(0, limit);
 }
 
-/** A separate system chunk; all personal wording comes from runtime config. */
+export const DEFAULT_INITIATIVE_QUESTION_LIMIT = 4;
+export const DEFAULT_OLD_ANSWER_REVISIT_DAYS = 30;
+
+const QUESTION_STOP_WORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "been", "but", "by", "can", "could",
+  "did", "do", "does", "for", "from", "had", "has", "have", "he", "her", "here",
+  "hers", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its", "just",
+  "like", "me", "more", "most", "my", "no", "not", "now", "of", "on", "one", "or",
+  "our", "out", "really", "she", "so", "some", "still", "than", "that", "the",
+  "their", "them", "then", "there", "these", "they", "thing", "things", "this",
+  "those", "to", "too", "up", "us", "user", "users", "very", "was", "we", "were",
+  "what", "whats", "when", "where", "which", "who", "why", "will", "with", "would",
+  "yeah", "yes", "you", "your", "yours",
+]);
+
+function tokenizeForMatching(text: string): Set<string> {
+  const tokens = new Set<string>();
+  for (const raw of text.toLowerCase().replace(/[^a-z0-9\s]/g, " ").split(/\s+/)) {
+    if (raw.length < 3 || QUESTION_STOP_WORDS.has(raw)) continue;
+    tokens.add(raw);
+  }
+  return tokens;
+}
+
+function tokenOverlapScore(recentTokens: ReadonlySet<string>, questionText: string): number {
+  if (recentTokens.size === 0) return 0;
+  const questionTokens = tokenizeForMatching(questionText);
+  let score = 0;
+  for (const token of questionTokens) {
+    if (recentTokens.has(token)) {
+      score += 1;
+    } else if (token.length >= 3) {
+      for (const recent of recentTokens) {
+        if (
+          recent.length >= 3 &&
+          Math.abs(recent.length - token.length) <= 3 &&
+          (recent.startsWith(token) || token.startsWith(recent))
+        ) {
+          score += 0.5;
+          break;
+        }
+      }
+    }
+  }
+  return score;
+}
+
+function shuffleInPlace<T>(items: T[], random: () => number): T[] {
+  for (let i = items.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(random() * (i + 1));
+    const tmp = items[i]!;
+    items[i] = items[j]!;
+    items[j] = tmp;
+  }
+  return items;
+}
+
+/**
+ * Curated small question selector for dynamic initiative turns.
+ *
+ * Priority order (capped at `limit`, default 4, no duplicates):
+ * 1. Conversation-relevant questions matched against recent context (up to 2).
+ * 2. Random subset of unanswered user questions (preferring current-or-lower tiers).
+ * 3. User questions needing clarification (0–1 reserved when available).
+ * 4. Old settled user answers past `oldAnswerMinAgeDays` for natural revisit (0–1 reserved when available).
+ */
+export function selectInitiativeQuestions(input: {
+  readonly configuration: RelationshipConfiguration;
+  readonly summary: RelationshipSummary;
+  readonly recentText: string;
+  readonly now: Date;
+  readonly limit?: number;
+  readonly oldAnswerMinAgeDays?: number;
+  readonly random?: () => number;
+}): readonly SelectedInitiativeQuestion[] {
+  const limit = input.limit ?? DEFAULT_INITIATIVE_QUESTION_LIMIT;
+  if (!Number.isInteger(limit) || limit < 0) {
+    throw new RangeError(`initiative question limit must be a non-negative integer, got ${String(limit)}`);
+  }
+  if (limit === 0 || input.configuration.questions.length === 0) return [];
+
+  const oldAnswerMinAgeDays = input.oldAnswerMinAgeDays ?? DEFAULT_OLD_ANSWER_REVISIT_DAYS;
+  const minOldAgeMs = Math.max(0, oldAnswerMinAgeDays) * 86_400_000;
+  const random = input.random ?? Math.random;
+  const maxCurrentTierPos = Math.max(
+    input.summary.baseTier.position,
+    input.summary.effectiveTier.position,
+  );
+
+  const userAnswerByKey = new Map<string, RelationshipAnswer>();
+  for (const answer of input.summary.answers) {
+    if (answer.participant === "user") {
+      userAnswerByKey.set(answer.questionKey, answer);
+    }
+  }
+
+  interface CandidateEntry {
+    readonly question: RelationshipQuestion;
+    readonly status: "unanswered" | "clarification" | "revisit";
+    readonly answer?: RelationshipAnswer;
+    readonly ageDays?: number;
+  }
+
+  const unansweredCurrent: CandidateEntry[] = [];
+  const unansweredHigher: CandidateEntry[] = [];
+  const clarifications: CandidateEntry[] = [];
+  const revisits: CandidateEntry[] = [];
+  const allEligible: CandidateEntry[] = [];
+
+  for (const question of input.configuration.questions) {
+    const answer = userAnswerByKey.get(question.key);
+    if (answer === undefined) {
+      const entry: CandidateEntry = { question, status: "unanswered" };
+      allEligible.push(entry);
+      if (question.tierPosition <= maxCurrentTierPos) {
+        unansweredCurrent.push(entry);
+      } else {
+        unansweredHigher.push(entry);
+      }
+    } else if (answer.clarificationNeeded) {
+      const entry: CandidateEntry = { question, status: "clarification", answer };
+      allEligible.push(entry);
+      clarifications.push(entry);
+    } else if (answer.updatedAt !== undefined) {
+      const ageMs = input.now.getTime() - answer.updatedAt.getTime();
+      if (ageMs >= minOldAgeMs) {
+        const ageDays = Math.max(1, Math.floor(ageMs / 86_400_000));
+        const entry: CandidateEntry = { question, status: "revisit", answer, ageDays };
+        allEligible.push(entry);
+        revisits.push(entry);
+      }
+    }
+  }
+
+  const picked: SelectedInitiativeQuestion[] = [];
+  const pickedKeys = new Set<string>();
+  const toSelected = (
+    entry: CandidateEntry,
+    overrideReason?: SelectedInitiativeQuestion["reason"],
+  ): SelectedInitiativeQuestion => ({
+    questionKey: entry.question.key,
+    questionText: entry.question.text,
+    reason: overrideReason ?? entry.status,
+    ...(entry.answer !== undefined ? { priorAnswer: entry.answer.answer } : {}),
+    ...(entry.ageDays !== undefined ? { priorAnswerAgeDays: entry.ageDays } : {}),
+  });
+  const add = (
+    entry: CandidateEntry,
+    overrideReason?: SelectedInitiativeQuestion["reason"],
+  ): boolean => {
+    if (picked.length >= limit || pickedKeys.has(entry.question.key)) return false;
+    pickedKeys.add(entry.question.key);
+    picked.push(toSelected(entry, overrideReason));
+    return true;
+  };
+
+  // 1. Conversation-relevant questions (up to 2).
+  const recentTokens = tokenizeForMatching(input.recentText);
+  if (recentTokens.size > 0) {
+    const statusPriority = { unanswered: 0, clarification: 1, revisit: 2 } as const;
+    const relevant = allEligible
+      .map((entry) => ({
+        entry,
+        score: tokenOverlapScore(recentTokens, entry.question.text),
+      }))
+      .filter((item) => item.score > 0)
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          statusPriority[a.entry.status] - statusPriority[b.entry.status] ||
+          a.entry.question.tierPosition - b.entry.question.tierPosition ||
+          a.entry.question.key.localeCompare(b.entry.question.key),
+      );
+    const maxRelevant = Math.min(2, limit);
+    for (const item of relevant) {
+      if (picked.length >= maxRelevant) break;
+      add(
+        item.entry,
+        item.entry.status === "unanswered" ? "relevant" : item.entry.status,
+      );
+    }
+  }
+
+  // Remaining candidates after relevance pass.
+  const remainingUnansweredCurrent = unansweredCurrent.filter(
+    (entry) => !pickedKeys.has(entry.question.key),
+  );
+  const remainingUnansweredHigher = unansweredHigher.filter(
+    (entry) => !pickedKeys.has(entry.question.key),
+  );
+  const remainingClarifications = clarifications.filter(
+    (entry) => !pickedKeys.has(entry.question.key),
+  );
+  const remainingRevisits = revisits.filter(
+    (entry) => !pickedKeys.has(entry.question.key),
+  );
+
+  // Reserve at most 1 slot for clarification and 1 for old-answer revisit when
+  // available, while keeping random unanswered questions the primary fill.
+  const slotsLeftAfterRelevant = limit - picked.length;
+  const reserveClarification =
+    remainingClarifications.length > 0 && slotsLeftAfterRelevant >= 2 ? 1 : 0;
+  const reserveRevisit =
+    remainingRevisits.length > 0 &&
+    slotsLeftAfterRelevant - reserveClarification >= 2
+      ? 1
+      : 0;
+  const unansweredTarget = Math.max(
+    0,
+    slotsLeftAfterRelevant - reserveClarification - reserveRevisit,
+  );
+
+  // 2. Random subset of unanswered questions (preferring current-or-lower tiers).
+  shuffleInPlace(remainingUnansweredCurrent, random);
+  shuffleInPlace(remainingUnansweredHigher, random);
+  const unansweredPool = [...remainingUnansweredCurrent, ...remainingUnansweredHigher];
+  let addedUnanswered = 0;
+  for (const entry of unansweredPool) {
+    if (addedUnanswered >= unansweredTarget || picked.length >= limit) break;
+    if (add(entry)) addedUnanswered += 1;
+  }
+
+  // 3. Questions needing clarification (0–1 normally; more if unanswered exhausted).
+  shuffleInPlace(remainingClarifications, random);
+  const maxClarifications =
+    unansweredPool.length > addedUnanswered
+      ? 1
+      : Math.max(1, limit - picked.length - (remainingRevisits.length > 0 ? 1 : 0));
+  let addedClarifications = 0;
+  for (const entry of remainingClarifications) {
+    if (addedClarifications >= maxClarifications || picked.length >= limit) break;
+    if (add(entry)) addedClarifications += 1;
+  }
+
+  // 4. Old settled answers to check if still true (oldest/random, capped to avoid spam).
+  // Sort oldest first with random tie-break among similarly aged answers by shuffling first.
+  shuffleInPlace(remainingRevisits, random);
+  remainingRevisits.sort((a, b) => (b.ageDays ?? 0) - (a.ageDays ?? 0));
+  const maxRevisits = unansweredPool.length > addedUnanswered ? 1 : 2;
+  let addedRevisits = 0;
+  for (const entry of remainingRevisits) {
+    if (addedRevisits >= maxRevisits || picked.length >= limit) break;
+    if (add(entry)) addedRevisits += 1;
+  }
+
+  // If reserved slots went unfilled and unanswered questions remain, top up.
+  for (const entry of unansweredPool) {
+    if (picked.length >= limit) break;
+    add(entry);
+  }
+
+  return picked;
+}
+
+/**
+ * Slim familiarity context: stage/tier, time known, streaks, and reply budget.
+ * Settled and clarification-needed answers stay out of this chunk so every turn
+ * stays lean; curated questions are surfaced dynamically only on initiative turns.
+ */
 export function renderRelationshipContext(summary: RelationshipSummary): string {
   const lines = [
-    `Relationship configuration: ${summary.relationshipType}.`,
-    `First recorded conversation date: ${summary.firstConversationDate ?? "not yet recorded"}.`,
-    `Time known: ${summary.timeKnownDays} behavioral day(s); active day streak: ${summary.activeDayStreak}; missed day streak: ${summary.missedDayStreak}.`,
-    `Familiarity: ${summary.answeredSlots}/${summary.eligibleSlots} participant-question slots (${(summary.familiarity * 100).toFixed(1)}%); user ${summary.userAnsweredSlots}/${summary.eligibleSlotsPerParticipant}, assistant ${summary.assistantAnsweredSlots}/${summary.eligibleSlotsPerParticipant}.`,
-    `Base tier: ${summary.baseTier.label}. Effective tier: ${summary.effectiveTier.label} (${summary.tierMovement}).`,
-    `Tier prompt: ${summary.effectiveTier.prompt}`,
-    `Behavioral guidance: ${summary.effectiveTier.behavioralGuidance}`,
+    `Relationship type: ${summary.relationshipType}.`,
+    `Time known: ${summary.timeKnownDays} day(s) (first recorded: ${summary.firstConversationDate ?? "not yet recorded"}); active day streak: ${summary.activeDayStreak}; missed day streak: ${summary.missedDayStreak}.`,
+    `Stage: ${summary.effectiveTier.label} (base: ${summary.baseTier.label}, movement: ${summary.tierMovement}; familiarity ${(summary.familiarity * 100).toFixed(1)}%).`,
+    summary.effectiveTier.prompt,
+    summary.effectiveTier.behavioralGuidance,
     `Reply length: keep this reply concise, aiming for at most about ${String(mainReplyMaxTokensForSummary(summary))} output tokens.`,
-    `Clarification guidance: ${summary.clarificationGuidance}`,
   ];
-  const clarificationAnswers = summary.answers.filter((answer) => answer.clarificationNeeded);
-  if (clarificationAnswers.length > 0) {
-    lines.push(
-      `Clarification-needed interpretations (ask naturally when relevant; do not claim certainty): ${clarificationAnswers.map((answer) => `${answer.participant} — ${answer.questionText}: ${answer.answer}`).join("; ")}`,
-    );
-  }
-  const learnedAnswers = summary.answers.filter((answer) => !answer.clarificationNeeded);
-  if (learnedAnswers.length > 0) {
-    lines.push(
-      `Current interpreted shared answers: ${learnedAnswers.map((answer) => `${answer.participant} — ${answer.questionText}: ${answer.answer}`).join("; ")}`,
-    );
-  }
   return lines.join("\n");
 }

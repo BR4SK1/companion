@@ -7,13 +7,19 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  areClaimsNearDuplicate,
+  buildRecallQuery,
   buildTsQueryText,
   evidenceBoost,
   normalizeRecallInput,
+  recallCanonicalDetailed,
   recencyBoost,
   sanitizeTextQuery,
+  selectRecallResults,
   DEFAULT_RECALL_LIMIT,
+  DEFAULT_RECALL_MAX_ASSISTANT_SHARE,
 } from "../../apps/worker/src/memory/recall.ts";
+import { loadMemoryConfig } from "../../apps/worker/src/memory/config.ts";
 import {
   buildCanonicalMemoryContextForPrompt,
   renderProfileSection,
@@ -139,15 +145,16 @@ describe("canonical memory context rendering", () => {
     assert.ok(text.startsWith("Use these memories as user-specific context."));
   });
 
-  it("truncates long claims and escapes XML-sensitive characters", () => {
-    const text = buildCanonicalMemoryContextForPrompt({
+  it("preserves ordinary claims without mid-word truncation and word-bounds very long claims with XML escaping", () => {
+    const mediumClaim = `a <tag> & "quote" ${"word ".repeat(50).trim()}`;
+    const mediumText = buildCanonicalMemoryContextForPrompt({
       now,
       items: [{
         type: "fact",
-        id: "fact-2",
+        id: "fact-medium",
         subject: "user",
         kind: "fact",
-        claim: `a <tag> & "quote" ${"x".repeat(230)}`,
+        claim: mediumClaim,
         topics: [],
         observedAt: "2026-06-14T11:00:00Z",
         textScore: 0,
@@ -156,13 +163,34 @@ describe("canonical memory context rendering", () => {
         score: 0,
       }],
     });
-    assert.ok(text.includes("&lt;tag&gt;"));
-    assert.ok(text.includes("&amp;"));
-    assert.ok(!text.includes("<tag>"));
-    // The rendered claim line is bounded: truncation at 220 raw chars plus
-    // the "..." marker and XML-escaping expansion.
-    const claimLine = text.split("\n").find((line) => line.includes("xxx"));
-    assert.ok(claimLine.length <= 260);
+    assert.ok(mediumText.includes("&lt;tag&gt;"));
+    assert.ok(mediumText.includes("&amp;"));
+    assert.ok(!mediumText.includes("<tag>"));
+    assert.ok(!mediumText.includes("..."), "a ~270-char claim must not be truncated");
+
+    const veryLongClaim = Array.from({ length: 220 }, (_, i) => `token${String(i)}`).join(" ");
+    const longText = buildCanonicalMemoryContextForPrompt({
+      now,
+      items: [{
+        type: "fact",
+        id: "fact-long",
+        subject: "user",
+        kind: "fact",
+        claim: veryLongClaim,
+        topics: [],
+        observedAt: "2026-06-14T11:00:00Z",
+        textScore: 0,
+        recencyBoost: 0,
+        evidenceBoost: 0,
+        score: 0,
+      }],
+    });
+    const claimLine = longText.split("\n").find((line) => line.includes("token0"));
+    assert.ok(claimLine.endsWith("..."), "claims over 1000 chars are safety-capped");
+    assert.ok(claimLine.length <= 1040);
+    // Word-boundary snap: the last token before "..." must be a complete tokenN, never partial "tok...".
+    const beforeEllipsis = claimLine.slice(0, -3).trim().split(" ").at(-1);
+    assert.match(beforeEllipsis, /^token\d+$/);
   });
 
   it("returns undefined for empty result sets", () => {
@@ -356,5 +384,131 @@ describe("recall temporal expression detection", () => {
     );
     assert.equal(fall.start.toISOString(), "2026-11-01T04:00:00.000Z");
     assert.equal(fall.end.toISOString(), "2026-11-02T05:00:00.000Z");
+  });
+});
+
+describe("chat recall query builder, dedupe, assistant cap, and exclusion filters", () => {
+  it("builds a 1-full-turn + current-message query without a 16-word cut", () => {
+    const longCurrent = Array.from({ length: 24 }, (_, i) => `word${String(i)}`).join(" ");
+    const query = buildRecallQuery({
+      currentUserText: longCurrent,
+      history: [
+        { role: "user", content: "old turn should not be included", turnId: "turn-old" },
+        { role: "assistant", content: "old reply", turnId: "turn-old" },
+        { role: "user", content: "hiking in Colorado", turnId: "turn-prev" },
+        { role: "assistant", content: "sounds awesome near the mountains", turnId: "turn-prev" },
+      ],
+    });
+    assert.ok(query.includes("word23"), "must not truncate at 16 words");
+    assert.ok(query.includes("hiking in Colorado"), "includes previous turn user text");
+    assert.ok(query.includes("mountains"), "includes previous turn assistant reply");
+    assert.ok(!query.includes("old turn"), "only includes the immediately preceding turn");
+    assert.ok(query.length <= 512);
+  });
+
+  it("preserves current user text first when the previous assistant reply is very long", () => {
+    const query = buildRecallQuery({
+      currentUserText: "what did we decide about dinner",
+      history: [
+        { role: "user", content: "pasta or tacos", turnId: "turn-prev" },
+        { role: "assistant", content: Array.from({ length: 120 }, (_, i) => `extra${String(i)}`).join(" "), turnId: "turn-prev" },
+      ],
+    });
+    assert.ok(query.startsWith("what did we decide about dinner"));
+    assert.ok(query.includes("pasta or tacos"));
+    assert.ok(query.length <= 512);
+    // Word-boundary snap: no chopped trailing token.
+    const lastToken = query.split(" ").at(-1);
+    assert.match(lastToken, /^extra\d+$/);
+  });
+
+  it("detects near-identical claims while keeping distinct claims separate", () => {
+    assert.equal(
+      areClaimsNearDuplicate("Prefers tea in the morning.", "prefers tea in the morning"),
+      true,
+    );
+    assert.equal(
+      areClaimsNearDuplicate(
+        "The user is planning a summer hiking trip to Colorado",
+        "User planning summer hiking trip to Colorado soon",
+      ),
+      true,
+    );
+    assert.equal(
+      areClaimsNearDuplicate("Likes coffee in the morning", "Works as a software engineer"),
+      false,
+    );
+  });
+
+  it("caps assistant-attributed items and deduplicates same-subject near-duplicates", () => {
+    const mk = (id, subjectRole, claim, score, type = "fact") => ({
+      item: {
+        type,
+        id,
+        subject: subjectRole,
+        subjectRole,
+        kind: "fact",
+        claim,
+        topics: [],
+        observedAt: "2026-06-01T00:00:00.000Z",
+        textScore: score,
+        recencyBoost: 0,
+        evidenceBoost: 0,
+        score,
+      },
+      score,
+      chars: claim.length + 40,
+    });
+    const scored = [
+      mk("a1", "assistant", "Found an article on local-first databases interesting", 10),
+      mk("a2", "assistant", "Enjoys reading sci-fi novels in autumn", 9),
+      mk("a3", "assistant", "Likes rainy evenings with music", 8),
+      mk("a4", "assistant", "Curious about vintage cameras", 7),
+      mk("u1", "user", "User loves cycling along the river in summer", 6),
+      mk("u2", "user", "User loves cycling along the river during summer.", 5.5),
+      mk("u3", "user", "User trained for a half marathon last spring", 5),
+      mk("u4", "user", "User enjoys autumn weather", 4),
+    ];
+    const { results } = selectRecallResults(scored, {
+      limit: 8,
+      maxChars: 12_000,
+      maxAssistantShare: DEFAULT_RECALL_MAX_ASSISTANT_SHARE,
+      deduplicateClaims: true,
+    });
+    const assistantItems = results.filter((item) => item.subjectRole === "assistant");
+    assert.equal(assistantItems.length, 2, "assistant items capped at 2 of 8");
+    const ids = results.map((item) => item.id);
+    assert.ok(ids.includes("u1"));
+    assert.ok(!ids.includes("u2"), "near-duplicate user claim is deduplicated");
+    assert.ok(ids.includes("u3"));
+    assert.ok(ids.includes("u4"));
+  });
+
+  it("applies excludeTurnIds and minAgeMs SQL filters and configures a 15-minute default", async () => {
+    const config = loadMemoryConfig({});
+    assert.equal(config.recallMinAgeMs, 15 * 60_000);
+
+    const calls = [];
+    const pool = {
+      query: async (sql, params) => {
+        calls.push({ sql: String(sql), params });
+        return { rows: [] };
+      },
+    };
+    const referenceTime = new Date("2026-06-15T12:30:00.000Z");
+    await recallCanonicalDetailed(pool, config, {
+      query: "morning coffee",
+      referenceTime,
+      excludeTurnIds: ["turn-1", "turn-2"],
+      minAgeMs: 15 * 60_000,
+    });
+    assert.equal(calls.length, 2);
+    const [factCall, obsCall] = calls;
+    assert.match(factCall.sql, /f\.observed_at <= \$\d+::timestamptz/);
+    assert.match(factCall.sql, /\(f\.turn_id IS NULL OR f\.turn_id::text <> ALL\(\$\d+::text\[\]\)\)/);
+    assert.equal(factCall.params[2].toISOString(), "2026-06-15T12:15:00.000Z");
+    assert.deepEqual(factCall.params[3], ["turn-1", "turn-2"]);
+    assert.match(obsCall.sql, /o\.last_observed_at <= \$\d+::timestamptz/);
+    assert.equal(obsCall.params[2].toISOString(), "2026-06-15T12:15:00.000Z");
   });
 });

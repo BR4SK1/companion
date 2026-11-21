@@ -173,8 +173,9 @@ export const TABLE_REGISTRY: readonly TableDef[] = [
       text("id", { minLength: 1 }),
       boolean("enabled"),
       text("selection_description", { prompt: true, minLength: 1, maxLength: 4000 }),
-      text("response_guidance", { prompt: true, minLength: 1 }),
+      text("response_guidance", { prompt: true, minLength: 0 }),
       integer("position", { min: 0 }),
+      boolean("include_initiative_context"),
     ],
   },
   {

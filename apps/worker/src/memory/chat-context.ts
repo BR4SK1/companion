@@ -12,13 +12,18 @@
 
 import type { CanonicalRecallItem, ObservationProfile } from "./types.ts";
 
-const MEMORY_MAX_CONTENT_LENGTH = 220;
+const MEMORY_MAX_CONTENT_LENGTH = 1000;
 
 function truncate(text: string, maxLength: number): string {
   if (text.length <= maxLength) {
     return text;
   }
-  return `${text.slice(0, maxLength - 3)}...`;
+  const budget = Math.max(1, maxLength - 3);
+  const slice = text.slice(0, budget);
+  const lastSpace = slice.lastIndexOf(" ");
+  const snapped =
+    lastSpace >= Math.floor(budget * 0.5) ? slice.slice(0, lastSpace) : slice;
+  return `${snapped.trimEnd()}...`;
 }
 
 function sanitizeForXmlText(text: string): string {

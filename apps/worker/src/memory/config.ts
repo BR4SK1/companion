@@ -123,6 +123,8 @@ export interface MemoryConfig {
   /** Chat integration. */
   readonly recallLimit: number;
   readonly recallMaxChars: number;
+  /** Minimum age (ms) before a memory can be recalled in chat (prevents echoing recent turns). */
+  readonly recallMinAgeMs: number;
   readonly leaseSecondsMinimum: number;
 }
 
@@ -149,6 +151,7 @@ const DEFAULTS = {
   profileMaxOutputTokens: 8_000,
   recallLimit: 8,
   recallMaxChars: 12_000,
+  recallMinAgeMs: 15 * 60_000,
 } as const;
 
 export function loadMemoryConfig(
@@ -305,6 +308,10 @@ export function loadMemoryConfig(
     recallMaxChars: optionalNumber(env, "WORKER_MEMORY_RECALL_MAX_CHARS", DEFAULTS.recallMaxChars, {
       integer: true,
       positive: true,
+    }),
+    recallMinAgeMs: optionalNumber(env, "WORKER_MEMORY_RECALL_MIN_AGE_MS", DEFAULTS.recallMinAgeMs, {
+      integer: true,
+      minimum: 0,
     }),
     leaseSecondsMinimum: MIN_LEASE_SECONDS,
   };

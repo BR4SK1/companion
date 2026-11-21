@@ -155,6 +155,7 @@ interface PatternRow {
   selection_description: string;
   response_guidance: string;
   position: number;
+  include_initiative_context?: boolean;
 }
 
 function mapMessage(row: MessageRow): ConversationMessage {
@@ -196,6 +197,7 @@ function mapPattern(row: PatternRow): ResponsePattern {
     selectionDescription: row.selection_description,
     responseGuidance: row.response_guidance,
     position: row.position,
+    includeInitiativeContext: Boolean(row.include_initiative_context),
   };
 }
 
@@ -2133,7 +2135,8 @@ export function createConversationStore(
     readonly ResponsePattern[]
   > {
     const result = await pool.query<PatternRow>(
-      `SELECT id, selection_description, response_guidance, position
+      `SELECT id, selection_description, response_guidance, position,
+              include_initiative_context
        FROM response_pattern
        WHERE enabled
        ORDER BY position, id`,
