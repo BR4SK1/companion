@@ -35,7 +35,7 @@ function mockSnapshot() {
       { kind: "fact_extraction", version: "mock-v1", system_prompt: LONG_PROMPT },
     ],
     response_pattern: [
-      { id: "mock-pattern", enabled: true, selection_description: "Mock selection", response_guidance: "Mock guidance", position: 0 },
+      { id: "mock-pattern", enabled: true, selection_description: "Mock selection", response_guidance: "Mock guidance", position: 0, include_initiative_context: false },
     ],
     prompt_module: [
       {
@@ -314,7 +314,7 @@ describe("config manager mock verification", () => {
           {
             table: "response_pattern",
             key: { id: "mock-pattern-2" },
-            row: { id: "mock-pattern-2", enabled: true, selection_description: "New", response_guidance: "New guidance", position: 1 },
+            row: { id: "mock-pattern-2", enabled: true, selection_description: "New", response_guidance: "", position: 1, include_initiative_context: true },
           },
         ],
       }),
@@ -331,7 +331,7 @@ describe("config manager mock verification", () => {
           {
             table: "response_pattern",
             key: { id: "mock-pattern-2" },
-            row: { id: "mock-pattern-2", enabled: true, selection_description: "New", response_guidance: "New guidance", position: 1 },
+            row: { id: "mock-pattern-2", enabled: true, selection_description: "New", response_guidance: "", position: 1, include_initiative_context: true },
           },
         ],
         confirmation: "nonprod",
@@ -443,7 +443,7 @@ describe("config manager targeted row writes (planRowChanges)", () => {
     const after = base();
     after.response_pattern = [
       ...after.response_pattern,
-      { id: "mock-pattern-2", enabled: true, selection_description: "New", response_guidance: "New guidance", position: 1 },
+      { id: "mock-pattern-2", enabled: true, selection_description: "New", response_guidance: "New guidance", position: 1, include_initiative_context: false },
     ];
     after.article_prompt = [];
     const plan = planRowChanges(before, after);

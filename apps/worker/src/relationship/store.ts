@@ -9,8 +9,10 @@ import type {
   RelationshipQuestion,
   RelationshipSummary,
   RelationshipTier,
+  SelectedInitiativeQuestion,
 } from "./types.ts";
 import {
+  selectInitiativeQuestions,
   selectUnansweredQuestionsForExtraction,
   summarizeRelationship,
 } from "./runtime.ts";
@@ -59,6 +61,7 @@ interface AnswerRow {
   participant: string;
   current_answer: string;
   clarification_needed: boolean;
+  updated_at?: Date;
 }
 interface FirstMessageRow { effective_at: Date; }
 interface BehavioralDayRow { activity_day: string; }
@@ -192,6 +195,13 @@ export async function loadRelationshipConfiguration(
 
 export interface RelationshipStore {
   readonly getSummary: (now: Date) => Promise<RelationshipSummary>;
+  readonly getInitiativeQuestions: (input: {
+    readonly recentText: string;
+    readonly now: Date;
+    readonly limit?: number;
+    readonly oldAnswerMinAgeDays?: number;
+    readonly random?: () => number;
+  }) => Promise<readonly SelectedInitiativeQuestion[]>;
   readonly extractAnswers: (input: {
     readonly userText: string;
     readonly assistantText: string;
@@ -301,7 +311,7 @@ export function createRelationshipStore(input: {
       ),
       pool.query<AnswerRow>(
         `SELECT a.question_id, q.question_key, q.question_text, a.participant,
-                a.current_answer, a.clarification_needed
+                a.current_answer, a.clarification_needed, a.updated_at
          FROM relationship_answer a
          JOIN relationship_question q ON q.id = a.question_id
          WHERE q.enabled = true
@@ -317,6 +327,7 @@ export function createRelationshipStore(input: {
       participant: row.participant as RelationshipParticipant,
       answer: row.current_answer,
       clarificationNeeded: row.clarification_needed,
+      ...(row.updated_at !== undefined ? { updatedAt: row.updated_at } : {}),
     }));
     return summarizeRelationship({
       configuration,
@@ -324,6 +335,27 @@ export function createRelationshipStore(input: {
       userActivityDays,
       now,
       answers,
+    });
+  }
+
+  async function getInitiativeQuestions(params: {
+    readonly recentText: string;
+    readonly now: Date;
+    readonly limit?: number;
+    readonly oldAnswerMinAgeDays?: number;
+    readonly random?: () => number;
+  }): Promise<readonly SelectedInitiativeQuestion[]> {
+    const summary = await getSummary(params.now);
+    return selectInitiativeQuestions({
+      configuration,
+      summary,
+      recentText: params.recentText,
+      now: params.now,
+      ...(params.limit !== undefined ? { limit: params.limit } : {}),
+      ...(params.oldAnswerMinAgeDays !== undefined
+        ? { oldAnswerMinAgeDays: params.oldAnswerMinAgeDays }
+        : {}),
+      ...(params.random !== undefined ? { random: params.random } : {}),
     });
   }
 
@@ -411,5 +443,5 @@ export function createRelationshipStore(input: {
     }
   }
 
-  return { getSummary, extractAnswers, recordAnswers };
+  return { getSummary, getInitiativeQuestions, extractAnswers, recordAnswers };
 }

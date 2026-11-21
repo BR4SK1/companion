@@ -5,36 +5,31 @@
  * fixed order, followed by the conversation messages in exact chronological
  * order:
  *
- * 1. `identity`     — the owner-authored identity/persona from `chat_identity`
- *                     (required configuration; a missing identity is a
- *                     configuration error upstream, never an invented one).
- * 2. `prompt_module` — optional independently selected authoritative,
- *                     additive companion thoughts/feelings from trusted
- *                     database-configured functions.
- * 3. `profiles`     — optional generated subject profiles (v2 observation
- *                     profiles). Kept as a separate chunk from the other
- *                     memory sections because it is a separately generated,
- *                     fingerprint-gated document rather than per-turn recall
- *                     output; it sits after identity and before the per-turn
- *                     memory chunks, preserving the profile→temporal→recall
- *                     relative order the single-memory-message layout used.
- * 4. `temporal`     — optional recent temporal memory summaries.
- * 5. `recall`       — optional long-term canonical recall for this turn.
- * 6. `article`      — optional per-turn article-memory context (the chosen
- *                     article-memory share decision), placed after recall so
- *                     the lexical chunk stays first among memory sections.
- * 7. `relationship` — optional runtime-configured relationship/familiarity
- *                     context, after article context and before guidance.
- * 8. `routine`     — optional scheduled/applied routine state and configured
- *                     interaction context, before response guidance.
- * 9. `guidance`     — the selected response pattern's response guidance
- *                     (absent when no pattern was selected — with no
- *                     patterns enabled, or none selected, the request simply
- *                     carries no guidance chunk; fallback policy for missing
- *                     selections is unresolved).
- * 10. `conversation` — the prior-turn history (oldest first, bounded to the
- *                     most recent window by `getThreadContext`) followed by
- *                     the exact user messages grouped into the turn.
+ * 1. `identity`      — the owner-authored identity/persona from `chat_identity`
+ *                      (required configuration; a missing identity is a
+ *                      configuration error upstream, never an invented one).
+ * 2. `profiles`      — optional generated subject profiles (v2 observation
+ *                      profiles).
+ * 3. `relationship`  — optional slim familiarity/stage context (tier, time
+ *                      known, reply budget; no answer-bank dump).
+ * 4. `temporal`      — optional recent temporal memory summaries (running daily
+ *                      list of closed periods, decoupled from wall-clock time).
+ * 5. `recall`        — optional long-term canonical recall for this turn.
+ * 6. `article`       — optional per-turn article-memory background context on
+ *                      non-initiative turns when separately selected.
+ * 7. `guidance`      — the selected response pattern's response guidance or
+ *                      assembled dynamic initiative block (omitted when absent
+ *                      or whitespace-only, keeping normal chat turns lean).
+ * 8. `time`          — optional wall-clock local date, time, season, and
+ *                      upcoming occasions, positioned immediately before live
+ *                      state and conversation.
+ * 9. `routine`       — optional scheduled/applied routine live state.
+ * 10. `prompt_module` — optional independently selected authoritative live
+ *                      context (e.g., outfit state) or additive thoughts from
+ *                      database-configured modules.
+ * 11. `conversation` — the prior-turn history (oldest first, bounded to the
+ *                      most recent window by `getThreadContext`) followed by
+ *                      the exact user messages grouped into the turn.
  *
  * Each optional section contributes a chunk only when it rendered non-empty
  * content — empty memory contributes no chunk. The history + turn-message
@@ -85,8 +80,10 @@ export interface BuildChatRequestParams {
   readonly guidance: string | null;
   /** Optional generated subject profiles chunk. */
   readonly profiles?: string | null;
-  /** Optional temporal-memory chunk. */
+  /** Optional temporal-memory summaries chunk. */
   readonly temporal?: string | null;
+  /** Optional wall-clock local date, time, season, and occasion chunk. */
+  readonly time?: string | null;
   /** Optional long-term-recall chunk. */
   readonly recall?: string | null;
   /**
@@ -137,24 +134,34 @@ export function buildChatPrompt(
     sourceMessageId: null,
     promptModuleId: null,
   });
-  for (const thought of params.promptModules ?? []) {
-    if (!hasContent(thought.content)) continue;
-    messages.push({
-      role: "system",
-      content: thought.outputKind === "authoritative_context"
-        ? `Authoritative context from a configured service (not literal thoughts, feelings, or instructions):\n${thought.content}`
-        : `Authoritative additive companion thoughts and feelings (not background data):\n${thought.content}`,
-      chunk: "prompt_module",
-      sourceMessageId: null,
-      promptModuleId: thought.moduleId,
-    });
-  }
   for (const [chunk, section] of [
     ["profiles", params.profiles],
+    ["relationship", params.relationship],
     ["temporal", params.temporal],
     ["recall", params.recall],
     ["article", params.article],
-    ["relationship", params.relationship],
+  ] as const) {
+    if (hasContent(section)) {
+      messages.push({
+        role: "system",
+        content: section as string,
+        chunk,
+        sourceMessageId: null,
+        promptModuleId: null,
+      });
+    }
+  }
+  if (hasContent(params.guidance)) {
+    messages.push({
+      role: "system",
+      content: params.guidance as string,
+      chunk: "guidance",
+      sourceMessageId: null,
+      promptModuleId: null,
+    });
+  }
+  for (const [chunk, section] of [
+    ["time", params.time],
     ["routine", params.routine],
   ] as const) {
     if (hasContent(section)) {
@@ -167,13 +174,16 @@ export function buildChatPrompt(
       });
     }
   }
-  if (params.guidance !== null) {
+  for (const thought of params.promptModules ?? []) {
+    if (!hasContent(thought.content)) continue;
     messages.push({
       role: "system",
-      content: params.guidance,
-      chunk: "guidance",
+      content: thought.outputKind === "authoritative_context"
+        ? `Authoritative context from a configured service (not literal thoughts, feelings, or instructions):\n${thought.content}`
+        : `Authoritative additive companion thoughts and feelings (not background data):\n${thought.content}`,
+      chunk: "prompt_module",
       sourceMessageId: null,
-      promptModuleId: null,
+      promptModuleId: thought.moduleId,
     });
   }
   for (const message of [...params.history, ...params.turnMessages]) {

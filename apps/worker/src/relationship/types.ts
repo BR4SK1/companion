@@ -47,6 +47,22 @@ export interface RelationshipAnswer {
   readonly participant: RelationshipParticipant;
   readonly answer: string;
   readonly clarificationNeeded: boolean;
+  /** Last update timestamp for this answer row, when loaded from persistence. */
+  readonly updatedAt?: Date;
+}
+
+export type InitiativeQuestionReason =
+  | "relevant"
+  | "unanswered"
+  | "clarification"
+  | "revisit";
+
+export interface SelectedInitiativeQuestion {
+  readonly questionKey: string;
+  readonly questionText: string;
+  readonly reason: InitiativeQuestionReason;
+  readonly priorAnswer?: string;
+  readonly priorAnswerAgeDays?: number;
 }
 
 export interface RelationshipSummary {

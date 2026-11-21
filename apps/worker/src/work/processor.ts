@@ -76,6 +76,8 @@ import {
   selectResponsePattern,
 } from "./decision.ts";
 import { buildChatPrompt } from "./chat.ts";
+import { buildDynamicInitiativePrompt } from "./initiative.ts";
+import { buildRecallQuery } from "../memory/recall.ts";
 import type { MemoryChatContext } from "../memory/types.ts";
 import { buildTemporalContext, type TemporalSettings } from "../temporal/context.ts";
 import {
@@ -85,7 +87,10 @@ import {
   selectArticleShare,
 } from "../articles/share.ts";
 import type { ArticleMemoryCandidate } from "../articles/types.ts";
-import type { RelationshipExtractionItem } from "../relationship/types.ts";
+import type {
+  RelationshipExtractionItem,
+  SelectedInitiativeQuestion,
+} from "../relationship/types.ts";
 import { mainReplyProviderMaxTokensForBaseTierOrdinal } from "../relationship/runtime.ts";
 import { OpenRouterTransportError } from "@companion/openrouter/transport";
 import type {
@@ -205,8 +210,19 @@ export interface TurnProcessorDeps {
     readonly turnId: string;
     readonly turnAttempt: number;
     readonly userText: string;
+    readonly history?: readonly ConversationMessage[];
     readonly referenceTime: Date;
   }) => Promise<MemoryChatContext | null>;
+  /**
+   * Loads a small curated subset of relationship questions (3–4 max) ONLY when
+   * a response pattern with `includeInitiativeContext` is selected. Omitted on
+   * normal chat turns; failures degrade to no questions.
+   */
+  readonly loadInitiativeQuestions?: (input: {
+    readonly turnId: string;
+    readonly recentText: string;
+    readonly referenceTime: Date;
+  }) => Promise<readonly SelectedInitiativeQuestion[]>;
   /**
    * Loads the per-turn article-memory share candidates (cooldown-eligible
    * accepted reactions, newest-first, deduplicated against the turn's recall
@@ -438,8 +454,9 @@ export async function processTurnWork(
   }
 
   let selected: ResponsePattern | undefined;
-  // The chosen article-memory candidate's context chunk, rendered when the
-  // article-share decision selects a candidate; null otherwise.
+  // The chosen article-memory candidate (when article_memory_share selected
+  // one) and its standalone context chunk on non-initiative turns.
+  let chosenArticle: ArticleMemoryCandidate | null = null;
   let articleChunk: string | null = null;
 
   // Memory context assembly, before the decision step so the article-memory
@@ -454,18 +471,19 @@ export async function processTurnWork(
   let temporalChunk: string | null = null;
   let recallChunk: string | null = null;
   let recallFactKeys: string[] = [];
+  const currentUserText = work.messages
+    .filter((message) => message.role === "user")
+    .map((message) => message.content.trim())
+    .filter(Boolean)
+    .join("\n");
   if (deps.loadMemoryContext !== undefined) {
-    const userText = work.messages
-      .filter((message) => message.role === "user")
-      .map((message) => message.content.trim())
-      .filter(Boolean)
-      .join("\n");
-    if (userText.length > 0) {
+    if (currentUserText.length > 0) {
       try {
         const loaded = await deps.loadMemoryContext({
           turnId: work.turn.id,
           turnAttempt: work.turn.attempt,
-          userText,
+          userText: currentUserText,
+          history,
           referenceTime: attemptReferenceTime,
         });
         profilesChunk = loaded?.profileSection ?? null;
@@ -678,15 +696,18 @@ export async function processTurnWork(
         });
       }
       if (articleSelection.kind === "selected") {
-        const chosen = articleSelection.candidate;
-        articleChunk = buildArticleShareContextForPrompt(chosen);
+        chosenArticle = articleSelection.candidate;
+        articleChunk = buildArticleShareContextForPrompt(
+          chosenArticle,
+          attemptReferenceTime,
+        );
         // The inclusion record is a prompt-inclusion event (never a share
         // claim); a failed write is logged and never fails the turn.
         if (deps.recordArticleShareInclusion !== undefined) {
           try {
             await deps.recordArticleShareInclusion({
               turnId: work.turn.id,
-              reactionId: chosen.reactionId,
+              reactionId: chosenArticle.reactionId,
             });
           } catch (error) {
             console.warn(
@@ -696,6 +717,60 @@ export async function processTurnWork(
         }
       }
     }
+  }
+
+  // Dynamic initiative prompt assembly: runs ONLY when the selected pattern
+  // explicitly enables `includeInitiativeContext`. On normal chat turns,
+  // curated questions are omitted completely and the pattern's guidance (if
+  // non-empty) passes through verbatim.
+  let guidanceChunk: string | null =
+    selected !== undefined ? selected.responseGuidance : null;
+  if (selected?.includeInitiativeContext === true) {
+    let initiativeArticle = chosenArticle;
+    if (initiativeArticle === null && articleCandidates.length > 0) {
+      initiativeArticle = articleCandidates[0]!;
+      if (deps.recordArticleShareInclusion !== undefined) {
+        try {
+          await deps.recordArticleShareInclusion({
+            turnId: work.turn.id,
+            reactionId: initiativeArticle.reactionId,
+          });
+        } catch (error) {
+          console.warn(
+            `[ARTICLE] share inclusion record failed for turn ${work.turn.id}: ${errorMessage(error)}; continuing`,
+          );
+        }
+      }
+    }
+    let initiativeQuestions: readonly SelectedInitiativeQuestion[] = [];
+    if (deps.loadInitiativeQuestions !== undefined) {
+      try {
+        const recentText = buildRecallQuery({
+          currentUserText,
+          history,
+        });
+        initiativeQuestions = await deps.loadInitiativeQuestions({
+          turnId: work.turn.id,
+          recentText,
+          referenceTime: attemptReferenceTime,
+        });
+      } catch {
+        console.warn(
+          `[RELATIONSHIP] initiative questions load failed for turn ${work.turn.id}; continuing without curated questions`,
+        );
+      }
+    }
+    // Fold the chosen/fallback article into the dynamic initiative block so it
+    // is never duplicated as a separate background chunk.
+    if (initiativeArticle !== null) {
+      articleChunk = null;
+    }
+    guidanceChunk = buildDynamicInitiativePrompt({
+      guidance: selected.responseGuidance,
+      article: initiativeArticle,
+      questions: initiativeQuestions,
+      now: attemptReferenceTime,
+    });
   }
 
   // Relationship context is independently optional and degrading, like the
@@ -817,11 +892,7 @@ export async function processTurnWork(
         occasionKeys: temporal.occasionKeys,
         occasionContext: temporal.occasionContext,
       };
-  const fullTemporalChunk = temporal === undefined
-    ? temporalChunk
-    : temporalChunk === null
-      ? temporal.promptText
-      : `${temporal.promptText}\n\nRecent temporal memory:\n${temporalChunk}`;
+  const timeChunk = temporal?.promptText ?? null;
 
   // Main reply output budget: when the relationship loader supplied a
   // base tier ordinal, the visible-reply budget is 500 + 100 per
@@ -864,9 +935,10 @@ export async function processTurnWork(
       history,
       turnMessages: work.messages,
       identity: identity.content,
-      guidance: selected !== undefined ? selected.responseGuidance : null,
+      guidance: guidanceChunk,
       ...(profilesChunk !== null ? { profiles: profilesChunk } : {}),
-      temporal: fullTemporalChunk,
+      ...(temporalChunk !== null ? { temporal: temporalChunk } : {}),
+      ...(timeChunk !== null ? { time: timeChunk } : {}),
       ...(recallChunk !== null ? { recall: recallChunk } : {}),
       ...(articleChunk !== null ? { article: articleChunk } : {}),
       ...(relationshipChunk !== null ? { relationship: relationshipChunk } : {}),

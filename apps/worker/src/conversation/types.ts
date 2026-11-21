@@ -31,6 +31,7 @@ export type ChatChunkName =
   | "identity"
   | "profiles"
   | "temporal"
+  | "time"
   | "recall"
   | "article"
   | "relationship"
@@ -145,6 +146,12 @@ export interface ResponsePattern {
   readonly responseGuidance: string;
   /** Ordering for stable presentation to the decision model. */
   readonly position: number;
+  /**
+   * When true, selecting this pattern dynamically assembles an initiative
+   * prompt combining `responseGuidance` with an eligible article reaction
+   * (when available) and a small curated subset of relationship questions.
+   */
+  readonly includeInitiativeContext?: boolean;
 }
 
 // ---------------------------------------------------------------------------

@@ -14,6 +14,7 @@ test("worker startup and migration-only command share the complete ordered schem
       "0004_chat_identity",
       "0005_message_timing",
       "0006_conversation_thread_order",
+      "0024_response_pattern_initiative",
       "0003_memory_work",
       "0004_memory_semantic_shadow",
       "0021_memory_operation_turn_attribution",
@@ -34,6 +35,7 @@ test("worker startup and migration-only command share the complete ordered schem
       "0019_prompt_module_chat_attribution",
       "0022_prompt_module_activation_modes",
       "0023_prompt_module_http_post",
+      "0025_time_chat_chunk",
     ],
   );
   assert.equal(new Set(workerMigrations.map(({ id }) => id)).size, workerMigrations.length);

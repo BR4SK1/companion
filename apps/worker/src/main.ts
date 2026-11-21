@@ -65,7 +65,11 @@ import {
   promptContentHash,
 } from "./memory/prompts.ts";
 import { startMemoryRuntime, recordMemoryOperation, type SemanticShadowRequest } from "./memory/runtime.ts";
-import { recallCanonicalDetailed } from "./memory/recall.ts";
+import {
+  buildRecallQuery,
+  DEFAULT_RECALL_MAX_ASSISTANT_SHARE,
+  recallCanonicalDetailed,
+} from "./memory/recall.ts";
 import {
   buildCanonicalMemoryContextForPrompt,
   renderProfileSection,
@@ -298,7 +302,7 @@ async function main(): Promise<void> {
 
       // Per-turn memory context. Every section degrades independently: a
       // failed section logs a warning and the turn continues with the rest.
-      loadMemoryContext = async ({ turnId, turnAttempt, userText, referenceTime }) => {
+      loadMemoryContext = async ({ turnId, turnAttempt, userText, history, referenceTime }) => {
         const now = referenceTime;
         const profileSubjects = configuration.subjects.filter(
           (subject) => subject.profileEnabled,
@@ -314,8 +318,17 @@ async function main(): Promise<void> {
         let semanticShadowRequest: SemanticShadowRequest | undefined;
         if (memoryConfig.recallEnabled) {
           try {
-            const recallQuery = userText.trim().split(/\s+/).slice(0, 16).join(" ").slice(0, 512);
+            const recallQuery = buildRecallQuery({
+              currentUserText: userText,
+              history,
+            });
             if (recallQuery.length > 0) {
+              const excludeTurnIds = [
+                turnId,
+                ...(history ?? [])
+                  .map((message) => message.turnId)
+                  .filter((id): id is string => id !== null),
+              ];
               const recallStartedAt = new Date();
               const detailedRecall = await recallCanonicalDetailed(pool, memoryConfig, {
                 query: recallQuery,
@@ -323,6 +336,10 @@ async function main(): Promise<void> {
                 limit: memoryConfig.recallLimit,
                 maxChars: memoryConfig.recallMaxChars,
                 timezone: configuration.behavior.timezone,
+                excludeTurnIds,
+                minAgeMs: memoryConfig.recallMinAgeMs,
+                maxAssistantShare: DEFAULT_RECALL_MAX_ASSISTANT_SHARE,
+                deduplicateClaims: true,
               });
               const recall = detailedRecall.response;
               memoryContext = buildCanonicalMemoryContextForPrompt({
@@ -341,7 +358,7 @@ async function main(): Promise<void> {
                   (recall.query.timeRange !== undefined
                     ? ` window=${recall.query.timeRange.description}`
                     : "") +
-                  ` queryWords=16 results=${String(recall.results.length)}` +
+                  ` queryChars=${String(recallQuery.length)} results=${String(recall.results.length)}` +
                   ` facts=${String(recall.diagnostics.factCandidates)}` +
                   ` observations=${String(recall.diagnostics.observationCandidates)}` +
                   ` truncated=${String(recall.diagnostics.truncatedForBudget)}` +
@@ -691,6 +708,15 @@ async function main(): Promise<void> {
                 baseTierOrdinal: summary.baseTierOrdinal,
               };
             },
+            ...(provisionedRelationshipStore !== undefined
+              ? {
+                  loadInitiativeQuestions: ({ recentText, referenceTime }) =>
+                    provisionedRelationshipStore.getInitiativeQuestions({
+                      recentText,
+                      now: referenceTime,
+                    }),
+                }
+              : {}),
             ...(provisionedRelationshipStore !== undefined &&
                 provisionedRelationshipCallLlm !== undefined
               ? {

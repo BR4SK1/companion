@@ -469,6 +469,11 @@ CREATE UNIQUE INDEX conversation_message_standalone_thread_order_idx
   WHERE thread_order IS NOT NULL;
 `;
 
+const ADD_RESPONSE_PATTERN_INITIATIVE = `
+ALTER TABLE response_pattern
+  ADD COLUMN include_initiative_context boolean NOT NULL DEFAULT false;
+`;
+
 export const conversationMigrations: readonly Migration[] = [
   {
     id: "0001_conversation_work",
@@ -489,5 +494,9 @@ export const conversationMigrations: readonly Migration[] = [
   {
     id: "0006_conversation_thread_order",
     sql: ADD_CONVERSATION_THREAD_ORDER,
+  },
+  {
+    id: "0024_response_pattern_initiative",
+    sql: ADD_RESPONSE_PATTERN_INITIATIVE,
   },
 ];

@@ -244,7 +244,11 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     const fixture = await createIsolatedMigrationFixture(pool, DATABASE_URL, "thread_order_upgrade");
     const upgradePool = fixture.pool;
     try {
-      await runMigrations(upgradePool, conversationMigrations.slice(0, -1));
+      const threadOrderIndex = conversationMigrations.findIndex(
+        (m) => m.id === "0006_conversation_thread_order",
+      );
+      assert.ok(threadOrderIndex > 0);
+      await runMigrations(upgradePool, conversationMigrations.slice(0, threadOrderIndex));
 
       const firstTurn = randomUUID();
       const secondTurn = randomUUID();
@@ -268,7 +272,9 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       await insertMessage("assistant", "legacy r1", firstTurn);
       await insertMessage("assistant", "legacy r2", secondTurn);
 
-      const threadOrderMigration = conversationMigrations.at(-1);
+      const threadOrderMigration = conversationMigrations.find(
+        (m) => m.id === "0006_conversation_thread_order",
+      );
       assert.ok(threadOrderMigration);
       await runMigrations(upgradePool, [threadOrderMigration]);
       const orderedTurns = await upgradePool.query(
@@ -2535,7 +2541,8 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
          WHERE id IN ('0002_conversation_tracing', '0004_chat_identity',
                       '0008_article_share_and_evidence', '0011_relationship_chat_chunk',
                        '0013_routine_chat_chunk', '0017_trace_attempt_temporal_context',
-                       '0018_generic_prompt_modules', '0019_prompt_module_chat_attribution')`,
+                       '0018_generic_prompt_modules', '0019_prompt_module_chat_attribution',
+                       '0025_time_chat_chunk')`,
       );
 
       // A legacy turn exactly as pre-tracing code wrote it.
@@ -2567,6 +2574,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         "0017_trace_attempt_temporal_context",
         "0018_generic_prompt_modules",
         "0019_prompt_module_chat_attribution",
+        "0025_time_chat_chunk",
       ]);
       const chunkConstraint = await pool.query(
         `SELECT pg_get_constraintdef(oid) AS definition
@@ -2577,6 +2585,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       assert.match(chunkConstraint.rows[0].definition, /relationship/);
       assert.match(chunkConstraint.rows[0].definition, /routine/);
       assert.match(chunkConstraint.rows[0].definition, /prompt_module/);
+      assert.match(chunkConstraint.rows[0].definition, /time/);
 
       // The legacy row is untouched: the decision JSONB is exactly as inserted,
       // and no attempt rows were fabricated for it.

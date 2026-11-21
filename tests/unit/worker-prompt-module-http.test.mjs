@@ -209,8 +209,8 @@ describe("declarative HTTP prompt modules", () => {
       assert.equal(traces.executions[0].outputReady, true);
       assert.deepEqual(chatTraces[0].messagePromptModuleIds, [
         null,
-        "00000000-0000-4000-8000-000000000101",
         null,
+        "00000000-0000-4000-8000-000000000101",
         null,
         null,
         null,
@@ -384,9 +384,9 @@ describe("declarative HTTP prompt modules", () => {
       assert.deepEqual(traces.map(({ state }) => state), ["failed", "succeeded"]);
       assert.deepEqual(chatRequest.messagePromptModuleIds, [
         null,
+        null,
         "00000000-0000-4000-8000-000000000101",
         "00000000-0000-4000-8000-000000000102",
-        null,
         null,
       ]);
       assert.ok(chatRequest.request.messages.some((message) => message.content.includes("Configured generic fallback.")));

@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   relationshipDayStreaks,
   relationshipDayStreaksForDays,
+  selectInitiativeQuestions,
   selectUnansweredQuestionsForExtraction,
   summarizeRelationship,
   renderRelationshipContext,
@@ -264,8 +265,12 @@ describe("relationship familiarity semantics", () => {
     assert.equal(summary.baseTier.key, "tier-b");
     assert.equal(summary.effectiveTier.key, "tier-c");
     assert.equal(summary.tierMovement, "up");
-    assert.match(renderRelationshipContext(summary), /Clarification-needed interpretations/);
-    assert.match(renderRelationshipContext(summary), /Ask gently when relevant/);
+    const rendered = renderRelationshipContext(summary);
+    assert.match(rendered, /Stage: C \(base: B, movement: up; familiarity 75\.0%\)/);
+    assert.match(rendered, /Prompt C/);
+    assert.match(rendered, /Guide C/);
+    assert.ok(!rendered.includes("Clarification-needed interpretations"), "clarification answer dump stays out of familiarity chunk");
+    assert.ok(!rendered.includes("Current interpreted shared answers"), "answer bank dump stays out of familiarity chunk");
   });
 
   it("moves down at most one tier after a configured missed-day signal", () => {
@@ -531,7 +536,7 @@ describe("relationship extraction question bound", () => {
     assert.deepEqual(updates.map((item) => item.questionKey), ["question-100"]);
   });
 
-  it("keeps the unanswered bank out of the ordinary chat context", () => {
+  it("keeps both answered and unanswered questions out of the slim familiarity context", () => {
     const summary = summarizeRelationship({
       configuration,
       firstConversationAt: new Date("2026-01-07T12:00:00.000Z"),
@@ -542,8 +547,122 @@ describe("relationship extraction question bound", () => {
       ],
     });
     const rendered = renderRelationshipContext(summary);
-    assert.ok(rendered.includes("Question A?"), "learned answers stay in ordinary chat context");
+    assert.ok(!rendered.includes("Question A?"), "answer bank dump is decoupled from familiarity context");
     assert.ok(!rendered.includes("Question B?"), "unanswered bank questions are not injected into ordinary chat context");
+    assert.match(rendered, /familiarity 25\.0%/);
+  });
+});
+
+describe("curated initiative question selector", () => {
+  const now = new Date("2026-06-15T12:00:00.000Z");
+  const richConfig = {
+    ...configuration,
+    questions: [
+      { id: "q1", key: "fav-music", typeKey: "k", typeGuidance: "g", tierId: "t0", tierPosition: 0, text: "What is your favorite band or music?", position: 0 },
+      { id: "q2", key: "fav-color", typeKey: "k", typeGuidance: "g", tierId: "t0", tierPosition: 0, text: "What is your favorite color?", position: 1 },
+      { id: "q3", key: "pets", typeKey: "k", typeGuidance: "g", tierId: "t0", tierPosition: 0, text: "Do you have any pets or dogs?", position: 2 },
+      { id: "q4", key: "coffee", typeKey: "k", typeGuidance: "g", tierId: "t0", tierPosition: 0, text: "How do you take your coffee?", position: 3 },
+      { id: "q5", key: "hometown", typeKey: "k", typeGuidance: "g", tierId: "t0", tierPosition: 0, text: "Where did you grow up?", position: 4 },
+      { id: "q6", key: "cooking", typeKey: "k", typeGuidance: "g", tierId: "t0", tierPosition: 0, text: "Do you enjoy cooking dinner?", position: 5 },
+      { id: "q7", key: "deep-goal", typeKey: "k", typeGuidance: "g", tierId: "t2", tierPosition: 2, text: "What is your biggest life goal?", position: 6 },
+    ],
+  };
+
+  it("prioritizes topic-relevant, random unanswered, clarification, and old revisits within limit", () => {
+    const answers = [
+      // Clarification-needed answer
+      {
+        questionId: "q4",
+        questionKey: "coffee",
+        questionText: "How do you take your coffee?",
+        participant: "user",
+        answer: "maybe black",
+        clarificationNeeded: true,
+        updatedAt: new Date("2026-06-10T12:00:00.000Z"),
+      },
+      // Old settled answer (> 30 days ago) -> eligible for revisit
+      {
+        questionId: "q1",
+        questionKey: "fav-music",
+        questionText: "What is your favorite band or music?",
+        participant: "user",
+        answer: "Radiohead",
+        clarificationNeeded: false,
+        updatedAt: new Date("2026-04-01T12:00:00.000Z"),
+      },
+      // Recent settled answer (5 days ago) -> must NOT be asked
+      {
+        questionId: "q5",
+        questionKey: "hometown",
+        questionText: "Where did you grow up?",
+        participant: "user",
+        answer: "Portland",
+        clarificationNeeded: false,
+        updatedAt: new Date("2026-06-10T12:00:00.000Z"),
+      },
+    ];
+    const summary = summarizeRelationship({
+      configuration: richConfig,
+      firstConversationAt: new Date("2026-01-01T12:00:00.000Z"),
+      userActivityAt: [],
+      now,
+      answers,
+    });
+    const picked = selectInitiativeQuestions({
+      configuration: richConfig,
+      summary,
+      recentText: "I walked my dog at the park and started cooking pasta.",
+      now,
+      limit: 4,
+      random: () => 0,
+    });
+    assert.equal(picked.length, 4);
+    assert.equal(new Set(picked.map((q) => q.questionKey)).size, 4, "no duplicates");
+    // Relevant questions matched ("dogs" -> pets, "cooking" -> cooking) come first.
+    assert.deepEqual(
+      picked.slice(0, 2).map((q) => q.questionKey).sort(),
+      ["cooking", "pets"],
+    );
+    assert.ok(picked.slice(0, 2).every((q) => q.reason === "relevant"));
+    // Unanswered + clarification fill the remaining slots; recent settled hometown is excluded.
+    assert.ok(!picked.some((q) => q.questionKey === "hometown"));
+    assert.ok(picked.some((q) => q.questionKey === "fav-color" && q.reason === "unanswered"));
+    assert.ok(picked.some((q) => q.questionKey === "coffee" && q.reason === "clarification" && q.priorAnswer === "maybe black"));
+  });
+
+  it("includes an old settled answer revisit when room allows", () => {
+    const answers = [
+      {
+        questionId: "q1",
+        questionKey: "fav-music",
+        questionText: "What is your favorite band or music?",
+        participant: "user",
+        answer: "Radiohead",
+        clarificationNeeded: false,
+        updatedAt: new Date("2026-04-01T12:00:00.000Z"),
+      },
+    ];
+    const summary = summarizeRelationship({
+      configuration: richConfig,
+      firstConversationAt: new Date("2026-01-01T12:00:00.000Z"),
+      userActivityAt: [],
+      now,
+      answers,
+    });
+    const picked = selectInitiativeQuestions({
+      configuration: richConfig,
+      summary,
+      recentText: "just chilling",
+      now,
+      limit: 4,
+      random: () => 0.4,
+    });
+    assert.equal(picked.length, 4);
+    const revisit = picked.find((q) => q.questionKey === "fav-music");
+    assert.ok(revisit, "old settled answer should be eligible for revisit");
+    assert.equal(revisit.reason, "revisit");
+    assert.equal(revisit.priorAnswer, "Radiohead");
+    assert.equal(revisit.priorAnswerAgeDays, 75);
   });
 });
 
