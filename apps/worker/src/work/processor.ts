@@ -36,6 +36,17 @@
  * - `recordChatOutcome` — the available outcome after the call: the native
  *   response and reply content, or the actual transport/contract error when
  *   no usable response arrived. Never invented; absent raw data stays absent.
+ * - Chat diagnostics — every completed main-chat call also emits one
+ *   structured, privacy-safe `[CHAT_DIAGNOSTIC]` log line (see
+ *   `chat-diagnostics.ts`), correlated by turn id + attempt: the request as
+ *   sent (model, effective `max_tokens`, requested reasoning effort with
+ *   unset kept distinct), the response shape without content (content
+ *   shape, finish reason, validated usage), and the outcome/validation
+ *   path. It is emitted before the outcome trace write on every outcome,
+ *   so diagnostics stay visible for an invalid response even when the
+ *   best-effort trace write fails. Diagnostics never include prompts,
+ *   replies, reasoning text, provider message text, raw bodies, or error
+ *   text, and a logging failure never fails the turn.
  *
  * Behavior on unusable results is deliberately strict for this slice: a
  * decision that does not name an offered pattern, or a chat response that
@@ -88,6 +99,11 @@ import type {
   DecisionsResponse,
 } from "@companion/openrouter";
 import { parseChatResponse } from "@companion/openrouter/chat";
+import {
+  buildChatDiagnostics,
+  formatChatDiagnostics,
+  type ChatDiagnosticOutcome,
+} from "./chat-diagnostics.ts";
 import { runPromptModules } from "../prompt-modules/runtime.ts";
 import type {
   PromptModuleContext,
@@ -365,6 +381,38 @@ function decisionFailureTrace(error: unknown): DecisionOutcomeTrace {
 /** Contract-validation failure: the body arrived but did not validate. */
 function chatInvalidTrace(error: unknown): ChatOutcomeTrace {
   return { kind: "invalid", message: errorMessage(error) };
+}
+
+/**
+ * Emit the one structured, privacy-safe chat diagnostics line for a
+ * completed chat call. Emitted before every outcome trace write so it
+ * stays visible even when the (best-effort) trace write for an invalid or
+ * failed attempt fails. Best-effort itself: a logging failure never
+ * fails or masks the turn outcome — the original error still propagates.
+ */
+function emitChatDiagnostics(
+  deps: TurnProcessorDeps,
+  work: TurnWork,
+  identityRevision: number,
+  chatRequest: ChatRequest,
+  rawResponse: unknown,
+  outcome: ChatDiagnosticOutcome,
+  error?: unknown,
+): void {
+  try {
+    const record = buildChatDiagnostics({
+      turnId: work.turn.id,
+      attempt: work.turn.attempt,
+      identityRevision,
+      request: chatRequest,
+      rawResponse,
+      outcome,
+      ...(error !== undefined ? { error } : {}),
+    });
+    (deps.log ?? console.log)(formatChatDiagnostics(record));
+  } catch {
+    // Diagnostics are best-effort; never fail the turn for logging.
+  }
 }
 
 export async function processTurnWork(
@@ -865,9 +913,20 @@ export async function processTurnWork(
   try {
     rawChatResponse = await deps.callChat(chatRequest);
   } catch (error) {
-    // Transport failure: record the actual error (best-effort — a trace
-    // write failure must never mask the original error) and rethrow so the
-    // engine records a failed turn.
+    // Transport failure: the structured diagnostics line goes out first
+    // (request as sent + fixed error kind, no response data), then the
+    // actual error is recorded best-effort — a trace write failure must
+    // never mask the original error — and rethrown so the engine records
+    // a failed turn.
+    emitChatDiagnostics(
+      deps,
+      work,
+      identity.revision,
+      chatRequest,
+      undefined,
+      "failed",
+      error,
+    );
     if (deps.recordChatOutcome !== undefined) {
       try {
         await deps.recordChatOutcome({
@@ -891,7 +950,21 @@ export async function processTurnWork(
   try {
     chatResponse = parseChatResponse(rawChatResponse);
   } catch (error) {
-    // Contract failure: a body arrived but did not validate.
+    // Contract failure: a body arrived but did not validate. The
+    // structured diagnostics line (requested model/budget/reasoning, the
+    // invalid field's structural path, content shape, and any
+    // individually-valid finish reason/usage) goes out before the
+    // best-effort trace write, so it stays visible even when that write
+    // fails. The turn still fails; nothing is published.
+    emitChatDiagnostics(
+      deps,
+      work,
+      identity.revision,
+      chatRequest,
+      rawChatResponse,
+      "invalid",
+      error,
+    );
     if (deps.recordChatOutcome !== undefined) {
       try {
         await deps.recordChatOutcome({
@@ -914,6 +987,18 @@ export async function processTurnWork(
   const reply = choice?.message.content ?? null;
   const applicationRejection =
     choice === undefined ? "chat response has no choices" : null;
+
+  // Structured diagnostics for the responded call, emitted before the
+  // deliberate outcome trace write below so they stay visible even when
+  // that write fails and the attempt fails with it.
+  emitChatDiagnostics(
+    deps,
+    work,
+    identity.revision,
+    chatRequest,
+    rawChatResponse,
+    "responded",
+  );
 
   // Chat outcome boundary: persisted before the application usability check,
   // in its own fenced transaction. The returned response is recorded as-is
