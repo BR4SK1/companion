@@ -21,11 +21,29 @@ export const MEMORY_ERROR_CATEGORIES = [
   "llm_network",
   "llm_invalid_json",
   "llm_output_invalid",
+  "llm_output_truncated",
   "llm_attribution_invalid",
+  "source_budget_exceeded",
   "db_error",
   "config_error",
   "internal_error",
 ] as const;
+
+/** Typed error for LLM responses that stopped due to `finish_reason === "length"`. */
+export class MemoryLlmTruncatedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MemoryLlmTruncatedError";
+  }
+}
+
+/** Typed error when even the minimum unit of memory input exceeds its budget. */
+export class MemorySourceBudgetError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MemorySourceBudgetError";
+  }
+}
 
 interface TransportErrorLike {
   readonly name: string;
@@ -76,8 +94,14 @@ export function memoryErrorCategory(error: unknown): string {
   if (error instanceof Error && error.name === "MemoryLlmOutputError") {
     return "llm_output_invalid";
   }
+  if (error instanceof Error && error.name === "MemoryLlmTruncatedError") {
+    return "llm_output_truncated";
+  }
   if (error instanceof Error && error.name === "FactExtractionAttributionError") {
     return "llm_attribution_invalid";
+  }
+  if (error instanceof Error && error.name === "MemorySourceBudgetError") {
+    return "source_budget_exceeded";
   }
   if (error instanceof Error && error.name === "MemoryConfigurationError") {
     return "config_error";

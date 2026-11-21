@@ -40,7 +40,7 @@ import {
 } from "./policy.ts";
 import { selectLastCompletedTurns, sourceFingerprint } from "./source.ts";
 import { getFactsByTurns, getIngestState, updateIngestState } from "./facts.ts";
-import { memoryErrorCategory } from "./errors.ts";
+import { memoryErrorCategory, MemorySourceBudgetError } from "./errors.ts";
 import { behavioralDay, type BehaviorTime } from "./time.ts";
 import type {
   ConsolidationItem,
@@ -51,7 +51,116 @@ import type {
 
 const MAX_CLAIM_CHARS = 1_000;
 const MAX_RELATION_CHARS = 500;
-const MAX_OBSERVATION_SOURCE_CHARS = 100_000;
+export const MAX_OBSERVATION_SOURCE_CHARS = 100_000;
+
+export interface FittedConsolidationWindow {
+  readonly turns: SourceTurn[];
+  readonly facts: MemoryFact[];
+  readonly sourceChars: number;
+  readonly trimmedTurns: number;
+  readonly trimmedFacts: number;
+}
+
+function toPromptFact(fact: MemoryFact & { turnKey: string }) {
+  return {
+    id: factIdentifier(fact),
+    subject: fact.subject,
+    kind: fact.kind,
+    claim: fact.claim,
+    topics: fact.topics,
+    condition: fact.condition ?? undefined,
+    consequence: fact.consequence ?? undefined,
+    observedAt: fact.observedAt,
+    turnId: fact.turnKey,
+  };
+}
+
+/**
+ * Fit the newest contiguous suffix of completed turns into the consolidation
+ * fact-count and source-character budgets.
+ *
+ * `turns` is oldest-first (as returned by `selectLastCompletedTurns`). When all
+ * turns fit, they are returned unchanged. Otherwise oldest turns are dropped
+ * until the remaining turns fit both `maxFacts` and `maxSourceChars`. If even
+ * the newest turn with facts cannot fit on its own, throws
+ * `MemorySourceBudgetError` instead of silently consolidating zero facts.
+ */
+export function fitTurnsToConsolidationBudget(
+  turns: readonly SourceTurn[],
+  facts: readonly MemoryFact[],
+  budget: { readonly maxFacts: number; readonly maxSourceChars: number },
+): FittedConsolidationWindow {
+  const turnFacts = facts.filter(
+    (fact): fact is MemoryFact & { turnKey: string } => fact.turnKey !== null,
+  );
+  if (turnFacts.length === 0) {
+    return {
+      turns: [...turns],
+      facts: [],
+      sourceChars: 0,
+      trimmedTurns: 0,
+      trimmedFacts: 0,
+    };
+  }
+
+  const factsByTurn = new Map<string, Array<MemoryFact & { turnKey: string }>>();
+  for (const fact of turnFacts) {
+    const group = factsByTurn.get(fact.turnKey);
+    if (group === undefined) {
+      factsByTurn.set(fact.turnKey, [fact]);
+    } else {
+      group.push(fact);
+    }
+  }
+
+  // `renderFactInput` joins each fact block with "\n\n", so the rendered
+  // character length of any subset of facts is exact and order-invariant:
+  // sum(blockLengths) + 2 * (count - 1).
+  const selectedTurnsReversed: SourceTurn[] = [];
+  let selectedFactCount = 0;
+  let selectedChars = 0;
+
+  for (let i = turns.length - 1; i >= 0; i -= 1) {
+    const turn = turns[i]!;
+    const group = factsByTurn.get(turn.turnKey) ?? [];
+    if (group.length === 0) {
+      selectedTurnsReversed.push(turn);
+      continue;
+    }
+    const nextFactCount = selectedFactCount + group.length;
+    if (nextFactCount > budget.maxFacts) {
+      break;
+    }
+    const groupRenderedLength = renderFactInput(group.map(toPromptFact)).length;
+    const nextChars = selectedChars === 0
+      ? groupRenderedLength
+      : selectedChars + 2 + groupRenderedLength;
+    if (nextChars > budget.maxSourceChars) {
+      break;
+    }
+    selectedTurnsReversed.push(turn);
+    selectedFactCount = nextFactCount;
+    selectedChars = nextChars;
+  }
+
+  if (selectedFactCount === 0) {
+    throw new MemorySourceBudgetError(
+      `Newest turn with facts exceeds consolidation budget (maxFacts=${String(budget.maxFacts)}, maxSourceChars=${String(budget.maxSourceChars)})`,
+    );
+  }
+
+  const selectedTurns = selectedTurnsReversed.reverse();
+  const selectedTurnKeys = new Set(selectedTurns.map((turn) => turn.turnKey));
+  const selectedFacts = turnFacts.filter((fact) => selectedTurnKeys.has(fact.turnKey));
+
+  return {
+    turns: selectedTurns,
+    facts: selectedFacts,
+    sourceChars: selectedChars,
+    trimmedTurns: turns.length - selectedTurns.length,
+    trimmedFacts: turnFacts.length - selectedFacts.length,
+  };
+}
 
 export interface ConsolidationDeps {
   readonly pool: PostgresPool;
@@ -257,10 +366,25 @@ export async function runScheduledConsolidation(
   const stateBefore = await getIngestState(pool);
   const countedBefore = stateBefore?.newFactsSinceConsolidation ?? 0;
 
-  const turns = await selectLastCompletedTurns(pool, config.observationMaxTurns);
-  if (turns.length === 0) {
+  const rawTurns = await selectLastCompletedTurns(pool, config.observationMaxTurns);
+  if (rawTurns.length === 0) {
     throw new Error("No completed turns matched the bounded selector");
   }
+  // Load production facts before persisting the run so the recorded turn list,
+  // source fingerprint, and artifact identities match the exact fitted window.
+  const rawFacts = await getFactsByTurns(pool, rawTurns.map((turn) => turn.turnId));
+  const fitted = fitTurnsToConsolidationBudget(rawTurns, rawFacts, {
+    maxFacts: config.observationMaxFacts,
+    maxSourceChars: MAX_OBSERVATION_SOURCE_CHARS,
+  });
+  if (fitted.trimmedTurns > 0) {
+    log(
+      `[MEMORY] consolidation window trimmed to fit budget: turns=${String(fitted.turns.length)}/${String(rawTurns.length)} facts=${String(fitted.facts.length)}/${String(rawFacts.length)} chars=${String(fitted.sourceChars)}/${String(MAX_OBSERVATION_SOURCE_CHARS)}`,
+    );
+  }
+  const turns = fitted.turns;
+  const facts = fitted.facts;
+
   const sourceHash = sourceFingerprint(turns);
   const factSetId = hashArtifact("fact-set", sourceHash, factSignature, "cacheable");
   const observationSetId = hashArtifact(
@@ -295,8 +419,6 @@ export async function runScheduledConsolidation(
   );
 
   try {
-    // Production facts for the selected turns are the evidence substrate.
-    const facts = await getFactsByTurns(pool, turns.map((turn) => turn.turnId));
     await pool.query(
       `UPDATE memory_run SET status = 'facts-ready', fact_count = $2 WHERE run_id = $1`,
       [runId, facts.length],
@@ -394,7 +516,7 @@ async function consolidateObservations(
     return 0;
   }
   if (facts.length > deps.config.observationMaxFacts) {
-    throw new Error(
+    throw new MemorySourceBudgetError(
       `Fact set contains ${facts.length} facts; reduce the bounded selector (limit ${deps.config.observationMaxFacts})`,
     );
   }
@@ -405,20 +527,10 @@ async function consolidateObservations(
   const turnFacts = facts.filter(
     (fact): fact is MemoryFact & { turnKey: string } => fact.turnKey !== null,
   );
-  const factsForPrompt = turnFacts.map((fact) => ({
-    id: factIdentifier(fact),
-    subject: fact.subject,
-    kind: fact.kind,
-    claim: fact.claim,
-    topics: fact.topics,
-    condition: fact.condition ?? undefined,
-    consequence: fact.consequence ?? undefined,
-    observedAt: fact.observedAt,
-    turnId: fact.turnKey,
-  }));
+  const factsForPrompt = turnFacts.map(toPromptFact);
   const source = renderFactInput(factsForPrompt);
   if (source.length > MAX_OBSERVATION_SOURCE_CHARS) {
-    throw new Error(
+    throw new MemorySourceBudgetError(
       `Observation source is ${source.length} characters; reduce the bounded selector (limit ${MAX_OBSERVATION_SOURCE_CHARS})`,
     );
   }

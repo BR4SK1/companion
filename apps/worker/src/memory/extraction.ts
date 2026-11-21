@@ -11,6 +11,7 @@
 import { withTransaction, type PostgresPool } from "@companion/postgres";
 
 import type { MemoryLlmCaller, TaskPreset } from "./llm.ts";
+import { MemoryLlmTruncatedError } from "./errors.ts";
 import { hashPayload } from "./hashing.ts";
 import {
   buildFactExtractionPrompt,
@@ -171,7 +172,7 @@ export function assertCompleteResponse(
   description: string,
 ): void {
   if (finishReason === "length") {
-    throw new Error(
+    throw new MemoryLlmTruncatedError(
       `${description} response was truncated; reduce the source or increase the output budget`,
     );
   }
