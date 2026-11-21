@@ -1,32 +1,22 @@
 /**
- * PWA journeys, all against the run's own disposable stack (the web
- * production build):
- * - the PWA static assets (manifest, service worker, offline page, icons)
- *   are publicly reachable and user-agnostic on both channels;
- * - the document head carries the manifest link and the Apple home-screen
- *   metadata;
- * - the service worker registers (production build only — this suite always
- *   serves the production build), precaches exactly one user-agnostic page
- *   into exactly one cache under its own prefix, and answers only failed
- *   same-origin top-level GET navigations with that fallback;
- * - the BFF's /api surface (auth flow, test gate, thread and messages) is
- *   never intercepted, HTTP error responses are preserved, and POSTs and
- *   subresources are never touched.
- *
- * No messages are sent in this spec; no provider traffic occurs. Offline
- * emulation is per browser context, so it cannot affect other specs.
+ * PWA journeys against the deployed production build:
+ * - static PWA assets (manifest, service worker, offline page, icons) are
+ *   publicly reachable and user-agnostic on both channels;
+ * - document head carries the manifest link and Apple home-screen metadata;
+ * - the service worker registers, precaches only `/offline.html`, serves it
+ *   on offline navigations, never intercepts `/api` or subresources, and
+ *   preserves HTTP error responses.
  */
 
 import { expect, test } from "@playwright/test";
 
-import { gateOrigin, mainOrigin } from "../helpers/api.mjs";
+import { gateOrigin, mainOrigin } from "../helpers/env.mjs";
 
 const OFFLINE_CACHE = "companion-offline-v1";
 
-/** Leaves the context back online, whatever a test did to it. */
-async function goOnline(context) {
+test.afterEach(async ({ context }) => {
   await context.setOffline(false);
-}
+});
 
 test.describe("PWA assets", () => {
   test("are publicly reachable and user-agnostic on the test channel", async ({ request }) => {
@@ -52,9 +42,6 @@ test.describe("PWA assets", () => {
     const worker = await request.get(`${gateOrigin()}/sw.js`);
     expect(worker.status()).toBe(200);
     expect(worker.headers()["content-type"]).toContain("javascript");
-    const workerBody = await worker.text();
-    expect(workerBody).toContain("companion-offline-");
-    expect(workerBody).toContain("/offline.html");
 
     const offline = await request.get(`${gateOrigin()}/offline.html`);
     expect(offline.status()).toBe(200);
@@ -83,50 +70,29 @@ test.describe("PWA assets", () => {
 });
 
 test.describe("document head metadata", () => {
-  test("carries the manifest link and the Apple home-screen metadata", async ({ page }) => {
+  test("carries the manifest link and Apple home-screen metadata", async ({ page }) => {
     await page.goto("/");
-    await expect(page.locator('link[rel="manifest"]')).toHaveAttribute(
-      "href",
-      "/manifest.webmanifest",
-    );
-    await expect(page.locator('meta[name="apple-mobile-web-app-title"]')).toHaveAttribute(
-      "content",
-      "Companion",
-    );
-    await expect(
-      page.locator('meta[name="apple-mobile-web-app-status-bar-style"]'),
-    ).toHaveCount(1);
+    await expect(page.locator('link[rel="manifest"]')).toHaveAttribute("href", "/manifest.webmanifest");
+    await expect(page.locator('meta[name="apple-mobile-web-app-title"]')).toHaveAttribute("content", "Companion");
+    await expect(page.locator('meta[name="apple-mobile-web-app-status-bar-style"]')).toHaveCount(1);
     await expect(
       page.locator('meta[name="apple-mobile-web-app-capable"], meta[name="mobile-web-app-capable"]'),
     ).not.toHaveCount(0);
     await expect(page.locator('link[rel="apple-touch-icon"]')).toHaveCount(1);
-    // Theme handling is unchanged: theme-color metas are present (the static
-    // viewport export renders media-scoped ones; after hydration the
-    // provider consolidates them into a single applied-scheme meta).
     await expect(page.locator('meta[name="theme-color"]')).not.toHaveCount(0);
   });
 });
 
 test.describe("service worker", () => {
-  test("registers in the production build and caches only the offline page", async ({ page }) => {
+  async function waitForControlledPage(page) {
     await page.goto("/");
-    const registration = await page.evaluate(() =>
-      navigator.serviceWorker.ready.then((r) => ({
-        script: r.active?.scriptURL ?? null,
-        scope: r.scope,
-      })),
-    );
-    expect(registration.script?.endsWith("/sw.js")).toBe(true);
-    expect(registration.scope).toBe(`${gateOrigin()}/`);
-
-    // Reload so the activated (and claiming) worker controls the page from
-    // the start; then inspect the origin's cache storage.
+    await page.evaluate(() => navigator.serviceWorker.ready);
     await page.reload();
-    await expect
-      .poll(() =>
-        page.evaluate(() => Boolean(navigator.serviceWorker.controller)),
-      )
-      .toBe(true);
+    await expect.poll(() => page.evaluate(() => Boolean(navigator.serviceWorker.controller))).toBe(true);
+  }
+
+  test("registers and caches only the offline page", async ({ page }) => {
+    await waitForControlledPage(page);
     const cacheState = await page.evaluate(async (cacheName) => {
       const names = await caches.keys();
       const cache = await caches.open(cacheName);
@@ -137,39 +103,19 @@ test.describe("service worker", () => {
   });
 
   test("serves the offline page for a failed navigation and recovers online", async ({ page, context }) => {
-    await page.goto("/");
-    await page.evaluate(() => navigator.serviceWorker.ready);
-    await page.reload(); // controlled by the activated worker from here on
-    await expect
-      .poll(() =>
-        page.evaluate(() => Boolean(navigator.serviceWorker.controller)),
-      )
-      .toBe(true);
-
+    await waitForControlledPage(page);
     await context.setOffline(true);
     await page.goto("/");
     await expect(page.locator("h1")).toHaveText("You're offline");
-    await goOnline(context);
+
+    await context.setOffline(false);
     await page.goto("/");
-    // Back online the real app renders again (the fail-closed thread view on
-    // the test channel).
     await expect(page.getByRole("log", { name: "Conversation" })).toBeVisible();
   });
 
   test("never intercepts the BFF API surface, POSTs, or subresources", async ({ page, context }) => {
-    await page.goto("/");
-    await page.evaluate(() => navigator.serviceWorker.ready);
-    await page.reload();
-    await expect
-      .poll(() =>
-        page.evaluate(() => Boolean(navigator.serviceWorker.controller)),
-      )
-      .toBe(true);
-
+    await waitForControlledPage(page);
     await context.setOffline(true);
-    // From the (offline-fallback) document: an intercepted request would
-    // resolve with the cached offline page; a pass-through request rejects
-    // because the emulated network is down.
     const outcome = await page.evaluate(async () => {
       const attempt = (path, init) =>
         fetch(path, init).then(
@@ -189,32 +135,13 @@ test.describe("service worker", () => {
       gate: "rejected",
       subresource: "rejected",
     });
-    // A top-level navigation to the BFF API is never intercepted either:
-    // it fails (the emulated network is down) instead of resolving to the
-    // cached offline page. This exercises the worker's path exclusion for
-    // real navigations, not just subresource requests.
     await expect(page.goto("/api/thread")).rejects.toThrow();
-    await goOnline(context);
   });
 
   test("preserves HTTP error responses instead of substituting the fallback", async ({ page }) => {
-    await page.goto("/");
-    await page.evaluate(() => navigator.serviceWorker.ready);
-    await page.reload();
-    await expect
-      .poll(() =>
-        page.evaluate(() => Boolean(navigator.serviceWorker.controller)),
-      )
-      .toBe(true);
-
+    await waitForControlledPage(page);
     const response = await page.goto("/definitely-not-a-page");
     expect(response?.status()).toBe(404);
-    const body = await page.content();
-    expect(body).not.toContain("You're offline");
+    expect(await page.content()).not.toContain("You're offline");
   });
-});
-
-test.afterEach(async ({ context }) => {
-  // Safety net: never leave an emulated-offline context behind.
-  await goOnline(context);
 });

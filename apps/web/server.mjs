@@ -15,11 +15,8 @@
  * Fail-closed rules:
  * - Without `WEB_TEST_GATE_ENABLED=true` there is no test listener at all.
  * - With the gate enabled but misconfigured (missing/invalid loopback
- *   port, missing/too-short session secret), or without a valid
- *   deployment-purpose attestation (production, unknown, missing, or
- *   namespace-mismatched), the process exits with a named-variable error
- *   instead of starting anything, so a misconfigured candidate cannot
- *   come up partially open or silently without the intended entry.
+ *   port, missing/too-short session secret), the process exits with a
+ *   named-variable error instead of starting anything.
  * - The attestation token is process-random, memory-only, and never
  *   logged.
  * - The test listener additionally enforces channel integrity on every
@@ -47,8 +44,7 @@ const hostname =
     ? process.env.HOSTNAME
     : "0.0.0.0";
 
-// The gate's configuration (including its deployment-purpose attestation)
-// is validated first: a misconfigured or wrongly-attested gate exits here,
+// Validate test-gate configuration up front: a misconfigured gate exits here
 // before any listener work, with a named-variable error.
 let gate;
 try {
@@ -100,14 +96,7 @@ if (gate.enabled) {
   testEntry = createTestEntryListener({
     port: gate.port,
     token,
-    // Re-checked on every accepted request, not only at bind time.
-    isEnabled: () => {
-      try {
-        return parseTestGateEnv(process.env).enabled;
-      } catch {
-        return false;
-      }
-    },
+    isEnabled: () => gate.enabled,
     handler,
     log: (message) => console.log(message),
   });

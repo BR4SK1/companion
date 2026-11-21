@@ -60,11 +60,6 @@ const gateEnv = {
   WEB_TEST_GATE_ENABLED: "true",
   WEB_TEST_GATE_PORT: String(TEST_PORT),
   WEB_TEST_GATE_SESSION_SECRET: GATE_SECRET,
-  // Chart-attested non-production deployment (the pod-namespace value is
-  // the downward-API injection; in-process both env values are compared).
-  COMPANION_DEPLOYMENT_PURPOSE: "non-production",
-  COMPANION_DEPLOYMENT_NAMESPACE: "companion-np",
-  COMPANION_POD_NAMESPACE: "companion-np",
 };
 
 /** The fake worker's observed requests (for asserting the BFF's calls). */
@@ -476,24 +471,6 @@ describe("fail-closed behavior with the gate disabled", () => {
     });
     const response = await issuanceRoute.GET(request);
     assert.equal(response.status, 404);
-  });
-
-  it("a production deployment purpose keeps the gate closed everywhere", async () => {
-    testGateModule.setChannelAttestationTokenForTesting("route-test-token");
-    setEnv({ ...gateEnv, COMPANION_DEPLOYMENT_PURPOSE: "production" });
-    const response = await threadRoute.GET(
-      makeRequest(`${TEST_ORIGIN}/api/thread`, {
-        headers: { [TEST_ATTESTATION_HEADER]: "route-test-token" },
-        cookies: { [sessionModule.TEST_SESSION_COOKIE_NAME]: testCookie() },
-      }),
-    );
-    assert.equal(response.status, 503, "a production purpose must fail the whole configuration");
-    const mainResponse = await threadRoute.GET(
-      makeRequest(`${MAIN_ORIGIN}/api/thread`, {
-        cookies: { [sessionModule.SESSION_COOKIE_NAME]: ownerCookie() },
-      }),
-    );
-    assert.equal(mainResponse.status, 503, "the owner channel fails closed too");
   });
 
   it("misconfigured gate values fail the whole configuration closed", async () => {

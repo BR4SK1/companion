@@ -1,764 +1,134 @@
 #!/usr/bin/env bash
-# Companion non-production ship deploy (repo-owned Step 4 entry point).
+# Companion non-production ship deploy (repo-owned entry point).
 #
-# Contract (fleet wrapper calls this exactly as `./scripts/ship-deploy <SHA>`
-# from the repository root after requiring HEAD == SHA and a clean tree):
-#   - Exactly one argument: the exact outgoing candidate SHA (40 lowercase
-#     hex characters). No other argument, environment selection, or staging
-#     endpoint inference is accepted. The target is the single predetermined
-#     non-production deployment (namespace companion-np, release companion);
-#     configuration files never select a different target.
-#   - Builds both images from the immutable candidate source only
-#     (`git archive <SHA>`, never the working tree), tags them with the full
-#     SHA, pushes them, records their registry digests, deploys the exact
-#     candidate chart with digest-pinned images, and verifies the Ready
-#     workloads run those digests with a strict bounded post-rollout check
-#     (shared deadline, time-bounded read-only calls, ownership-chain and
-#     current-revision proof, sole non-deleting pod per workload).
-#   - On success, stdout is exactly one line: SHIP_DEPLOYED_SHA=<SHA>.
-#     Every other diagnostic goes to stderr. The effective `node` on
-#     the inherited PATH is verified against the candidate's tracked
-#     tests/e2e/.nvmrc before any build, registry publish, Helm, or
-#     cluster mutation; a mismatch or missing `node` blocks with an
-#     actionable diagnostic and never downloads or switches the
-#     runtime automatically.
-#
-# Fixed-target identity: live cluster identity (context, API server,
-# namespace/UID pins, approved registry repositories) is verified against a
-# fixed trusted local-only file (.private/deploy/ship-target-identity.json,
-# gitignored, 0600, owned by the operator). That file only supplies expected
-# fingerprints for comparison; it never selects the target. UIDs and the API
-# endpoint live only in that local file and are never tracked, logged, or
-# printed here. If the file is missing, untracked-check fails, permissions
-# are wrong, or the live cluster does not match, this script blocks.
-#
-# No Ship lock: this entry point creates, consults, retains, or hands off
-# no lock file or directory, and requires no reservation gate. It has no
-# replacement reservation or lock, so concurrent candidates are not
-# serialized here. The E2E runner re-proves the exact candidate
-# independently from the registry and the live cluster without any handoff
-# file. On failure at any stage this script exits non-zero; nothing is
-# auto-rolled-back or auto-cleaned.
-set -uo pipefail
+# Called by the fleet wrapper as `./scripts/ship-deploy <SHA>` from the
+# repository root. Builds web and worker images from `git archive <SHA>`,
+# pushes them to the repositories configured in
+# `.private/deploy/non-production-values.yaml`, deploys the digest-pinned
+# candidate chart to namespace `companion-np` (release `companion`), verifies
+# Ready pods run the pushed digests, and prints `SHIP_DEPLOYED_SHA=<SHA>`.
+set -euo pipefail
 
 NAMESPACE="companion-np"
 RELEASE="companion"
-WEB_DEPLOY="companion-web"
-WORKER_DEPLOY="companion-worker"
-IDENTITY_FILE_REL=".private/deploy/ship-target-identity.json"
-VALUES_FILE_REL=".private/deploy/non-production-values.yaml"
+VALUES_FILE=".private/deploy/non-production-values.yaml"
 
 log() { printf 'ship-deploy: %s\n' "$*" >&2; }
 fail() { log "ERROR: $*"; exit 1; }
 
-# --- Global temp state for the EXIT cleanup. ---
-REPO_ROOT=""
-TMP_ROOT=""
-
-cleanup_on_exit() {
-  local rc=$?
-  if [[ -n "$TMP_ROOT" && -d "$TMP_ROOT" && ! -L "$TMP_ROOT" ]]; then
-    rm -rf -- "$TMP_ROOT" 2>/dev/null || true
-  fi
-  exit "$rc"
-}
-trap cleanup_on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-# --- Argument contract: exactly one 40-hex SHA, nothing else. ---
-[[ $# -eq 1 ]] || fail "takes exactly one argument: the outgoing candidate SHA (40 hex characters)"
+[[ $# -eq 1 ]] || fail "usage: ./scripts/ship-deploy <40-hex-sha>"
 CANDIDATE="$1"
-[[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]] || fail "candidate SHA is not exactly 40 lowercase hex characters"
-if [[ -n "${HUSKY:-}" && "$HUSKY" == "0" ]]; then
-  fail "bypass disabled: HUSKY=0 would disable the Husky gates"
-fi
+[[ "$CANDIDATE" =~ ^[0-9a-f]{40}$ ]] || fail "invalid candidate SHA: $CANDIDATE"
 
-# --- Repository and script provenance. ---
+for tool in git tar docker helm kubectl python3; do
+  command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
+done
+
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || fail "must run inside a Git repository"
-cd -- "$REPO_ROOT" || fail "cannot enter repository root"
-git rev-parse --absolute-git-dir >/dev/null 2>&1 || fail "not a Git repository"
-SCRIPT_SRC="${BASH_SOURCE[0]:-$0}"
-SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_SRC")" && pwd -P)" || fail "cannot resolve script directory"
-SCRIPT_PATH="$SCRIPT_DIR/$(basename -- "$SCRIPT_SRC")"
-[[ -f "$SCRIPT_PATH" && ! -L "$SCRIPT_PATH" ]] || fail "scripts/ship-deploy must be a regular file, not a symlink"
-[[ "$SCRIPT_PATH" == "$REPO_ROOT/scripts/ship-deploy" ]] || fail "scripts/ship-deploy must be invoked from the repository root entry point"
+cd -- "$REPO_ROOT"
 
-git cat-file -e "$CANDIDATE^{commit}" >/dev/null 2>&1 || fail "candidate SHA is not a commit present locally: $CANDIDATE"
-[[ "$(git rev-parse "$CANDIDATE")" == "$CANDIDATE" ]] || fail "candidate SHA does not resolve to itself"
-CANDIDATE_TREE="$(git rev-parse "$CANDIDATE^{tree}")" || fail "cannot resolve candidate tree"
-HEAD_SHA="$(git rev-parse HEAD)" || fail "cannot resolve HEAD"
-[[ "$HEAD_SHA" == "$CANDIDATE" ]] || fail "HEAD ($HEAD_SHA) does not equal the candidate ($CANDIDATE); refusing to deploy a moved HEAD"
-# The running script must be byte-identical to the candidate's tracked copy.
-git show "$CANDIDATE:scripts/ship-deploy" 2>/dev/null | cmp -s - "$SCRIPT_PATH" || fail "running scripts/ship-deploy differs from the candidate tree; refusing to deploy with an unverified entry point"
-for required in "package.json" "deploy/helm/companion/Chart.yaml" "deploy/docker/Dockerfile.web" "deploy/docker/Dockerfile.worker" "scripts/test-e2e.mjs" "tests/e2e/.nvmrc"; do
-  git cat-file -e "$CANDIDATE:$required" >/dev/null 2>&1 || fail "candidate tree is missing required path: $required"
-done
+[[ "$(git rev-parse HEAD)" == "$CANDIDATE" ]] || fail "HEAD does not match candidate SHA ($CANDIDATE)"
+[[ -z "$(git status --porcelain)" ]] || fail "working tree must be clean"
+git cat-file -e "${CANDIDATE}^{commit}" 2>/dev/null || fail "commit not found: $CANDIDATE"
+[[ -f "$VALUES_FILE" ]] || fail "missing values file: $VALUES_FILE"
 
-# --- Node preflight: the effective `node` on the inherited PATH must
-# match the candidate's tracked tests/e2e/.nvmrc before any build,
-# registry publish, Helm, or cluster mutation. The expected version
-# comes from the immutable candidate tree (`git show`), never the
-# working tree. No automatic download or runtime switch: on mismatch
-# or absence this blocks with an actionable diagnostic (stderr) so
-# the operator can select the pinned Node.js and rerun the ship
-# workflow. The E2E runner re-checks the same pin independently.
-EXPECTED_NODE_VERSION_RAW="$(git show "$CANDIDATE:tests/e2e/.nvmrc" 2>/dev/null)" \
-  || fail "candidate tree is missing required path: tests/e2e/.nvmrc"
-EXPECTED_NODE_VERSION="${EXPECTED_NODE_VERSION_RAW//[[:space:]]/}"
-EXPECTED_NODE_VERSION="${EXPECTED_NODE_VERSION#v}"
-[[ "$EXPECTED_NODE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-  || fail "candidate tests/e2e/.nvmrc does not pin a valid Node.js version (refusing to build, publish, or mutate the cluster with an unpinned runtime)"
-EFFECTIVE_NODE_PATH="$(command -v node 2>/dev/null)" || EFFECTIVE_NODE_PATH=""
-[[ -n "$EFFECTIVE_NODE_PATH" ]] \
-  || fail "Node.js not found on PATH: candidate pins Node.js $EXPECTED_NODE_VERSION via tests/e2e/.nvmrc. Select the pinned Node.js before rerunning the ship workflow (prepend its bin directory to PATH and verify with 'node --version'); refusing to build, publish, or mutate the cluster with an unpinned Node.js (no automatic download or runtime switch)"
-EFFECTIVE_NODE_VERSION_RAW="$(node --version 2>/dev/null)" || EFFECTIVE_NODE_VERSION_RAW=""
-EFFECTIVE_NODE_VERSION="${EFFECTIVE_NODE_VERSION_RAW//[[:space:]]/}"
-EFFECTIVE_NODE_VERSION="${EFFECTIVE_NODE_VERSION#v}"
-[[ "$EFFECTIVE_NODE_VERSION" == "$EXPECTED_NODE_VERSION" ]] \
-  || fail "Node.js version mismatch: effective node on PATH ($EFFECTIVE_NODE_PATH) reports v${EFFECTIVE_NODE_VERSION:-unknown}, but candidate pins Node.js $EXPECTED_NODE_VERSION via tests/e2e/.nvmrc. Select the pinned Node.js before rerunning the ship workflow (prepend its bin directory to PATH and verify with 'node --version'); refusing to build, publish, or mutate the cluster with an unpinned Node.js (no automatic download or runtime switch)"
+# Read image repositories from the local-only non-production values file.
+read -r WEB_REPO WORKER_REPO < <(
+  python3 - "$VALUES_FILE" <<'PY'
+import sys, yaml
+data = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+web_repo = ((data.get("web") or {}).get("image") or {}).get("repository") or ""
+worker_repo = ((data.get("worker") or {}).get("image") or {}).get("repository") or ""
+if not web_repo or not worker_repo:
+    sys.exit("web.image.repository and worker.image.repository are required")
+print(web_repo, worker_repo)
+PY
+) || fail "failed to read image repositories from $VALUES_FILE"
 
-# --- Tooling: approved local build/deploy tools must already exist. ---
-for tool in git docker helm kubectl python3 tar cmp mktemp timeout sleep date; do
-  command -v "$tool" >/dev/null 2>&1 || fail "required tooling missing: $tool (install the approved tooling; refusing to guess an alternative)"
-done
-docker info >/dev/null 2>&1 || fail "docker daemon is not available; refusing to build without the approved build tooling"
+TMP_ROOT="$(mktemp -d)"
+trap 'rm -rf -- "$TMP_ROOT"' EXIT
 
-# --- Local-only identity and values (fixed paths, never env-selected). ---
-IDENTITY_FILE="$REPO_ROOT/$IDENTITY_FILE_REL"
-VALUES_FILE="$REPO_ROOT/$VALUES_FILE_REL"
-[[ -f "$IDENTITY_FILE" && ! -L "$IDENTITY_FILE" ]] || fail "trusted local identity file is missing: $IDENTITY_FILE_REL (provision the fixed identity pins locally; refusing to guess cluster identity)"
-[[ -f "$VALUES_FILE" && ! -L "$VALUES_FILE" ]] || fail "local-only non-production values file is missing: $VALUES_FILE_REL (refusing to guess environment values)"
-if git ls-files --error-unmatch -- "$IDENTITY_FILE_REL" >/dev/null 2>&1; then
-  fail "identity file must not be tracked in git"
-fi
-if git ls-files --error-unmatch -- "$VALUES_FILE_REL" >/dev/null 2>&1; then
-  fail "non-production values file must not be tracked in git"
-fi
-git check-ignore -q -- "$IDENTITY_FILE_REL" || fail "identity file must be gitignored (local-only)"
-git check-ignore -q -- "$VALUES_FILE_REL" || fail "non-production values file must be gitignored (local-only)"
-
-# Parse and cross-check identity + values. Values themselves are never
-# printed; only the validated, non-secret pins needed below are emitted.
-PARSED="$(python3 - "$IDENTITY_FILE" "$VALUES_FILE" <<'PYEOF'
-import json, os, re, stat, sys
-from pathlib import Path
-
-def die(msg):
-    print(f"ship-deploy: ERROR: {msg}", file=sys.stderr)
-    sys.exit(1)
-
-def load_identity(path):
-    p = Path(path)
-    st = p.lstat()
-    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
-        die("identity file must be a regular file, not a symlink")
-    if st.st_uid != os.geteuid():
-        die("identity file must be owned by the operator running the deploy")
-    if stat.S_IMODE(st.st_mode) != 0o600:
-        die("identity file must have mode 0600 (owner read/write only)")
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        die("identity file is not valid JSON")
-    return data
-
-ident = load_identity(sys.argv[1])
-def req_str(key, pattern=None):
-    val = ident.get(key)
-    if not isinstance(val, str) or not val:
-        die(f"identity file field {key} is missing or invalid")
-    if pattern and not re.fullmatch(pattern, val):
-        die(f"identity file field {key} has an invalid format")
-    return val
-
-context = req_str("context", r"[A-Za-z0-9_-]+")
-api_server = req_str("apiServer", r"https://[A-Za-z0-9._-]+:[0-9]+")
-kube_system_uid = req_str("kubeSystemUid", r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-namespace = req_str("namespace")
-namespace_uid = req_str("namespaceUid", r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-release = req_str("release")
-chart = req_str("chart")
-if namespace != "companion-np":
-    die("identity file namespace does not match the predetermined non-production namespace")
-if release != "companion" or chart != "companion":
-    die("identity file release/chart do not match the predetermined release")
-deployments = ident.get("deployments")
-repos = ident.get("registryRepositories")
-if not isinstance(deployments, dict) or deployments.get("web") != "companion-web" or deployments.get("worker") != "companion-worker":
-    die("identity file deployments do not match the predetermined workloads")
-if not isinstance(repos, dict):
-    die("identity file registry repositories are missing")
-web_repo = repos.get("web")
-worker_repo = repos.get("worker")
-for label, repo in (("web", web_repo), ("worker", worker_repo)):
-    if not isinstance(repo, str) or not repo or " " in repo or "@" in repo or repo.endswith(":") or ":" in repo.rsplit("/", 1)[-1]:
-        die(f"identity file {label} registry repository is invalid")
-
-try:
-    import yaml
-except ImportError:
-    die("python3 PyYAML is required to parse the local values file (install the approved tooling)")
-try:
-    values = yaml.safe_load(Path(sys.argv[2]).read_text(encoding="utf-8"))
-except Exception:
-    die("non-production values file is not valid YAML")
-if not isinstance(values, dict):
-    die("non-production values file must be a mapping")
-deployment = values.get("deployment") or {}
-if deployment.get("purpose") != "non-production":
-    die("non-production values must declare deployment.purpose=non-production")
-if deployment.get("namespace") != "companion-np":
-    die("non-production values must declare deployment.namespace=companion-np")
-web = values.get("web") or {}
-worker = values.get("worker") or {}
-if (web.get("image") or {}).get("repository") != web_repo:
-    die("non-production values web.image.repository does not match the approved registry repository in the identity file")
-if (worker.get("image") or {}).get("repository") != worker_repo:
-    die("non-production values worker.image.repository does not match the approved registry repository in the identity file")
-if worker.get("enabled") is not True:
-    die("non-production values must enable the worker")
-test_gate = web.get("testGate") or {}
-if test_gate.get("enabled") is not True:
-    die("non-production values must enable the web test-entry gate for deployed validation")
-gate_port = test_gate.get("port", 3100)
-if not isinstance(gate_port, int) or not (1 <= gate_port <= 65535):
-    die("non-production values gate port is invalid")
-for key, val in [
-    ("ID_CONTEXT", context), ("ID_API_SERVER", api_server),
-    ("ID_KUBE_SYSTEM_UID", kube_system_uid), ("ID_NAMESPACE_UID", namespace_uid),
-    ("ID_WEB_REPO", web_repo), ("ID_WORKER_REPO", worker_repo),
-    ("VAL_GATE_PORT", str(gate_port)),
-]:
-    print(f"{key}={val}")
-PYEOF
-)" || fail "local identity/values verification failed (see above; refusing to guess target, registry, or values)"
-while IFS='=' read -r parsed_key parsed_val; do
-  case "$parsed_key" in
-    ID_CONTEXT) ID_CONTEXT="$parsed_val" ;;
-    ID_API_SERVER) ID_API_SERVER="$parsed_val" ;;
-    ID_KUBE_SYSTEM_UID) ID_KUBE_SYSTEM_UID="$parsed_val" ;;
-    ID_NAMESPACE_UID) ID_NAMESPACE_UID="$parsed_val" ;;
-    ID_WEB_REPO) ID_WEB_REPO="$parsed_val" ;;
-    ID_WORKER_REPO) ID_WORKER_REPO="$parsed_val" ;;
-    VAL_GATE_PORT) VAL_GATE_PORT="$parsed_val" ;;
-    *) fail "unexpected identity parse output" ;;
-  esac
-done <<< "$PARSED"
-[[ -n "${ID_CONTEXT:-}" && -n "${ID_API_SERVER:-}" && -n "${ID_KUBE_SYSTEM_UID:-}" && -n "${ID_NAMESPACE_UID:-}" && -n "${ID_WEB_REPO:-}" && -n "${ID_WORKER_REPO:-}" && -n "${VAL_GATE_PORT:-}" ]] || fail "identity parse did not produce all required pins"
-
-TMP_ROOT="$(mktemp -d)" || fail "cannot create temporary build directory"
-
-# --- Fixed cluster identity verification (read-only, before any mutation). ---
-CURRENT_CONTEXT="$(kubectl config current-context 2>/dev/null)" || fail "cannot read kubectl current-context"
-[[ "$CURRENT_CONTEXT" == "$ID_CONTEXT" ]] || fail "kubectl context does not match the fixed identity pin (refusing to deploy to an unverified cluster)"
-kubectl config view -o json > "$TMP_ROOT/kubeconfig.json" 2>/dev/null || fail "cannot read kubeconfig"
-python3 - "$TMP_ROOT/kubeconfig.json" "$ID_CONTEXT" "$ID_API_SERVER" <<'PYEOF' || fail "kubeconfig cluster server does not match the fixed identity pin or TLS verification is skipped"
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-context_name, expected_server = sys.argv[2], sys.argv[3]
-ctx = next((c for c in data.get("contexts", []) if c.get("name") == context_name), None)
-if ctx is None:
-    sys.exit(1)
-cluster_name = (ctx.get("context") or {}).get("cluster")
-cluster = next((c for c in data.get("clusters", []) if c.get("name") == cluster_name), None)
-if cluster is None:
-    sys.exit(1)
-info = cluster.get("cluster") or {}
-if info.get("server") != expected_server:
-    sys.exit(1)
-if info.get("insecure-skip-tls-verify") is True:
-    sys.exit(1)
-PYEOF
-kubectl version -o json > "$TMP_ROOT/server-version.json" 2>/dev/null || fail "cannot read cluster server version"
-python3 - "$TMP_ROOT/server-version.json" <<'PYEOF' || fail "API server is not a K3s server (refusing to deploy to an unverified cluster)"
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-version = ((data.get("serverVersion") or {}).get("gitVersion") or "")
-if "+k3s" not in version:
-    sys.exit(1)
-PYEOF
-KUBE_SYSTEM_UID="$(kubectl get namespace kube-system -o jsonpath='{.metadata.uid}' 2>/dev/null)" || fail "cannot read kube-system namespace"
-[[ "$KUBE_SYSTEM_UID" == "$ID_KUBE_SYSTEM_UID" ]] || fail "kube-system UID does not match the fixed identity pin (refusing to deploy to an unverified cluster)"
-kubectl get namespace "$NAMESPACE" -o json > "$TMP_ROOT/namespace.json" 2>/dev/null || fail "namespace $NAMESPACE not found on the verified cluster"
-python3 - "$TMP_ROOT/namespace.json" "$ID_NAMESPACE_UID" <<'PYEOF' || fail "namespace UID does not match the fixed identity pin"
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-if data.get("metadata", {}).get("name") != "companion-np":
-    sys.exit(1)
-if data.get("metadata", {}).get("uid") != sys.argv[2]:
-    sys.exit(1)
-if (data.get("status") or {}).get("phase") != "Active":
-    sys.exit(1)
-PYEOF
-helm list -n "$NAMESPACE" -o json > "$TMP_ROOT/helm-list.json" 2>/dev/null || fail "cannot list Helm releases in $NAMESPACE"
-python3 - "$TMP_ROOT/helm-list.json" <<'PYEOF' || fail "Helm release $RELEASE not found in $NAMESPACE on the verified cluster"
-import json, sys
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-match = [r for r in data if r.get("name") == "companion" and r.get("namespace") == "companion-np"]
-if len(match) != 1:
-    sys.exit(1)
-if "companion" not in str(match[0].get("chart", "")):
-    sys.exit(1)
-PYEOF
-for deploy_name in "$WEB_DEPLOY" "$WORKER_DEPLOY"; do
-  kubectl get deploy "$deploy_name" -n "$NAMESPACE" -o name >/dev/null 2>&1 || fail "deployment $deploy_name not found in $NAMESPACE on the verified cluster"
-done
-log "fixed cluster identity verified (context, API server, kube-system, namespace, release, workloads); no identity values were printed"
-
-# --- Immutable candidate source: git archive only, never the working tree. ---
+# Extract immutable candidate source (never build from the working tree).
 SOURCE_DIR="$TMP_ROOT/source"
-mkdir -p -- "$SOURCE_DIR" || fail "cannot create candidate source directory"
-git archive "$CANDIDATE" | tar -x -C "$SOURCE_DIR" || fail "cannot extract immutable candidate source"
-cmp -s -- "$SOURCE_DIR/scripts/ship-deploy" "$SCRIPT_PATH" || fail "extracted candidate scripts/ship-deploy differs from the running entry point"
-git show "$CANDIDATE:package.json" 2>/dev/null | cmp -s - "$SOURCE_DIR/package.json" || fail "extracted candidate package.json does not match the candidate commit"
-[[ -f "$SOURCE_DIR/deploy/helm/companion/Chart.yaml" && -f "$SOURCE_DIR/deploy/docker/Dockerfile.web" && -f "$SOURCE_DIR/deploy/docker/Dockerfile.worker" ]] || fail "extracted candidate is missing chart or image definitions"
-log "candidate source extracted from $CANDIDATE (tree $CANDIDATE_TREE) for building"
-
-WEB_DIGEST=""
-WORKER_DIGEST=""
-WEB_POD=""
-WORKER_POD=""
-WEB_POD_UID=""
-WORKER_POD_UID=""
+mkdir -p -- "$SOURCE_DIR"
+git archive "$CANDIDATE" | tar -x -C "$SOURCE_DIR"
 
 build_and_push() {
   local label="$1" repo="$2" dockerfile="$3"
-  local ref="$repo:$CANDIDATE"
-  log "building $label image $ref from candidate source"
-  if docker manifest inspect "$ref" >/dev/null 2>&1; then
-    fail "immutable tag $ref already exists in the registry; refusing to overwrite it (investigate provenance before any retry)"
-  fi
+  local ref="${repo}:${CANDIDATE}"
+  log "building $label image ($ref)"
   docker build \
-    --label "org.opencontainers.image.revision=$CANDIDATE" \
+    --label "org.opencontainers.image.revision=${CANDIDATE}" \
     --label "org.opencontainers.image.source=companion" \
-    --label "companion.ship.candidate=$CANDIDATE" \
-    -f "$SOURCE_DIR/$dockerfile" -t "$ref" "$SOURCE_DIR" >&2 \
-    || fail "docker build failed for $label"
-  python3 - "$ref" "$CANDIDATE" <<'PYEOF' || fail "built $label image provenance label does not match the candidate"
-import json, subprocess, sys
-ref, candidate = sys.argv[1], sys.argv[2]
-out = subprocess.run(["docker", "inspect", ref], capture_output=True, text=True)
-if out.returncode != 0:
-    sys.exit(1)
-data = json.loads(out.stdout)
-labels = ((data[0].get("Config") or {}).get("Labels") or {})
-if labels.get("org.opencontainers.image.revision") != candidate:
-    sys.exit(1)
-if labels.get("companion.ship.candidate") != candidate:
-    sys.exit(1)
-PYEOF
-  log "pushing $label image $ref"
-  docker push "$ref" >&2 || fail "docker push failed for $label"
-  local repo_digest
-  repo_digest="$(docker inspect "$ref" --format '{{index .RepoDigests 0}}' 2>/dev/null)" || fail "cannot inspect pushed $label image digest"
-  [[ "$repo_digest" == "$repo"@sha256:* ]] || fail "pushed $label image RepoDigest does not match the expected repository"
-  local digest="sha256:${repo_digest##*@sha256:}"
-  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail "pushed $label image digest is not a sha256 digest"
+    -f "${SOURCE_DIR}/${dockerfile}" \
+    -t "$ref" \
+    "$SOURCE_DIR" >&2
+
+  log "pushing $label image ($ref)"
+  docker push "$ref" >&2
+
+  local digest
+  digest="$(
+    docker inspect "$ref" --format '{{json .RepoDigests}}' | python3 -c '
+import json, re, sys
+repo = sys.argv[1]
+digests = json.load(sys.stdin) or []
+prefix = f"{repo}@"
+for entry in digests:
+    if isinstance(entry, str) and entry.startswith(prefix):
+        d = entry[len(prefix):]
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", d):
+            print(d)
+            sys.exit(0)
+sys.exit(1)
+' "$repo"
+  )" || fail "could not determine pushed digest for $ref"
   printf '%s' "$digest"
 }
 
-WEB_DIGEST="$(build_and_push web "$ID_WEB_REPO" "deploy/docker/Dockerfile.web")" || exit 1
-log "web image digest recorded"
-WORKER_DIGEST="$(build_and_push worker "$ID_WORKER_REPO" "deploy/docker/Dockerfile.worker")" || exit 1
-log "worker image digest recorded"
+WEB_DIGEST="$(build_and_push web "$WEB_REPO" "deploy/docker/Dockerfile.web")"
+WORKER_DIGEST="$(build_and_push worker "$WORKER_REPO" "deploy/docker/Dockerfile.worker")"
+log "pushed web ($WEB_DIGEST) and worker ($WORKER_DIGEST)"
 
-# --- Helm render from the exact candidate chart, then upgrade. ---
-CHART_DIR="$SOURCE_DIR/deploy/helm/companion"
-RENDERED="$TMP_ROOT/rendered.yaml"
-helm template "$RELEASE" "$CHART_DIR" -n "$NAMESPACE" -f "$VALUES_FILE" \
-  --set "web.image.tag=$CANDIDATE" --set "worker.image.tag=$CANDIDATE" \
-  --set "web.image.digest=$WEB_DIGEST" --set "worker.image.digest=$WORKER_DIGEST" \
-  > "$RENDERED" 2>"$TMP_ROOT/helm-template.err" \
-  || { cat -- "$TMP_ROOT/helm-template.err" >&2; fail "helm template with the candidate chart failed"; }
-python3 - "$RENDERED" "$ID_WEB_REPO" "$WEB_DIGEST" "$ID_WORKER_REPO" "$WORKER_DIGEST" <<'PYEOF' || fail "rendered candidate chart does not match the expected digest-pinned workloads"
-import sys
-import yaml
-path, web_repo, web_digest, worker_repo, worker_digest = sys.argv[1:6]
-docs = [d for d in yaml.safe_load_all(open(path, encoding="utf-8")) if d]
-if any(d.get("kind") == "Secret" for d in docs):
-    sys.exit(1)
-def dep(suffix):
-    m = [d for d in docs if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith(suffix)]
-    if len(m) != 1:
-        sys.exit(1)
-    return m[0]
-web = dep("-web")
-worker = dep("-worker")
-if web["spec"]["template"]["spec"]["containers"][0]["image"] != f"{web_repo}@{web_digest}":
-    sys.exit(1)
-if worker["spec"]["template"]["spec"]["containers"][0]["image"] != f"{worker_repo}@{worker_digest}":
-    sys.exit(1)
-for d in (web, worker):
-    # Helm/Kubernetes namespace semantics: a namespaced manifest that
-    # omits metadata.namespace is applied into the Helm release
-    # namespace. Both the render (`helm template -n`) and the upgrade
-    # (`helm upgrade -n`, below) use the fixed $NAMESPACE
-    # (companion-np), whose UID and release already passed
-    # cluster-identity verification, so an omitted namespace on either
-    # Deployment is effective companion-np. An explicit namespace is
-    # only safe when it is exactly companion-np; anything else — a
-    # conflicting namespace, an empty string, or a non-string value —
-    # must block before the upgrade starts.
-    rendered_ns = d["metadata"].get("namespace")
-    if rendered_ns is not None and (not isinstance(rendered_ns, str) or rendered_ns != "companion-np"):
-        sys.exit(1)
-# The chart carries the deployment-purpose attestation and the enabled
-# test-entry gate on the web workload only: the worker chart renders no
-# COMPANION_* markers, so the worker must not be required to carry
-# them. The web markers are required exactly, and the gate must be
-# enabled — the degraded render (missing/wrong markers, disabled gate)
-# must never upgrade.
-web_env = {e["name"]: e.get("value") for e in web["spec"]["template"]["spec"]["containers"][0]["env"] if "value" in e}
-if web_env.get("COMPANION_DEPLOYMENT_PURPOSE") != "non-production":
-    sys.exit(1)
-if web_env.get("COMPANION_DEPLOYMENT_NAMESPACE") != "companion-np":
-    sys.exit(1)
-if web_env.get("WEB_TEST_GATE_ENABLED") != "true":
-    sys.exit(1)
-PYEOF
-log "candidate chart render verified (digest-pinned, no Secrets, gate enabled)"
+log "upgrading Helm release $RELEASE in $NAMESPACE"
+helm upgrade --install "$RELEASE" "${SOURCE_DIR}/deploy/helm/companion" \
+  --namespace "$NAMESPACE" \
+  -f "$VALUES_FILE" \
+  --set "web.image.tag=${CANDIDATE}" \
+  --set "web.image.digest=${WEB_DIGEST}" \
+  --set "worker.image.tag=${CANDIDATE}" \
+  --set "worker.image.digest=${WORKER_DIGEST}" \
+  --wait \
+  --timeout 5m >&2
 
-helm upgrade --install "$RELEASE" "$CHART_DIR" -n "$NAMESPACE" -f "$VALUES_FILE" \
-  --set "web.image.tag=$CANDIDATE" --set "worker.image.tag=$CANDIDATE" \
-  --set "web.image.digest=$WEB_DIGEST" --set "worker.image.digest=$WORKER_DIGEST" \
-  --wait --timeout 600s >&2 \
-  || fail "helm upgrade failed; deployment state is unknown (no auto-rollback)"
-kubectl rollout status "deploy/$WEB_DEPLOY" -n "$NAMESPACE" --timeout=600s >&2 || fail "web rollout did not complete"
-kubectl rollout status "deploy/$WORKER_DEPLOY" -n "$NAMESPACE" --timeout=600s >&2 || fail "worker rollout did not complete"
-log "rollouts completed; verifying Ready pods run the expected digests (strict bounded post-rollout check)"
+# Verify Ready pods are running the exact pushed digests.
+kubectl get pods -n "$NAMESPACE" -l "app.kubernetes.io/instance=${RELEASE}" -o json \
+  | python3 -c '
+import json, sys
 
-# Strict post-rollout verifier: one shared deadline for both workloads,
-# time-bounded read-only calls, and repeated checks until the exact
-# candidate state is proven or the deadline expires. Recognized
-# same-Deployment terminating pods and not-yet-Ready / imageID-missing
-# pods are waited on; wrong (non-empty) digests, foreign owners, stale
-# ownership of a live pod, and unexplained live duplicates fail closed
-# immediately. Diagnostics are predicate codes only (no pod names, UIDs,
-# digests, or image references), so failure output stays safe metadata.
-POST_ROLLOUT_DEADLINE_SECONDS=30
-POST_ROLLOUT_POLL_SECONDS=1
-POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS=15
-VERIFIED_FILE="$TMP_ROOT/verified-pods.txt"
-POST_ROLLOUT_DEADLINE_EPOCH=$(( $(date +%s) + POST_ROLLOUT_DEADLINE_SECONDS ))
-while :; do
-  timeout "${POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS}s" kubectl get deploy "$WEB_DEPLOY" -n "$NAMESPACE" -o json > "$TMP_ROOT/deploy-web.json" 2>/dev/null || fail "cannot read deployment $WEB_DEPLOY after rollout"
-  timeout "${POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS}s" kubectl get deploy "$WORKER_DEPLOY" -n "$NAMESPACE" -o json > "$TMP_ROOT/deploy-worker.json" 2>/dev/null || fail "cannot read deployment $WORKER_DEPLOY after rollout"
-  timeout "${POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS}s" kubectl get pods -n "$NAMESPACE" -o json > "$TMP_ROOT/pods.json" 2>/dev/null || fail "cannot list pods in $NAMESPACE after rollout"
-  timeout "${POST_ROLLOUT_KUBECTL_TIMEOUT_SECONDS}s" kubectl get rs -n "$NAMESPACE" -o json > "$TMP_ROOT/replicasets.json" 2>/dev/null || fail "cannot list ReplicaSets in $NAMESPACE after rollout"
-  : > "$VERIFIED_FILE"
-  python3 - "$TMP_ROOT/pods.json" "$TMP_ROOT/replicasets.json" "$TMP_ROOT/deploy-web.json" "$TMP_ROOT/deploy-worker.json" "$ID_WEB_REPO" "$WEB_DIGEST" "$ID_WORKER_REPO" "$WORKER_DIGEST" "$WEB_DEPLOY" "$WORKER_DEPLOY" > "$VERIFIED_FILE" <<'PYEOF'
-import json, re, sys
+web_digest, worker_digest = sys.argv[1], sys.argv[2]
+pods = (json.load(sys.stdin) or {}).get("items") or []
 
-pods_path, rs_path, web_deploy_path, worker_deploy_path = sys.argv[1:5]
-web_repo, web_digest, worker_repo, worker_digest = sys.argv[5:9]
-web_deploy_name, worker_deploy_name = sys.argv[9:11]
-
-DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
-UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
-
-def is_uuid(value):
-    return isinstance(value, str) and UUID_RE.fullmatch(value) is not None
-
-def digest_of(image_id):
-    text = image_id if isinstance(image_id, str) else ""
-    if "@" not in text:
-        return None
-    digest = text.rsplit("@", 1)[-1]
-    return digest if DIGEST_RE.fullmatch(digest) else None
-
-def meta_ns_ok(meta):
-    ns = meta.get("namespace")
-    return ns is None or ns == "companion-np"
-
-def controller_owner(meta):
-    owners = meta.get("ownerReferences") or []
-    return [o for o in owners if isinstance(o, dict) and o.get("controller") is True]
-
-try:
-    pods_data = json.load(open(pods_path, encoding="utf-8"))
-    rs_data = json.load(open(rs_path, encoding="utf-8"))
-    web_deploy_data = json.load(open(web_deploy_path, encoding="utf-8"))
-    worker_deploy_data = json.load(open(worker_deploy_path, encoding="utf-8"))
-except Exception:
-    print("invalid_cluster_state")
-    sys.exit(2)
-
-terminal = []
-retryable = []
-verified = {}
-
-def check_workload(label, deploy_data, expected_deploy_name, container_name, expected_image, expected_digest, workload_label):
-    meta = deploy_data.get("metadata") or {}
-    spec = deploy_data.get("spec") or {}
-    status = deploy_data.get("status") or {}
-    if meta.get("name") != expected_deploy_name:
-        terminal.append(f"{label}:deploy_name_mismatch")
-        return
-    if not meta_ns_ok(meta):
-        terminal.append(f"{label}:deploy_namespace_mismatch")
-        return
-    deploy_uid = meta.get("uid")
-    if not is_uuid(deploy_uid):
-        terminal.append(f"{label}:deploy_uid_missing")
-        return
-    generation = meta.get("generation")
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1:
-        terminal.append(f"{label}:deploy_generation_missing")
-        return
-    observed = status.get("observedGeneration")
-    if observed is None:
-        retryable.append(f"{label}:observed_generation_missing")
-    elif not isinstance(observed, int) or isinstance(observed, bool):
-        terminal.append(f"{label}:observed_generation_invalid")
-        return
-    elif observed > generation:
-        terminal.append(f"{label}:observed_generation_invalid")
-        return
-    elif observed < generation:
-        retryable.append(f"{label}:observed_generation_stale")
-    if spec.get("replicas") != 1:
-        terminal.append(f"{label}:deploy_replicas_not_single")
-        return
-    for field in ("updatedReplicas", "readyReplicas", "availableReplicas"):
-        if status.get(field) != 1:
-            retryable.append(f"{label}:deploy_{field}_not_single")
-    template_spec = ((spec.get("template") or {}).get("spec") or {})
-    containers = template_spec.get("containers") or []
-    if len(containers) != 1:
-        terminal.append(f"{label}:deploy_container_count")
-        return
-    if containers[0].get("name") != container_name:
-        terminal.append(f"{label}:deploy_container_name_mismatch")
-        return
-    if containers[0].get("image") != expected_image:
-        terminal.append(f"{label}:deploy_image_mismatch")
-        return
-    rs_items = rs_data.get("items") or []
-    rs_by_uid = {}
-    for rs in rs_items:
-        rmeta = rs.get("metadata") or {}
-        if isinstance(rmeta.get("uid"), str):
-            rs_by_uid[rmeta["uid"]] = rs
-    owned_rs = []
-    for rs in rs_items:
-        rmeta = rs.get("metadata") or {}
-        if not meta_ns_ok(rmeta):
-            continue
-        owners = rmeta.get("ownerReferences") or []
-        for owner in owners:
-            if (owner.get("controller") is True and owner.get("kind") == "Deployment"
-                    and owner.get("name") == expected_deploy_name and owner.get("uid") == deploy_uid
-                    and owner.get("apiVersion") == "apps/v1"):
-                owned_rs.append(rs)
-                break
-    if not owned_rs:
-        retryable.append(f"{label}:no_current_replicaset")
-        return
-    revisions = []
-    for rs in owned_rs:
-        annotations = (rs.get("metadata") or {}).get("annotations") or {}
-        raw_revision = annotations.get("deployment.kubernetes.io/revision")
-        try:
-            revision = int(raw_revision)
-        except (TypeError, ValueError):
-            terminal.append(f"{label}:rs_revision_missing")
+def check(component, expected_digest):
+    active = [
+        p for p in pods
+        if (p.get("metadata") or {}).get("labels", {}).get("app.kubernetes.io/name") == component
+        and not (p.get("metadata") or {}).get("deletionTimestamp")
+    ]
+    if not active:
+        sys.exit(f"no active {component} pod found")
+    for pod in active:
+        statuses = (pod.get("status") or {}).get("containerStatuses") or []
+        match = [
+            s for s in statuses
+            if s.get("ready") is True and str(s.get("imageID") or "").endswith(f"@{expected_digest}")
+        ]
+        if match:
             return
-        if revision < 1:
-            terminal.append(f"{label}:rs_revision_missing")
-            return
-        revisions.append((revision, rs))
-    max_revision = max(revision for revision, _ in revisions)
-    current = [rs for revision, rs in revisions if revision == max_revision]
-    if len(current) != 1:
-        terminal.append(f"{label}:current_revision_ambiguous")
-        return
-    current_rs = current[0]
-    cr_meta = current_rs.get("metadata") or {}
-    current_rs_uid = cr_meta.get("uid")
-    current_rs_name = cr_meta.get("name")
-    if not is_uuid(current_rs_uid) or not isinstance(current_rs_name, str) or not current_rs_name:
-        terminal.append(f"{label}:current_rs_identity_missing")
-        return
-    cr_containers = (((current_rs.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers") or []
-    if len(cr_containers) != 1:
-        terminal.append(f"{label}:current_rs_container_count")
-        return
-    if cr_containers[0].get("name") != container_name:
-        terminal.append(f"{label}:current_rs_container_name_mismatch")
-        return
-    if cr_containers[0].get("image") != expected_image:
-        terminal.append(f"{label}:current_rs_image_mismatch")
-        return
-    current_hash = (cr_meta.get("labels") or {}).get("pod-template-hash")
-    if not isinstance(current_hash, str) or not current_hash:
-        terminal.append(f"{label}:current_rs_template_hash_missing")
-        return
-    pod_items = pods_data.get("items") or []
-    workload_pods = []
-    for pod in pod_items:
-        pmeta = pod.get("metadata") or {}
-        pname = pmeta.get("name") or ""
-        labels = pmeta.get("labels") or {}
-        if (isinstance(pname, str) and pname.startswith(expected_deploy_name + "-")) or labels.get("app.kubernetes.io/name") == workload_label:
-            workload_pods.append(pod)
-    deleting = []
-    live = []
-    for pod in workload_pods:
-        if (pod.get("metadata") or {}).get("deletionTimestamp"):
-            deleting.append(pod)
-        else:
-            live.append(pod)
-    for pod in deleting:
-        pmeta = pod.get("metadata") or {}
-        labels = pmeta.get("labels") or {}
-        if labels.get("app.kubernetes.io/name") != workload_label or labels.get("app.kubernetes.io/instance") != "companion":
-            terminal.append(f"{label}:retiring_pod_foreign_labels")
-            return
-        if not meta_ns_ok(pmeta):
-            terminal.append(f"{label}:retiring_pod_foreign_owner")
-            return
-        owners = controller_owner(pmeta)
-        if len(owners) != 1 or owners[0].get("kind") != "ReplicaSet" or owners[0].get("apiVersion") != "apps/v1":
-            terminal.append(f"{label}:retiring_pod_foreign_owner")
-            return
-        owner_rs = rs_by_uid.get(owners[0].get("uid")) if isinstance(owners[0].get("uid"), str) else None
-        if owner_rs is None:
-            terminal.append(f"{label}:retiring_pod_unknown_owner")
-            return
-        rs_owners = (owner_rs.get("metadata") or {}).get("ownerReferences") or []
-        if not any(o.get("controller") is True and o.get("kind") == "Deployment"
-                   and o.get("name") == expected_deploy_name and o.get("uid") == deploy_uid for o in rs_owners):
-            terminal.append(f"{label}:retiring_pod_foreign_owner")
-            return
-    if deleting:
-        retryable.append(f"{label}:retiring_pods_present")
-    if len(live) == 0:
-        retryable.append(f"{label}:no_live_pod")
-        return
-    if len(live) > 1:
-        terminal.append(f"{label}:duplicate_live_pods")
-        return
-    pod = live[0]
-    pmeta = pod.get("metadata") or {}
-    pod_name = pmeta.get("name")
-    pod_uid = pmeta.get("uid")
-    if not isinstance(pod_name, str) or not pod_name:
-        terminal.append(f"{label}:pod_name_missing")
-        return
-    if not is_uuid(pod_uid):
-        terminal.append(f"{label}:pod_uid_missing")
-        return
-    if not meta_ns_ok(pmeta):
-        terminal.append(f"{label}:pod_foreign_owner")
-        return
-    labels = pmeta.get("labels") or {}
-    if labels.get("app.kubernetes.io/name") != workload_label or labels.get("app.kubernetes.io/instance") != "companion":
-        terminal.append(f"{label}:pod_labels_mismatch")
-        return
-    if labels.get("pod-template-hash") != current_hash:
-        terminal.append(f"{label}:pod_template_hash_mismatch")
-        return
-    owners = controller_owner(pmeta)
-    if len(owners) != 1:
-        terminal.append(f"{label}:pod_foreign_owner")
-        return
-    owner = owners[0]
-    if owner.get("kind") != "ReplicaSet" or owner.get("apiVersion") != "apps/v1" or owner.get("name") != current_rs_name or owner.get("uid") != current_rs_uid:
-        owner_rs = rs_by_uid.get(owner.get("uid")) if isinstance(owner.get("uid"), str) else None
-        is_stale = False
-        if owner_rs is not None:
-            rs_owners = (owner_rs.get("metadata") or {}).get("ownerReferences") or []
-            if any(o.get("controller") is True and o.get("kind") == "Deployment"
-                   and o.get("name") == expected_deploy_name and o.get("uid") == deploy_uid for o in rs_owners):
-                annotations = (owner_rs.get("metadata") or {}).get("annotations") or {}
-                try:
-                    owner_revision = int(annotations.get("deployment.kubernetes.io/revision"))
-                except (TypeError, ValueError):
-                    owner_revision = None
-                if owner_revision is not None and owner_revision != max_revision:
-                    is_stale = True
-        terminal.append(f"{label}:pod_stale_owner" if is_stale else f"{label}:pod_foreign_owner")
-        return
-    pcontainers = (pod.get("spec") or {}).get("containers") or []
-    if len(pcontainers) != 1:
-        terminal.append(f"{label}:pod_container_count")
-        return
-    if pcontainers[0].get("name") != container_name:
-        terminal.append(f"{label}:pod_container_name_mismatch")
-        return
-    if pcontainers[0].get("image") != expected_image:
-        terminal.append(f"{label}:pod_image_mismatch")
-        return
-    pstatus = pod.get("status") or {}
-    if pstatus.get("phase") != "Running":
-        retryable.append(f"{label}:pod_not_running")
-        return
-    statuses = pstatus.get("containerStatuses") or []
-    if len(statuses) != 1:
-        retryable.append(f"{label}:pod_container_status_missing")
-        return
-    if statuses[0].get("name") != container_name:
-        terminal.append(f"{label}:pod_status_container_name_mismatch")
-        return
-    if statuses[0].get("ready") is not True:
-        retryable.append(f"{label}:pod_not_ready")
-        return
-    image_id = statuses[0].get("imageID") or ""
-    if not image_id:
-        retryable.append(f"{label}:pod_image_id_missing")
-        return
-    digest = digest_of(image_id)
-    if digest is None:
-        suffix = image_id.rsplit("@", 1)[-1] if "@" in image_id else ""
-        if suffix.startswith("sha256:"):
-            terminal.append(f"{label}:pod_wrong_digest")
-        else:
-            retryable.append(f"{label}:pod_image_id_missing")
-        return
-    if digest != expected_digest:
-        terminal.append(f"{label}:pod_wrong_digest")
-        return
-    verified[label] = (pod_name, pod_uid)
+    sys.exit(f"no Ready {component} pod running {expected_digest}")
 
-check_workload("web", web_deploy_data, web_deploy_name, "web", f"{web_repo}@{web_digest}", web_digest, "web")
-check_workload("worker", worker_deploy_data, worker_deploy_name, "worker", f"{worker_repo}@{worker_digest}", worker_digest, "worker")
-if terminal:
-    print(terminal[0])
-    sys.exit(2)
-if retryable:
-    print(retryable[0])
-    sys.exit(3)
-print(verified["web"][0])
-print(verified["web"][1])
-print(verified["worker"][0])
-print(verified["worker"][1])
-PYEOF
-  verify_rc=$?
-  if [[ "$verify_rc" -eq 0 ]]; then
-    break
-  fi
-  verdict="$(head -n 1 -- "$VERIFIED_FILE" 2>/dev/null || printf 'unknown')"
-  [[ -n "$verdict" ]] || verdict="unknown"
-  if [[ "$verify_rc" -eq 2 ]]; then
-    fail "post-rollout verification failed ($verdict); deployment state is unknown (no auto-rollback)"
-  fi
-  if [[ "$verify_rc" -eq 3 ]]; then
-    now_epoch="$(date +%s)"
-    if (( now_epoch >= POST_ROLLOUT_DEADLINE_EPOCH )); then
-      fail "post-rollout verification did not settle within ${POST_ROLLOUT_DEADLINE_SECONDS}s (last waiting predicate: $verdict); deployment state is unknown (no auto-rollback)"
-    fi
-    log "post-rollout verification waiting: $verdict"
-    sleep "$POST_ROLLOUT_POLL_SECONDS"
-    continue
-  fi
-  fail "post-rollout verification error (exit $verify_rc, predicate: $verdict); deployment state is unknown (no auto-rollback)"
-done
-WEB_POD="$(sed -n '1p' -- "$VERIFIED_FILE")"
-WEB_POD_UID="$(sed -n '2p' -- "$VERIFIED_FILE")"
-WORKER_POD="$(sed -n '3p' -- "$VERIFIED_FILE")"
-WORKER_POD_UID="$(sed -n '4p' -- "$VERIFIED_FILE")"
-[[ -n "$WEB_POD" && -n "$WEB_POD_UID" && -n "$WORKER_POD" && -n "$WORKER_POD_UID" ]] || fail "pod verification did not record both pods"
-log "deployed candidate $CANDIDATE verified Ready on expected digests (web pod $WEB_POD, worker pod $WORKER_POD)"
-# Only stdout output of the whole script.
+check("web", web_digest)
+check("worker", worker_digest)
+' "$WEB_DIGEST" "$WORKER_DIGEST"
+
 printf 'SHIP_DEPLOYED_SHA=%s\n' "$CANDIDATE"

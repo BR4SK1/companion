@@ -2,13 +2,10 @@
   "name": "@companion/e2e",
   "version": "0.0.0",
   "private": true,
-  "description": "Playwright end-to-end suite for the Companion web/BFF/worker slice. Runs only against a disposable, run-owned local test stack with a throwaway pgvector-ready PostgreSQL, a local fake chat/decision provider, and a configured real embedding service; never against a real application database or live chat/decision provider.",
+  "description": "Deployed Playwright end-to-end suite against the live companion-np Kubernetes deployment via kubectl port-forward.",
   "type": "module",
   "scripts": {
-    "test": "node ./check-node-version.mjs && playwright test",
-    "test:stack": "node ./check-node-version.mjs && node --test stack-ops.test.mjs",
-    "test:smoke": "node ./check-node-version.mjs && node --test deployed-smoke.test.mjs",
-    "test:deployed-smoke": "node ./check-node-version.mjs && node ./deployed-dev-smoke.mjs",
+    "test": "node ./check-node-version.mjs && node ./run-e2e.mjs",
     "install:chromium": "node ./check-node-version.mjs && playwright install chromium",
     "show-report": "node ./check-node-version.mjs && playwright show-report"
   },

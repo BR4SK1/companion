@@ -1,23 +1,10 @@
-{{- include "companion.validateDeployment" . }}
 {{- if and .Values.web.enabled .Values.web.loadBalancer.enabled }}
-{{- /* Optional, production-gated K3s ServiceLB (LoadBalancer) Service for
-the web client. Disabled by default; rendering fails for any
-deployment.purpose other than exactly "production", so a non-production
-release can never expose the web client on a node host port — its only
-public route there is the Traefik Ingress (with its middlewares). Because
-the non-production-only test gate requires a non-production purpose, the
-gate and this Service can never render in the same release. This path
-bypasses Traefik entirely: nothing enforced by Traefik middlewares
-(rate limits, headers, allowlists) applies here, so the web BFF's
-owner-only authentication remains the only access control. The host port is
-required and validated — no generic default — because it is
-environment-specific infrastructure (choose it under the hosting
-environment's host-port policy; the chart cannot detect collisions between
-releases). Health: like any Service, only Ready endpoints receive traffic,
-so the web readiness probe on "/" gates this path; there is no separate
-LoadBalancer health check. */}}
-{{- $purpose := .Values.deployment.purpose -}}
-{{- if ne $purpose "production" }}{{ fail (printf "web.loadBalancer.enabled is production-gated: it requires deployment.purpose to be exactly \"production\", got %s; a non-production release must not expose the web client on a host port" $purpose) }}{{ end }}
+{{- /* Optional K3s ServiceLB (LoadBalancer) Service for the web client.
+Disabled by default, and mutually exclusive with web.testGate.enabled so the
+test-entry gate and a host-port LoadBalancer never render in the same release.
+Traffic bypasses Traefik middlewares; the web BFF's owner-only authentication
+remains the access control. */}}
+{{- if .Values.web.testGate.enabled }}{{ fail "web.loadBalancer.enabled and web.testGate.enabled cannot both be true" }}{{ end }}
 {{- $lbHostPort := int .Values.web.loadBalancer.hostPort -}}
 {{- if or (lt $lbHostPort 1) (gt $lbHostPort 65535) }}{{ fail (printf "web.loadBalancer.hostPort must be an integer between 1 and 65535 when web.loadBalancer is enabled, got %s" (toString .Values.web.loadBalancer.hostPort)) }}{{ end }}
 {{- if eq $lbHostPort (int .Values.web.service.port) }}{{ fail (printf "web.loadBalancer.hostPort (%d) must differ from web.service.port (%d): the LoadBalancer Service and the ClusterIP Service must stay unambiguous" $lbHostPort (int .Values.web.service.port)) }}{{ end }}

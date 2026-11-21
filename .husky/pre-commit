@@ -1,4 +1,6 @@
-# Run the standard local gates before the commit is created; any failing gate blocks the commit.
+# Run local quality gates before creating a commit; any failure blocks the commit.
 pnpm run format:check
 pnpm run lint
+pnpm run typecheck
 pnpm run test:unit
+./deploy/helm/render-checks.sh

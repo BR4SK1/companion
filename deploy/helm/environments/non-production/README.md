@@ -40,16 +40,12 @@ coordinated with shared capacity.
 
 ## End-to-end access to the candidate (test-entry gate)
 
-E2E testing of a non-production candidate may use the web app's
+E2E testing of a non-production candidate uses the web app's
 non-production-only test-entry gate: an unauthenticated full-application
-surface reachable only over the operator's loopback. The values must
-declare the deployment purpose and namespace (fail-closed), and enable the
-gate:
+surface reachable only over the operator's loopback. Enable it in
+non-production values only:
 
 ```yaml
-deployment:
-  purpose: non-production
-  namespace: companion-np
 web:
   testGate:
     enabled: true
@@ -57,22 +53,15 @@ web:
     existingSecret: companion-web-test-gate-secrets
 ```
 
-The namespace must be exactly `companion-np`: it is the one authorized
-non-production namespace (pinned in the chart and mirrored by the
-application), so no other namespace — including a production-named one —
-can self-declare itself non-production and open the gate. The chart
-refuses to render the gate for any other purpose or namespace (production
-values with the gate enabled fail rendering), and the application
-re-verifies the declared purpose and namespace against the
-Kubernetes-provided pod namespace before the gate may open. The gate
-Secret must exist in the release namespace with a
-`WEB_TEST_GATE_SESSION_SECRET` key (a secrets-generator value, never the
-owner session secret, in a Secret separate from `web.existingSecret` — the
-chart fails rendering otherwise). Then access the candidate with
+The gate Secret must exist in the release namespace with a
+`WEB_TEST_GATE_SESSION_SECRET` key (never the owner session secret, in a
+Secret separate from `web.existingSecret` — the chart fails rendering
+otherwise). `web.testGate.enabled` and `web.loadBalancer.enabled` are
+mutually exclusive. Then access the candidate with:
 
 ```sh
-kubectl get pods -n <non-prod-namespace> -l app.kubernetes.io/name=web
-kubectl port-forward -n <non-prod-namespace> pod/<web-pod> 3100:3100
+kubectl get pods -n companion-np -l app.kubernetes.io/name=web
+kubectl port-forward -n companion-np pod/<web-pod> 3100:3100
 # use the full application at http://127.0.0.1:3100
 ```
 
@@ -88,7 +77,7 @@ enable the gate in production values (see
 
 Database-backed suites that truncate domain data, synthesize runtime
 configuration, exercise destructive migration paths, or inject failures are
-explicit isolated-test tools, not routine ship-it gates. `WORKER_TEST_DATABASE_URL`
+explicit isolated-test tools, not routine shipping gates. `WORKER_TEST_DATABASE_URL`
 may point only to a positively verified disposable database dedicated to the
 run. Never target an application database, including this non-production
 database, with those suites. Do not stop deployed consumers, reset a schema or
@@ -98,25 +87,10 @@ fixture with required extensions already available; migrations do not provision
 extensions.
 
 The deployment candidate receives its ordinary forward migrations on startup.
-Candidate checks then use normal application flows against the identified
-non-production release and its already-provisioned identity, settings, memory,
-and prompt-module configuration. Do not reseed or replace that configuration.
-Check its invariance with approved metadata/fingerprints that do not expose
-content. The routine deployed smoke uses uniquely attributable synthetic input
-and intentionally retains its conversation, traces, and normal learned effects
-as non-production history. Do not rewind cursors/counters or delete canonical,
-shared, or otherwise ambiguous state. Legacy cleanup is explicit-only for
-selected historical markers; it is not a routine gate and must never run
-automatically. Preserve baseline memories. Stop if ownership, configuration
-invariance, extension capability, or candidate isolation cannot be established.
-
-Local E2E and deployed-smoke records must use a new, unique, task-owned
-`E2E_RUNS_DIR` outside the historical `tests/e2e/.runs` tree. The local browser
-stack uses a synthetic fixture identity, a fake OpenRouter chat/decision
-provider, a real configured embedding service, and a run-owned disposable
-PostgreSQL. It is not evidence about the maintained personality. Deployed checks
-through the loopback gate use the existing provisioned configuration. Keep the
-forward bound to workstation loopback and remove only task-owned resources.
+Candidate E2E checks (`pnpm run test:e2e`) then run Playwright against the
+live `companion-np` release via temporary loopback `kubectl port-forward`
+tunnels, using normal application flows and uniquely attributable synthetic
+messages while leaving existing provisioned configuration untouched.
 
 ## Open items
 

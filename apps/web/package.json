@@ -2,7 +2,7 @@
   "name": "@companion/web",
   "version": "0.0.0",
   "private": true,
-  "description": "Web client preview slice: local-only, fixture-backed Next.js/React/MUI messenger UI. No backend, authentication, or durable chat.",
+  "description": "Companion web client and BFF: owner-only Keycloak OIDC sign-in, signed-cookie sessions, and the live continuous conversation UI.",
   "scripts": {
     "dev": "next dev",
     "build": "next build",

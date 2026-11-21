@@ -13,8 +13,7 @@ It is **not** a deployable and runs nowhere automatically:
 
 ## Scope: what is editable
 
-Exactly the tables the worker treats as provisioned configuration (the same
-set the deployed-smoke configuration fingerprint covers):
+Exactly the tables the worker treats as provisioned configuration:
 
 | Table | Rows |
 | --- | --- |
