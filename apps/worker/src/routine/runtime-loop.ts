@@ -15,6 +15,8 @@ export function startRoutineRuntime(input: {
   readonly store: RoutineStore;
   /** Conversation-domain transaction that publishes the pending schedule notice. */
   readonly publishPendingAnnouncement?: () => Promise<boolean>;
+  /** Optional external HTTP routine tick, isolated from built-in reconciliation. */
+  readonly tickExternal?: () => Promise<void>;
   readonly intervalMs?: number;
   readonly log?: (message: string) => void;
 }): RoutineRuntime {
@@ -40,6 +42,12 @@ export function startRoutineRuntime(input: {
         // The applied cursor and pending notice are durable. The next pass
         // retries; an ongoing unavailable period is revalidated before publish.
         log("[ROUTINE] reconciliation or announcement publication failed; the next pass will retry if the absence is ongoing");
+      }
+      if (closed || input.tickExternal === undefined) return;
+      try {
+        await input.tickExternal();
+      } catch {
+        log("[ROUTINE] external provider tick failed; the next pass will retry");
       }
     });
     tail = next.catch(() => undefined);

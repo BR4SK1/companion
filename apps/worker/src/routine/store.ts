@@ -12,6 +12,7 @@ import type {
   RoutineAnnouncementDraft,
   RoutineAppliedState,
   RoutineConfiguration,
+  RoutineExternalProviderConfig,
   RoutineOccurrence,
   RoutineSnapshot,
   RoutineTransition,
@@ -234,6 +235,34 @@ export interface RoutineStore {
   readonly recordAnnouncementPublication: (
     client: PostgresPoolClient,
     draft: RoutineAnnouncementDraft,
+    messageId: string,
+    publishedAt: Date,
+  ) => Promise<void>;
+  /** Load the optional external HTTP routine provider configuration; null when absent. */
+  readonly loadExternalProvider: () => Promise<RoutineExternalProviderConfig | null>;
+  /** Set or clear a durable temporary availability hold for a named source. */
+  readonly setAvailabilityHold: (
+    sourceKey: string,
+    unavailableUntil: Date | null,
+    revision?: number,
+  ) => Promise<void>;
+  /** Lock the current revision through publication so a stale tick cannot post a message. */
+  readonly lockCurrentAvailabilityRevision: (
+    client: PostgresPoolClient,
+    sourceKey: string,
+    revision: number,
+  ) => Promise<boolean>;
+  /** Identify the most recent assistant message before this turn's first user message. */
+  readonly loadPublishedMessageKeyBeforeTurn: (turnId: string) => Promise<string | null>;
+  /** Check whether an external assistant message key has already been published. */
+  readonly hasPublishedExternalMessage: (
+    client: PostgresPoolClient,
+    clientKey: string,
+  ) => Promise<boolean>;
+  /** Record publication of an external assistant message inside the conversation transaction. */
+  readonly recordExternalMessagePublication: (
+    client: PostgresPoolClient,
+    clientKey: string,
     messageId: string,
     publishedAt: Date,
   ) => Promise<void>;
@@ -504,6 +533,12 @@ export function createRoutineStore(input: {
   }
 
   async function canStartNewTurn(client: PostgresPoolClient): Promise<boolean> {
+    const activeHold = await client.query<{ held: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM routine_availability_hold WHERE unavailable_until > clock_timestamp()
+       ) AS held`,
+    );
+    if (activeHold.rows[0]?.held === true) return false;
     const configuration = await loadConfiguration(client);
     if (configuration === null) return true;
     const clock = await client.query<{ now: Date }>("SELECT clock_timestamp() AS now");
@@ -512,6 +547,118 @@ export function createRoutineStore(input: {
       throw new Error("routine availability clock query returned no valid timestamp");
     }
     return scheduledRoutineStateAt(now, configuration).available;
+  }
+
+  async function loadExternalProvider(): Promise<RoutineExternalProviderConfig | null> {
+    const result = await pool.query<{
+      enabled: boolean;
+      endpoint_setting: string;
+      scope_setting: string | null;
+      timeout_ms: number;
+    }>(
+      `SELECT enabled, endpoint_setting, scope_setting, timeout_ms
+       FROM routine_external_provider
+       WHERE id = true`,
+    );
+    const row = result.rows[0];
+    if (row === undefined) return null;
+    return {
+      enabled: row.enabled,
+      endpointSetting: row.endpoint_setting,
+      scopeSetting: row.scope_setting,
+      timeoutMs: Number(row.timeout_ms),
+    };
+  }
+
+  async function setAvailabilityHold(
+    sourceKey: string,
+    unavailableUntil: Date | null,
+    revision?: number,
+  ): Promise<void> {
+    const deadline = unavailableUntil !== null && Number.isFinite(unavailableUntil.getTime())
+      ? unavailableUntil
+      : null;
+    if (deadline === null && revision === undefined) {
+      await pool.query(
+        `DELETE FROM routine_availability_hold WHERE source_key = $1 AND revision IS NULL`,
+        [sourceKey],
+      );
+      return;
+    }
+    // Preserve the last applied revision even after a clear. Older replies
+    // and retries may still be in flight when this write commits.
+    await pool.query(
+      `INSERT INTO routine_availability_hold (source_key, unavailable_until, revision, updated_at)
+       VALUES ($1, $2, $3, now())
+       ON CONFLICT (source_key) DO UPDATE SET
+         unavailable_until = EXCLUDED.unavailable_until,
+         revision = EXCLUDED.revision,
+         updated_at = now()
+       WHERE routine_availability_hold.revision IS NULL
+          OR EXCLUDED.revision > routine_availability_hold.revision`,
+      [sourceKey, deadline, revision ?? null],
+    );
+  }
+
+  async function lockCurrentAvailabilityRevision(
+    client: PostgresPoolClient,
+    sourceKey: string,
+    revision: number,
+  ): Promise<boolean> {
+    const result = await client.query(
+      `SELECT 1 FROM routine_availability_hold
+       WHERE source_key = $1 AND revision = $2
+       FOR SHARE`,
+      [sourceKey, revision],
+    );
+    return result.rows.length > 0;
+  }
+
+  async function loadPublishedMessageKeyBeforeTurn(turnId: string): Promise<string | null> {
+    // Raw sequence order records whether the question was visible before the
+    // user sent the message, even when the turn was claimed much later.
+    const result = await pool.query<{ client_key: string }>(
+      `SELECT p.client_key
+       FROM routine_external_message p
+       WHERE p.message_id = (
+         SELECT m.id
+         FROM conversation_message m
+         WHERE m.role = 'assistant' AND m.seq < (
+           SELECT min(u.seq) FROM conversation_message u
+           WHERE u.turn_id = $1 AND u.role = 'user'
+         )
+         ORDER BY m.seq DESC
+         LIMIT 1
+       )`,
+      [turnId],
+    );
+    return result.rows[0]?.client_key ?? null;
+  }
+
+  async function hasPublishedExternalMessage(
+    client: PostgresPoolClient,
+    clientKey: string,
+  ): Promise<boolean> {
+    const result = await client.query<{ present: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM routine_external_message WHERE client_key = $1
+       ) AS present`,
+      [clientKey],
+    );
+    return result.rows[0]?.present === true;
+  }
+
+  async function recordExternalMessagePublication(
+    client: PostgresPoolClient,
+    clientKey: string,
+    messageId: string,
+    publishedAt: Date,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO routine_external_message (client_key, message_id, published_at)
+       VALUES ($1, $2, $3)`,
+      [clientKey, messageId, publishedAt],
+    );
   }
 
   async function prepareAnnouncement(
@@ -623,5 +770,11 @@ export function createRoutineStore(input: {
     prepareAnnouncement,
     cancelAnnouncement,
     recordAnnouncementPublication,
+    loadExternalProvider,
+    setAvailabilityHold,
+    lockCurrentAvailabilityRevision,
+    loadPublishedMessageKeyBeforeTurn,
+    hasPublishedExternalMessage,
+    recordExternalMessagePublication,
   };
 }

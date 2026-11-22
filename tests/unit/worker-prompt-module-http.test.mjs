@@ -12,10 +12,12 @@ const config = {
   scopeField: "scope",
   turnIdField: "turn",
   localDateTimeField: "localTime",
+  engagementStateField: null,
   previousAssistantResponseField: "previousReply",
   userMessageField: "currentInput",
   priorConversationField: "history",
   responseTextField: "answerText",
+  unavailableUntilField: null,
   fieldMaxBytes: 8192,
   priorMessageLimit: 2,
   requestMaxBytes: 81920,
@@ -549,6 +551,85 @@ describe("declarative HTTP prompt modules", () => {
         }),
       });
       assert.equal(invalidRequired.kind, "invalid_result");
+    } finally {
+      await mock.close();
+    }
+  });
+
+  it("maps engagement, publication proof, and the revised availability hold through processTurnWork", async () => {
+    let received;
+    const mock = await listen(async (request, response) => {
+      received = await requestJson(request);
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({
+        answerText: "authoritative schedule context",
+        unavailableUntil: "2026-06-15T15:10:00.000Z",
+        availabilityRevision: 12,
+      }));
+    });
+    const pool = testPool([httpRow({
+      module_key: "schedule_state",
+      http_engagement_state_field: "engagementState",
+      http_published_routine_message_key_field: "publishedQuestion",
+      http_unavailable_until_field: "unavailableUntil",
+      http_availability_revision_field: "availabilityRevision",
+    })]);
+    const store = createPromptModuleStore(pool);
+    const holds = [];
+    try {
+      const outcome = await processTurnWork(
+        {
+          turn: {
+            id: "turn-hold-1",
+            attempt: 1,
+            createdAt: "2026-06-15T15:05:00.000Z",
+          },
+          messages: [{ id: "m-1", role: "user", content: "yeah go ahead" }],
+        },
+        {
+          decisionModel: "synthetic-decision",
+          chatModel: "synthetic-chat",
+          leaseOwner: "worker:test",
+          temporalSettings: {
+            timezone: "America/New_York",
+            seasonHemisphere: null,
+            birthdayMonth: null,
+            birthdayDay: null,
+          },
+          callDecisions: async () => { throw new Error("unexpected decision call"); },
+          callChat: async () => ({
+            id: "chat-1",
+            model: "synthetic-chat",
+            choices: [{ index: 0, message: { role: "assistant", content: "brb!" }, finish_reason: "stop" }],
+          }),
+          loadPatterns: async () => [],
+          loadIdentity: async () => ({ content: "synthetic identity", revision: 1 }),
+          loadContext: async () => [],
+          loadPreviousPublishedAssistantReply: async () => "mind if i go change?",
+          loadEngagementState: async () => "lull",
+          loadPublishedRoutineMessageKey: async (turnId) => {
+            assert.equal(turnId, "turn-hold-1");
+            return "schedule:2026-06-15:morning_change:ask:1";
+          },
+          applyAvailabilityHold: async (hold) => { holds.push(hold); },
+          loadPromptModules: () => store.loadEnabled(),
+          promptModuleCredentials: {
+            [config.endpointSetting]: mock.endpoint,
+            [config.scopeSetting]: "scope-prod",
+          },
+          executePromptModule,
+          recordPromptModuleDefinitions: async () => {},
+          recordPromptModuleDecision: async () => {},
+          recordPromptModuleExecution: async () => {},
+        },
+      );
+      assert.equal(outcome.reply, "brb!");
+      assert.equal(received.engagementState, "lull");
+      assert.equal(received.publishedQuestion, "schedule:2026-06-15:morning_change:ask:1");
+      assert.equal(holds.length, 1);
+      assert.equal(holds[0].moduleKey, "schedule_state");
+      assert.equal(holds[0].unavailableUntil.toISOString(), "2026-06-15T15:10:00.000Z");
+      assert.equal(holds[0].availabilityRevision, 12);
     } finally {
       await mock.close();
     }

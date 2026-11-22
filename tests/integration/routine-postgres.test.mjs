@@ -108,7 +108,9 @@ describe("routine schedule (PostgreSQL)", { skip: !hasDatabase }, () => {
        VALUES (gen_random_uuid(), 'legacy-transition', '2026-11-09',
                '2026-11-09T09:00:00Z', 'UTC', 'pending')`,
     );
-    const periodMigration = routineMigrations.at(-1);
+    const periodMigration = routineMigrations.find(
+      ({ id }) => id === "0015_routine_announcement_period_id",
+    );
     assert.ok(periodMigration);
     await runMigrations(pool, [periodMigration]);
     migratedLegacyEvent = (await pool.query(
@@ -125,11 +127,81 @@ describe("routine schedule (PostgreSQL)", { skip: !hasDatabase }, () => {
   beforeEach(async () => {
     await pool.query(
       `TRUNCATE routine_announcement, routine_applied_transition, routine_applied_state,
+        routine_availability_hold,
         routine_transition, routine_settings, conversation_message, conversation_turn, response_pattern,
         trace_attempt, trace_attempt_context, trace_attempt_pattern, trace_attempt_decision,
         trace_attempt_decision_probability, trace_attempt_chat, trace_attempt_chat_message,
         trace_attempt_chat_choice RESTART IDENTITY CASCADE`,
     );
+  });
+
+  it("orders concurrent hold updates and retains a cleared revision across retries", async () => {
+    const routine = createRoutineStore({ pool });
+    const source = "external-routine-test";
+    const deadline = new Date(Date.now() + 5 * 60_000);
+    const canStart = () => withTransaction(pool, routine.canStartNewTurn);
+
+    await routine.setAvailabilityHold(source, deadline);
+    assert.equal(await canStart(), false);
+    await Promise.all([
+      routine.setAvailabilityHold(source, deadline, 2),
+      routine.setAvailabilityHold(source, null, 1),
+    ]);
+    await routine.setAvailabilityHold(source, null);
+    assert.equal(await canStart(), false, "a stale clear cannot release an active hold");
+
+    await Promise.all([
+      routine.setAvailabilityHold(source, null, 3),
+      routine.setAvailabilityHold(source, deadline, 2),
+    ]);
+    await routine.setAvailabilityHold(source, deadline);
+    assert.equal(await canStart(), true, "old and unversioned replies cannot restore a cleared hold");
+    const { rows: [row] } = await pool.query(
+      `SELECT unavailable_until, revision FROM routine_availability_hold WHERE source_key = $1`,
+      [source],
+    );
+    assert.deepEqual(row, { unavailable_until: null, revision: "3" });
+  });
+
+  it("confirms an external question only if it was published before the turn's first input", async () => {
+    const routine = createRoutineStore({ pool });
+    const conversation = createConversationStore(pool);
+    const source = "external-routine-test";
+    await routine.setAvailabilityHold(source, null, 2);
+    const publish = (key, revision, skipIfUserMessagesQueued = true) =>
+      conversation.publishScheduledAssistantMessage({
+        skipIfUserMessagesQueued,
+        prepare: async (client) => {
+          if (!(await routine.lockCurrentAvailabilityRevision(client, source, revision))) return null;
+          return {
+            content: "Synthetic permission question?",
+            validUntil: null,
+            cancel: async () => {},
+            recordPublication: (tx, messageId, publishedAt) =>
+              routine.recordExternalMessagePublication(tx, key, messageId, publishedAt),
+          };
+        },
+      });
+
+    assert.equal(await publish("stale-question", 1), false);
+    await conversation.appendUserMessage({ content: "Synthetic reply queued before any question." });
+    assert.equal(await publish("queued-question", 2), false);
+    // Older publishers could still post a question after a user message was queued.
+    assert.equal(await publish("late-question", 2, false), true);
+    const first = await conversation.claimNextTurn({ owner: "first", leaseSeconds: 60 });
+    assert.equal(first.kind, "claimed");
+    assert.equal(await routine.loadPublishedMessageKeyBeforeTurn(first.work.turn.id), null);
+    assert.equal(await conversation.publishReply({
+      turnId: first.work.turn.id,
+      leaseOwner: "first",
+      content: "Synthetic normal reply.",
+    }), "published");
+
+    assert.equal(await publish("visible-question", 2), true);
+    await conversation.appendUserMessage({ content: "Synthetic answer to the visible question." });
+    const second = await conversation.claimNextTurn({ owner: "second", leaseSeconds: 60 });
+    assert.equal(second.kind, "claimed");
+    assert.equal(await routine.loadPublishedMessageKeyBeforeTurn(second.work.turn.id), "visible-question");
   });
 
   it("upgrades an existing transition/date outbox row to a fresh period identity", () => {

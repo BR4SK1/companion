@@ -1,3 +1,5 @@
+import type { EngagementState } from "../engagement/types.ts";
+
 /** Database-owned prompt-module definitions and their attempt-scoped trace values. */
 
 export interface PromptModuleDefinition {
@@ -28,10 +30,14 @@ export interface PromptModuleHttpPostConfig {
   readonly scopeField: string | null;
   readonly turnIdField: string | null;
   readonly localDateTimeField: string | null;
+  readonly engagementStateField?: string | null;
+  readonly publishedRoutineMessageKeyField?: string | null;
   readonly previousAssistantResponseField: string | null;
   readonly userMessageField: string | null;
   readonly priorConversationField: string | null;
   readonly responseTextField: string;
+  readonly unavailableUntilField?: string | null;
+  readonly availabilityRevisionField?: string | null;
   readonly fieldMaxBytes: number;
   readonly priorMessageLimit: number;
   readonly requestMaxBytes: number;
@@ -45,8 +51,12 @@ export interface PromptModuleConversationMessage {
 
 export interface PromptModulePromptOutput {
   readonly moduleId: string;
+  readonly moduleKey?: string;
   readonly content: string;
   readonly outputKind: PromptModuleOutputKind;
+  /** Optional availability hold returned by an external HTTP module (Date to hold, null to clear). */
+  readonly unavailableUntil?: Date | null;
+  readonly availabilityRevision?: number;
 }
 
 export interface PromptModuleContext {
@@ -61,12 +71,22 @@ export interface PromptModuleContext {
   readonly previousAssistantResponse: string;
   /** Authoritative worker-local ISO date-time with numeric offset; null if unconfigured. */
   readonly localDateTime: string | null;
+  /** Current engagement band from the worker's engagement domain; null when unprovisioned or no history. */
+  readonly engagementState?: EngagementState | null;
+  /** Ledger key for an external routine message published before this turn's first user input. */
+  readonly publishedRoutineMessageKey?: string | null;
   /** Only explicitly configured prompt-module credentials are passed here. */
   readonly credentials: Readonly<Record<string, string>>;
 }
 
 export type PromptModuleRunResult =
-  | { readonly kind: "succeeded"; readonly content: string; readonly durationMs: number }
+  | {
+      readonly kind: "succeeded";
+      readonly content: string;
+      readonly durationMs: number;
+      readonly unavailableUntil?: Date | null;
+      readonly availabilityRevision?: number;
+    }
   | { readonly kind: "failed" | "timed_out" | "invalid_result"; readonly durationMs: number };
 
 export type PromptModuleTraceBoundary = "definitions" | "decision" | "execution" | "chat_attribution";

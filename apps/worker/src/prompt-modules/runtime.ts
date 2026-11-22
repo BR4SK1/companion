@@ -85,7 +85,13 @@ function emptySelection(moduleId: string, selected: boolean | null) {
  */
 export async function runPromptModules(
   deps: PromptModuleRuntimeDeps,
-): Promise<readonly { readonly moduleId: string; readonly content: string; readonly outputKind: PromptModuleDefinition["outputKind"] }[]> {
+): Promise<readonly {
+  readonly moduleId: string;
+  readonly moduleKey?: string;
+  readonly content: string;
+  readonly outputKind: PromptModuleDefinition["outputKind"];
+  readonly unavailableUntil?: Date | null;
+}[]> {
   const modules = [...deps.modules].sort((a, b) =>
     a.position - b.position || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
   );
@@ -219,7 +225,15 @@ export async function runPromptModules(
     for (const module of everyTurnModules) selected.add(module.id);
   }
 
-  const outputs: { moduleId: string; content: string; outputKind: PromptModuleDefinition["outputKind"] }[] = [];
+  const outputs: {
+    moduleId: string;
+    moduleKey?: string;
+    content: string;
+    outputKind: PromptModuleDefinition["outputKind"];
+    unavailableUntil?: Date | null;
+    availabilityRevision?: number;
+  }[] = [];
+  const { publishedRoutineMessageKey, ...context } = deps.context;
   let executionOrdinal = 0;
   for (const module of modules) {
     if (!selected.has(module.id)) {
@@ -232,7 +246,13 @@ export async function runPromptModules(
     try {
       rawExecution = await deps.execute({
         module,
-        context: { ...deps.context, turnId: deps.turnId },
+        context: {
+          ...context,
+          turnId: deps.turnId,
+          ...(module.httpConfig?.publishedRoutineMessageKeyField != null
+            ? { publishedRoutineMessageKey: publishedRoutineMessageKey ?? null }
+            : {}),
+        },
       });
     } catch {
       rawExecution = { kind: "failed", durationMs: elapsed(executionStartedAt) };
@@ -253,7 +273,17 @@ export async function runPromptModules(
       fallbackSelected: fallbackUsed,
     };
     await deps.recordExecution({ turnId: deps.turnId, leaseOwner: deps.leaseOwner, result: trace });
-    if (content !== null) outputs.push({ moduleId: module.id, content, outputKind: module.outputKind });
+    if (content !== null) {
+      const hold = execution.kind === "succeeded" ? execution.unavailableUntil : undefined;
+      const revision = execution.kind === "succeeded" ? execution.availabilityRevision : undefined;
+      outputs.push({
+        moduleId: module.id,
+        content,
+        outputKind: module.outputKind,
+        ...(hold !== undefined ? { moduleKey: module.key, unavailableUntil: hold } : {}),
+        ...(hold !== undefined && revision !== undefined ? { availabilityRevision: revision } : {}),
+      });
+    }
     log(
       deps,
       `module=${module.key} activation=${module.activationMode} execution=${execution.kind} ms=${execution.durationMs} fallback_ready=${fallbackUsed} output_ready=${content !== null}`,

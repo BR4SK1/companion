@@ -15,6 +15,7 @@ import {
   RoutineConfigurationError,
 } from "../../apps/worker/src/routine/store.ts";
 import { routineMigrations } from "../../apps/worker/src/routine/migrations.ts";
+import { runExternalRoutineTick } from "../../apps/worker/src/routine/external.ts";
 import { buildChatPrompt } from "../../apps/worker/src/work/chat.ts";
 import { runEngineOnce } from "../../apps/worker/src/work/engine.ts";
 
@@ -250,6 +251,8 @@ describe("routine schedule semantics", () => {
       "0013_routine_chat_chunk",
       "0014_routine_announcement",
       "0015_routine_announcement_period_id",
+      "0026_routine_external_provider",
+      "0028_routine_hold_revision",
     ]);
     assert.doesNotMatch(routineMigrations[0].sql, /INSERT INTO/i);
     assert.match(routineMigrations[0].sql, /routine_applied_transition/);
@@ -257,6 +260,9 @@ describe("routine schedule semantics", () => {
     assert.match(routineMigrations[2].sql, /routine_announcement/);
     assert.match(routineMigrations[3].sql, /PRIMARY KEY \(id\)/i);
     assert.match(routineMigrations[3].sql, /status = 'ended'/);
+    assert.match(routineMigrations[4].sql, /routine_external_provider/);
+    assert.match(routineMigrations[4].sql, /routine_availability_hold/);
+    assert.match(routineMigrations[4].sql, /routine_external_message/);
     let queries = 0;
     const pool = { query: async () => { queries += 1; return { rows: [] }; } };
     assert.equal(await loadRoutineConfiguration(pool), null);
@@ -264,9 +270,87 @@ describe("routine schedule semantics", () => {
     const routineStore = createRoutineStore({ pool });
     let gateQueries = 0;
     assert.equal(await routineStore.canStartNewTurn({
-      query: async () => { gateQueries += 1; return { rows: [] }; },
+      query: async (sql) => {
+        gateQueries += 1;
+        if (String(sql).includes("routine_availability_hold")) return { rows: [{ held: false }] };
+        return { rows: [] };
+      },
     }), true);
-    assert.equal(gateQueries, 1, "unprovisioned schedules do not block ordinary chat");
+    assert.equal(gateQueries, 2, "checks active hold then unprovisioned schedule");
+    assert.equal(await routineStore.canStartNewTurn({
+      query: async (sql) => {
+        if (String(sql).includes("routine_availability_hold")) return { rows: [{ held: true }] };
+        throw new Error("should not query schedule when hold is active");
+      },
+    }), false);
+  });
+
+  it("runs external routine ticks with engagement state, hold updates, and assistant messages", async () => {
+    const disabled = await runExternalRoutineTick({
+      loadProvider: async () => null,
+      credentials: {},
+      timezone: "America/New_York",
+      applyAvailabilityHold: async () => { throw new Error("must not be called"); },
+      publishAssistantMessage: async () => { throw new Error("must not be called"); },
+    });
+    assert.deepEqual(disabled, { status: "disabled" });
+
+    let receivedBody;
+    let appliedHold;
+    let appliedRevision;
+    let publishedMessage;
+    let publishedRevision;
+    const ok = await runExternalRoutineTick({
+      loadProvider: async () => ({
+        enabled: true,
+        endpointSetting: "scheduleTickUrl",
+        scopeSetting: "scheduleScope",
+        timeoutMs: 5000,
+      }),
+      credentials: {
+        scheduleTickUrl: "http://schedule.local/v1/schedule/tick",
+        scheduleScope: "scope-prod",
+      },
+      timezone: "America/New_York",
+      now: () => new Date("2026-06-15T15:05:00.000Z"),
+      loadEngagementState: async () => "lull",
+      hasQueuedUserMessages: async () => false,
+      applyAvailabilityHold: async (until, revision) => {
+        appliedHold = until;
+        appliedRevision = revision;
+      },
+      publishAssistantMessage: async (msg, revision) => {
+        publishedMessage = msg;
+        publishedRevision = revision;
+        return true;
+      },
+      fetchImpl: async (_url, init) => {
+        receivedBody = JSON.parse(String(init.body));
+        return new Response(
+          JSON.stringify({
+            unavailableUntil: "2026-06-15T15:10:00.000Z",
+            availabilityRevision: 9,
+            assistantMessage: {
+              clientKey: "schedule:2026-06-15:morning_change:ask:1",
+              content: "mind if i step away for a few mins?",
+            },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      },
+    });
+    assert.deepEqual(ok, { status: "ok", publishedMessage: true });
+    assert.equal(receivedBody.userId, "scope-prod");
+    assert.equal(receivedBody.engagementState, "lull");
+    assert.equal(receivedBody.hasQueuedUserMessages, false);
+    assert.match(receivedBody.localDateTime, /^2026-06-15T11:05:00\.000-04:00$/);
+    assert.equal(appliedHold.toISOString(), "2026-06-15T15:10:00.000Z");
+    assert.equal(appliedRevision, 9);
+    assert.equal(publishedRevision, 9);
+    assert.deepEqual(publishedMessage, {
+      clientKey: "schedule:2026-06-15:morning_change:ask:1",
+      content: "mind if i step away for a few mins?",
+    });
   });
 
   it("rejects invalid configured timezones and incomplete schedules", async () => {

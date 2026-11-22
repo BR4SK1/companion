@@ -157,41 +157,37 @@ function optionalReasoningEffort(
   return value;
 }
 
-function promptModuleCredentials(
+function namedPromptModuleValues(
   env: Record<string, string | undefined>,
+  name: string,
 ): Readonly<Record<string, string>> {
-  const raw = env.WORKER_PROMPT_MODULE_CREDENTIALS_JSON;
+  const raw = env[name];
   if (raw === undefined || raw.length === 0) return {};
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new WorkerConfigError(
-      "WORKER_PROMPT_MODULE_CREDENTIALS_JSON must be a JSON object of named string credentials",
-    );
+    throw new WorkerConfigError(`${name} must be a JSON object of named strings`);
   }
-  if (
-    typeof parsed !== "object" || parsed === null || Array.isArray(parsed)
-  ) {
-    throw new WorkerConfigError(
-      "WORKER_PROMPT_MODULE_CREDENTIALS_JSON must be a JSON object of named string credentials",
-    );
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new WorkerConfigError(`${name} must be a JSON object of named strings`);
   }
-  const credentials: Record<string, string> = {};
-  for (const [name, value] of Object.entries(parsed)) {
-    if (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(name) || typeof value !== "string") {
-      throw new WorkerConfigError(
-        "WORKER_PROMPT_MODULE_CREDENTIALS_JSON must contain only named string credentials",
-      );
+  const entries = Object.entries(parsed);
+  for (const [key, value] of entries) {
+    if (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(key) || typeof value !== "string") {
+      throw new WorkerConfigError(`${name} must contain only named strings`);
     }
-    Object.defineProperty(credentials, name, {
-      value,
-      enumerable: true,
-      writable: false,
-      configurable: false,
-    });
   }
-  return Object.freeze(credentials);
+  return Object.fromEntries(entries);
+}
+
+function promptModuleCredentials(
+  env: Record<string, string | undefined>,
+): Readonly<Record<string, string>> {
+  return Object.freeze({
+    ...namedPromptModuleValues(env, "WORKER_PROMPT_MODULE_SETTINGS_JSON"),
+    ...namedPromptModuleValues(env, "WORKER_PROMPT_MODULE_CREDENTIALS_JSON"),
+  });
 }
 
 function optionalHttpHost(

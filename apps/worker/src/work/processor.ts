@@ -120,6 +120,7 @@ import type {
   PromptModuleTraceBoundary,
 } from "../prompt-modules/types.ts";
 import { PromptModuleTraceWriteError } from "../prompt-modules/types.ts";
+import type { EngagementState } from "../engagement/types.ts";
 import { TraceWriteFencedError } from "../conversation/store.ts";
 import {
   parseDecisionsExchange,
@@ -268,6 +269,15 @@ export interface TurnProcessorDeps {
   >;
   /** Optional configured scheduled/applied routine state; failures degrade to no context. */
   readonly loadRoutineContext?: (turnId: string, referenceTime: Date) => Promise<string | null>;
+  /** Optional current engagement band from the worker's engagement domain. */
+  readonly loadEngagementState?: (referenceTime: Date) => Promise<EngagementState | null>;
+  readonly loadPublishedRoutineMessageKey?: (turnId: string) => Promise<string | null>;
+  /** Optional callback to persist/clear an availability hold returned by an HTTP prompt module. */
+  readonly applyAvailabilityHold?: (input: {
+    readonly moduleKey: string;
+    readonly unavailableUntil: Date | null;
+    readonly availabilityRevision?: number;
+  }) => Promise<void>;
   /** Enabled prompt modules are loaded afresh for each attempt. */
   readonly loadPromptModules?: () => Promise<readonly PromptModuleDefinition[]>;
   /** Explicit service credentials only; the full worker environment is not passed to module code. */
@@ -824,6 +834,19 @@ export async function processTurnWork(
       if (modules.length > 0) {
         const previousAssistantResponse =
           await deps.loadPreviousPublishedAssistantReply(work.turn.id) ?? "";
+        let engagementState: EngagementState | null = null;
+        if (deps.loadEngagementState !== undefined) {
+          try {
+            engagementState = await deps.loadEngagementState(attemptReferenceTime);
+          } catch {
+            engagementState = null;
+          }
+        }
+        const publishedRoutineMessageKey = modules.some(
+          ({ httpConfig }) => httpConfig?.publishedRoutineMessageKeyField != null,
+        )
+          ? await deps.loadPublishedRoutineMessageKey?.(work.turn.id).catch(() => null) ?? null
+          : null;
         promptModuleChunks = await runPromptModules({
           turnId: work.turn.id,
           leaseOwner: deps.leaseOwner!,
@@ -848,6 +871,8 @@ export async function processTurnWork(
               new Date(work.turn.createdAt),
               deps.temporalSettings?.timezone,
             ),
+            engagementState,
+            publishedRoutineMessageKey,
           },
           callDecisions: deps.callDecisions,
           execute: deps.executePromptModule!,
@@ -862,6 +887,25 @@ export async function processTurnWork(
           ),
           ...(deps.log !== undefined ? { log: deps.log } : {}),
         });
+        if (deps.applyAvailabilityHold !== undefined) {
+          for (const output of promptModuleChunks) {
+            if (output.unavailableUntil !== undefined) {
+              try {
+                await deps.applyAvailabilityHold({
+                  moduleKey: output.moduleKey ?? output.moduleId,
+                  unavailableUntil: output.unavailableUntil,
+                  ...(output.availabilityRevision !== undefined
+                    ? { availabilityRevision: output.availabilityRevision }
+                    : {}),
+                });
+              } catch {
+                (deps.log ?? console.warn)(
+                  "[PROMPT_MODULE] availability_hold_write_failed; continuing chat",
+                );
+              }
+            }
+          }
+        }
       }
     } catch (error) {
       if (error instanceof TraceWriteFencedError) throw error;
