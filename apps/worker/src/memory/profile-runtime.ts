@@ -75,14 +75,13 @@ async function runAllProfiles(
         result.trimmedCount !== undefined && result.trimmedCount > 0
           ? ` trimmed=${String(result.trimmedCount)}`
           : "";
-      const contentTrimmedSuffix = result.contentTrimmed ? " contentTrimmed=true" : "";
       const droppedClaimsSuffix =
         result.droppedClaims !== undefined && result.droppedClaims > 0
           ? ` droppedClaims=${String(result.droppedClaims)}`
           : "";
       if (result.regenerated) {
         log(
-          `[MEMORY] profile ${subject.id} regenerated (${trigger}): sources=${String(result.sourceCount)}${trimmedSuffix}${contentTrimmedSuffix}${droppedClaimsSuffix}` +
+          `[MEMORY] profile ${subject.id} regenerated (${trigger}): sources=${String(result.sourceCount)}${trimmedSuffix}${droppedClaimsSuffix}` +
             `${result.skippedReason !== undefined ? ` [${result.skippedReason}]` : ""}`,
         );
       }
@@ -92,7 +91,7 @@ async function runAllProfiles(
         outcome: "ok",
         detail: `trigger=${trigger} regenerated=${String(result.regenerated)}` +
           `${result.skippedReason !== undefined ? ` skipped=${result.skippedReason}` : ""}` +
-          ` sources=${String(result.sourceCount)}${trimmedSuffix}${contentTrimmedSuffix}${droppedClaimsSuffix}`,
+          ` sources=${String(result.sourceCount)}${trimmedSuffix}${droppedClaimsSuffix}`,
         ...(result.model !== undefined ? { model: result.model } : {}),
         ...(result.promptVersion !== undefined ? { promptVersion: result.promptVersion } : {}),
         ...(result.inputTokens !== undefined ? { inputTokens: result.inputTokens } : {}),
