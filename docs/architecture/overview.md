@@ -25,4 +25,4 @@ The non-production deployment script builds from a clean candidate commit, pushe
 
 ## Open decisions
 
-Automatic retries for transient model failures, provider-call cancellation, diagnostic retention, image-generation recovery and production promotion remain open. Deployment-specific prompts, credentials and behavior configuration stay outside public documentation.
+Automatic retries for transient main-chat model failures (decision calls support configured multi-model round-robin failover with a bounded retry pass on retryable transport errors), provider-call cancellation, diagnostic retention, image-generation recovery and production promotion remain open. Deployment-specific prompts, credentials and behavior configuration stay outside public documentation.

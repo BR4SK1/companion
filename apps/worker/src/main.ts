@@ -85,6 +85,7 @@ import { memoryErrorCategory } from "./memory/errors.ts";
 import { loadTemporalSettings } from "./temporal/store.ts";
 import { createPromptModuleStore } from "./prompt-modules/store.ts";
 import { executePromptModule } from "./prompt-modules/executor.ts";
+import { createDecisionModelPool } from "./work/decision-pool.ts";
 
 /**
  * Runs one fenced trace write and refuses to continue on a lost lease. The
@@ -641,6 +642,13 @@ async function main(): Promise<void> {
     await api.start();
     console.log(`private api listening on ${config.http.host}:${String(config.http.port)}`);
 
+    const decisionModelPool = createDecisionModelPool(
+      config.openrouter.decisionModels,
+    );
+    console.log(
+      `[DECISION] configured model pool (${String(decisionModelPool.models.length)}): ${decisionModelPool.models.join(", ")}`,
+    );
+
     await runEngineLoop(
       {
         store,
@@ -648,6 +656,7 @@ async function main(): Promise<void> {
         processTurn: (work, { leaseOwner }) =>
           processTurnWork(work, {
             decisionModel: config.openrouter.decisionModel,
+            decisionModelPool,
             chatModel: config.openrouter.chatModel,
             ...(config.openrouter.chatReasoningEffort !== undefined
               ? {
