@@ -1,28 +1,25 @@
-# End-to-end tests
+# End-to-end tests (local-only)
 
-Deployed-only Playwright suite (`@companion/e2e`) exercising the live non-production Kubernetes deployment (`companion-np`, release `companion`) through temporary loopback `kubectl port-forward` tunnels.
+This directory holds the implementation-specific end-to-end suite. It is
+deliberately excluded from version control: everything under `tests/e2e/`
+except this README is gitignored (see the root
+[`.gitignore`](../../.gitignore)).
 
-## Running
+## Why E2E is gitignored
 
-The E2E toolchain is pinned to the Node.js version in the repository root [`.nvmrc`](../../.nvmrc) (`22.23.4`):
+This repository is a scaffold with no implementation details. Good end-to-end
+coverage inherently depends on implementation specifics — routes, selectors,
+session handling, deployment topology, and seed data — so the suite lives here
+as local-only code rather than in the tracked scaffold.
 
-```sh
-nvm use
-pnpm --filter @companion/e2e install:chromium   # first time only
-pnpm run test:e2e
-```
+## Local convention
 
-`run-e2e.mjs` finds the Ready `web` and `worker` pods in `companion-np`, opens loopback-only `kubectl port-forward` tunnels (`127.0.0.1:3100` for the web test-entry gate, plus ephemeral local ports for the web main listener and worker API), runs Playwright sequentially against those endpoints, and closes the tunnels on exit.
+The local suite is a Playwright project in this directory (`specs/`,
+`helpers/`, `playwright.config.mjs`, and a private `package.json` providing
+the `@companion/e2e` workspace package consumed by `pnpm run test:e2e`).
 
-Optional environment overrides: `E2E_NAMESPACE` (default `companion-np`), `E2E_RELEASE` (default `companion`), `E2E_GATE_PORT` (default `3100`, must match the pod's `WEB_TEST_GATE_PORT`).
+Boundaries for the local suite:
 
-## Coverage
-
-1. `01-access-and-safety.spec.mjs` — test-gate session issuance, OIDC absence on the test channel, owner-only main channel redirect and API refusal, cross-channel cookie isolation, Host and forwarding-header rejections on the gate listener, same-origin checks, and worker health/readiness + bearer-token boundaries.
-2. `02-pwa.spec.mjs` — public PWA assets (`manifest.webmanifest`, `sw.js`, `offline.html`, generated PNG icons) on both channels, document head metadata, service worker registration and offline-page-only caching, offline navigation fallback and recovery, `/api` exclusion, and HTTP error preservation.
-3. `03-live-chat.spec.mjs` — real end-to-end browser chat turn, including same-key retry after an interrupted acceptance acknowledgment, through the composer -> web BFF -> worker -> PostgreSQL -> live OpenRouter reply -> reload persistence.
-
-## Boundaries
-
-- Targets `companion-np` only (never production) and never resets or modifies provisioned configuration.
-- `03-live-chat.spec.mjs` sends one synthetic message through the live non-production stack, which performs real model calls and retains that synthetic turn in non-production history.
+- Target non-production deployments only; never production.
+- Never reset or modify provisioned configuration or shared state.
+- Mark synthetic traffic so it is recognizable in non-production history.
