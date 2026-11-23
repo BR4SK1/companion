@@ -900,6 +900,7 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       new Date("2026-06-15T19:00:00Z"),
     );
     assert.ok(summary !== null);
+    assert.equal(summary.cached, false);
     assert.equal(summary.messageCount, 2);
     assert.equal(callLlm.calls.temporal, 1);
     assert.ok(summary.content.startsWith("This morning, "));
@@ -921,6 +922,7 @@ describe("memory domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       new Date("2026-06-15T19:00:00Z"),
     );
     assert.equal(callLlm.calls.temporal, 1);
+    assert.equal(second.cached, true);
     assert.equal(second.fingerprint, summary.fingerprint);
 
     // The prompt context serves the closed morning under its tag.

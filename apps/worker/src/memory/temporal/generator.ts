@@ -538,6 +538,8 @@ export interface GeneratedSummary {
   readonly outputTokens: number;
   readonly callCount: number;
   readonly status: "complete";
+  /** True when reused from storage on a matching fingerprint (zero LLM calls). */
+  readonly cached: boolean;
 }
 
 /**
@@ -596,6 +598,7 @@ export async function generateTemporalSummary(
     outputTokens: generated.outputTokens,
     callCount: generated.callCount,
     status: "complete",
+    cached: false,
   };
   await saveTemporalSummary(deps.pool, {
     period,
@@ -643,6 +646,7 @@ function storedToGenerated(
     outputTokens: existing.outputTokens,
     callCount: existing.callCount,
     status: "complete",
+    cached: true,
   };
 }
 

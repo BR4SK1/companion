@@ -50,6 +50,15 @@ export interface ProfileGenerateSummary {
   readonly sourceCount: number;
   /** Number of older active observations omitted to fit `profileMaxSourceChars`. */
   readonly trimmedCount?: number;
+  /** True when the generated profile prose was bounded to the max character limit. */
+  readonly contentTrimmed?: boolean;
+  /** Count of unrecognized claim IDs ignored while retaining valid provenance. */
+  readonly droppedClaims?: number;
+  readonly model?: string;
+  readonly promptVersion?: string;
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly llmCalls?: number;
 }
 
 export interface FittedProfileObservations {
@@ -580,6 +589,15 @@ export async function generateProfileIfNeeded(
     sourceCount: observations.length,
     model: result.model || deps.config.model,
   });
+  const llmMeta = {
+    model: result.model || deps.config.model,
+    promptVersion: MEMORY_PROFILE_PROMPT_VERSION,
+    inputTokens: result.inputTokens,
+    outputTokens: result.outputTokens,
+    llmCalls: result.attemptCount,
+    ...(parsed.contentTrimmed ? { contentTrimmed: true } : {}),
+    ...(parsed.droppedClaims > 0 ? { droppedClaims: parsed.droppedClaims } : {}),
+  };
   if (saved === "stale") {
     return {
       subject: subjectId,
@@ -590,6 +608,7 @@ export async function generateProfileIfNeeded(
       skippedReason: "stale-at-save",
       sourceCount: observations.length,
       ...trimmedField,
+      ...llmMeta,
     };
   }
   return {
@@ -600,5 +619,6 @@ export async function generateProfileIfNeeded(
     regenerated: true,
     sourceCount: observations.length,
     ...trimmedField,
+    ...llmMeta,
   };
 }

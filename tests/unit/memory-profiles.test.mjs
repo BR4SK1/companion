@@ -9,9 +9,18 @@ import assert from "node:assert/strict";
 import { loadMemoryConfig, MemoryConfigError } from "../../apps/worker/src/memory/config.ts";
 import {
   memoryErrorCategory,
+  memoryOutputErrorReason,
   MemoryLlmTruncatedError,
   MemorySourceBudgetError,
 } from "../../apps/worker/src/memory/errors.ts";
+import {
+  buildObservationProfilePrompt,
+  buildObservationProfileResponseFormat,
+  parseProfileV2Output,
+  profileObservationHandle,
+  trimProfileContent,
+  MemoryLlmOutputError,
+} from "../../apps/worker/src/memory/prompts.ts";
 import {
   computeProfileFingerprint,
   fitObservationsToProfileBudget,
@@ -450,6 +459,11 @@ describe("observation profile fingerprint", () => {
     assert.equal(first.regenerated, true);
     assert.equal(first.sourceCount, 2);
     assert.equal(first.trimmedCount, 1);
+    assert.equal(first.model, "fake-model");
+    assert.equal(first.promptVersion, "v2-1");
+    assert.equal(first.inputTokens, 100);
+    assert.equal(first.outputTokens, 40);
+    assert.equal(first.llmCalls, 1);
     assert.equal(llmCalls, 1);
     assert.deepEqual(
       savedSources.map((s) => s.observation_id),
@@ -535,5 +549,105 @@ describe("observation profile fingerprint", () => {
         error instanceof MemoryLlmTruncatedError &&
         memoryErrorCategory(error) === "llm_output_truncated",
     );
+  });
+});
+
+describe("observation profile v2 schema, handles, and parser hardening", () => {
+  it("enforces strict json_schema with bounded content length", () => {
+    const format = buildObservationProfileResponseFormat();
+    assert.equal(format.type, "json_schema");
+    assert.equal(format.json_schema.strict, true);
+    assert.equal(format.json_schema.schema.additionalProperties, false);
+    assert.equal(format.json_schema.schema.properties.content.minLength, 1);
+    assert.equal(format.json_schema.schema.properties.content.maxLength, 4000);
+    assert.equal(format.json_schema.schema.properties.claims.items.properties.text.maxLength, 400);
+  });
+
+  it("uses compact prompt-local handles and resolves them back to canonical IDs", () => {
+    const observations = [
+      observation({ observationId: "memory-observation-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }),
+      observation({ observationId: "memory-observation-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", claim: "Prefers tea" }),
+    ];
+    const prompt = buildObservationProfilePrompt("SYSTEM", observations);
+    assert.equal(prompt.messages[0].content.includes(`"observationId":"${profileObservationHandle(0)}"`), true);
+    assert.equal(prompt.messages[0].content.includes(`"observationId":"${profileObservationHandle(1)}"`), true);
+    assert.equal(prompt.messages[0].content.includes("memory-observation-v1-"), false);
+
+    const parsed = parseProfileV2Output(
+      JSON.stringify({
+        content: "## Preferences & Tastes\n- Likes mornings and tea.",
+        claims: [
+          { observationId: "O1", text: "Likes mornings" },
+          { observationId: "memory-observation-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", text: "Prefers tea" },
+          { observationId: "O999", text: "Hallucinated ID should be dropped" },
+        ],
+      }),
+      observations,
+    );
+    assert.equal(parsed.contentTrimmed, false);
+    assert.equal(parsed.droppedClaims, 1);
+    assert.deepEqual(parsed.claims, [
+      { observationId: "memory-observation-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", text: "Likes mornings" },
+      { observationId: "memory-observation-v1-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", text: "Prefers tea" },
+    ]);
+  });
+
+  it("tolerates markdown-fenced JSON responses", () => {
+    const observations = [observation()];
+    const fenced = "```json\n" + JSON.stringify({
+      content: "## Life & Background\n- Morning person.",
+      claims: [{ observationId: "O1", text: "Likes mornings" }],
+    }) + "\n```";
+    const parsed = parseProfileV2Output(fenced, observations);
+    assert.equal(parsed.content, "## Life & Background\n- Morning person.");
+    assert.equal(parsed.claims[0].observationId, "obs-1");
+  });
+
+  it("trims oversized profile prose cleanly at a bullet boundary without orphan headings", () => {
+    const bulletA = "- First durable bullet describing preferences in detail.";
+    const bulletB = "- Second durable bullet describing habits in detail.";
+    const longText = [
+      "## Preferences & Tastes",
+      bulletA,
+      bulletB,
+      "",
+      "## Trailing Heading",
+      "- " + "x".repeat(200),
+    ].join("\n");
+    const budget = "## Preferences & Tastes\n".length + bulletA.length + 1 + bulletB.length + "\n\n## Trailing Heading\n".length + 5;
+    const trimmed = trimProfileContent(longText, budget);
+    assert.equal(trimmed.trimmed, true);
+    assert.equal(trimmed.content.length <= budget, true);
+    assert.equal(trimmed.content.includes("## Trailing Heading"), false);
+    assert.ok(trimmed.content.endsWith(bulletB));
+
+    // Also bounds over-4,000-char parser output instead of throwing.
+    const huge = Array.from({ length: 80 }, (_, idx) => `- Bullet ${String(idx + 1)}: ${"word ".repeat(12).trim()}.`).join("\n");
+    const parsed = parseProfileV2Output(
+      JSON.stringify({ content: huge, claims: [{ observationId: "O1", text: "Likes mornings" }] }),
+      [observation()],
+    );
+    assert.equal(parsed.contentTrimmed, true);
+    assert.ok(parsed.content.length <= 4000);
+    assert.ok(parsed.content.length > 2500);
+  });
+
+  it("attaches closed-set validation reasons on genuine output errors", () => {
+    const obs = [observation()];
+    const cases = [
+      ["not json at all", "json_parse"],
+      ["[]", "not_object"],
+      [JSON.stringify({ claims: [] }), "missing_content"],
+      [JSON.stringify({ content: "   ", claims: [] }), "empty_content"],
+    ];
+    for (const [payload, expectedReason] of cases) {
+      assert.throws(
+        () => parseProfileV2Output(payload, obs),
+        (error) =>
+          error instanceof MemoryLlmOutputError &&
+          memoryErrorCategory(error) === "llm_output_invalid" &&
+          memoryOutputErrorReason(error) === expectedReason,
+      );
+    }
   });
 });

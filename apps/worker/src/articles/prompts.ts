@@ -45,6 +45,46 @@ export const articleTaskPresets: Readonly<{
 };
 
 /**
+ * Effort-scaled reasoning headroom added above each article task's visible
+ * output budget when `WORKER_ARTICLE_REASONING_EFFORT` raises effort above
+ * the default `low` preset. OpenRouter counts hidden reasoning tokens against
+ * `max_tokens`, so raising effort without headroom starves short JSON review
+ * outputs (`review` defaults to 1,000 tokens at `low`).
+ */
+const ARTICLE_REASONING_HEADROOM_TOKENS: Readonly<Record<ReasoningEffort, number>> = {
+  none: 0,
+  minimal: 500,
+  low: 500,
+  medium: 2_000,
+  high: 3_500,
+  xhigh: 5_000,
+  max: 8_000,
+};
+
+const ARTICLE_VISIBLE_OUTPUT_BUDGETS = {
+  generation: 1_000,
+  review: 500,
+  consolidation: 1_000,
+} as const;
+
+function applyArticleReasoningEffort(
+  preset: TaskPreset,
+  visibleBudget: number,
+  reasoningEffort: ReasoningEffort,
+): TaskPreset {
+  const scaledMaxTokens = Math.max(
+    preset.maxTokens,
+    visibleBudget + ARTICLE_REASONING_HEADROOM_TOKENS[reasoningEffort],
+  );
+  return {
+    ...preset,
+    maxTokens: scaledMaxTokens,
+    honorMaxTokens: true,
+    reasoningEffort,
+  };
+}
+
+/**
  * The article task presets with an optional configured reasoning-effort
  * override (`WORKER_ARTICLE_REASONING_EFFORT`) applied to every task.
  * Without an override the presets keep their defaults (`low`).
@@ -58,9 +98,21 @@ export function articleTaskPresetsWithReasoningEffort(
 }> {
   if (reasoningEffort === undefined) return articleTaskPresets;
   return {
-    generation: { ...articleTaskPresets.generation, reasoningEffort },
-    review: { ...articleTaskPresets.review, reasoningEffort },
-    consolidation: { ...articleTaskPresets.consolidation, reasoningEffort },
+    generation: applyArticleReasoningEffort(
+      articleTaskPresets.generation,
+      ARTICLE_VISIBLE_OUTPUT_BUDGETS.generation,
+      reasoningEffort,
+    ),
+    review: applyArticleReasoningEffort(
+      articleTaskPresets.review,
+      ARTICLE_VISIBLE_OUTPUT_BUDGETS.review,
+      reasoningEffort,
+    ),
+    consolidation: applyArticleReasoningEffort(
+      articleTaskPresets.consolidation,
+      ARTICLE_VISIBLE_OUTPUT_BUDGETS.consolidation,
+      reasoningEffort,
+    ),
   };
 }
 
