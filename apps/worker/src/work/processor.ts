@@ -885,6 +885,7 @@ export async function processTurnWork(
             ),
             engagementState,
             publishedRoutineMessageKey,
+            patternId: selected?.id ?? null,
           },
           callDecisions: deps.callDecisions,
           execute: moduleServices.executePromptModule,

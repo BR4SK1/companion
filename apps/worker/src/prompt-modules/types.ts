@@ -32,6 +32,7 @@ export interface PromptModuleHttpPostConfig {
   readonly localDateTimeField: string | null;
   readonly engagementStateField?: string | null;
   readonly publishedRoutineMessageKeyField?: string | null;
+  readonly patternIdField?: string | null;
   readonly previousAssistantResponseField: string | null;
   readonly userMessageField: string | null;
   readonly priorConversationField: string | null;
@@ -75,6 +76,8 @@ export interface PromptModuleContext {
   readonly engagementState?: EngagementState | null;
   /** Ledger key for an external routine message published before this turn's first user input. */
   readonly publishedRoutineMessageKey?: string | null;
+  /** Opaque selected response-pattern id from the turn's pattern decision, or null when none was selected. */
+  readonly patternId?: string | null;
   /** Only explicitly configured prompt-module credentials are passed here. */
   readonly credentials: Readonly<Record<string, string>>;
 }

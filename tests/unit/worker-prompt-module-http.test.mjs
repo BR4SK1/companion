@@ -575,6 +575,7 @@ describe("declarative HTTP prompt modules", () => {
       module_key: "schedule_state",
       http_engagement_state_field: "engagementState",
       http_published_routine_message_key_field: "publishedQuestion",
+      http_pattern_id_field: "patternId",
       http_unavailable_until_field: "unavailableUntil",
       http_availability_revision_field: "availabilityRevision",
     })]);
@@ -611,13 +612,30 @@ describe("declarative HTTP prompt modules", () => {
             birthdayMonth: null,
             birthdayDay: null,
           },
-          callDecisions: async () => { throw new Error("unexpected decision call"); },
+          callDecisions: async () => ({
+            id: "dec-1",
+            model: "synthetic-decision",
+            answers: {
+              response_pattern: {
+                type: "choice",
+                choice: "cozy_roleplay",
+              },
+            },
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }),
           callChat: async () => ({
             id: "chat-1",
             model: "synthetic-chat",
             choices: [{ index: 0, message: { role: "assistant", content: "brb!" }, finish_reason: "stop" }],
           }),
-          loadPatterns: async () => [],
+          loadPatterns: async () => [
+            {
+              id: "cozy_roleplay",
+              selectionDescription: "Cozy domestic scene.",
+              responseGuidance: "Keep it warm.",
+              position: 0,
+            },
+          ],
           loadIdentity: async () => ({ content: "synthetic identity", revision: 1 }),
           loadContext: async () => [],
           loadPreviousPublishedAssistantReply: async () => "mind if i go change?",
@@ -630,8 +648,10 @@ describe("declarative HTTP prompt modules", () => {
         },
       );
       assert.equal(outcome.reply, "brb!");
+      assert.equal(outcome.selectedPatternId, "cozy_roleplay");
       assert.equal(received.engagementState, "lull");
       assert.equal(received.publishedQuestion, "schedule:2026-06-15:morning_change:ask:1");
+      assert.equal(received.patternId, "cozy_roleplay");
       assert.equal(holds.length, 1);
       assert.equal(holds[0].moduleKey, "schedule_state");
       assert.equal(holds[0].unavailableUntil.toISOString(), "2026-06-15T15:10:00.000Z");
