@@ -16,7 +16,8 @@ import type { MemoryLlmCaller } from "./llm.ts";
 import type { MemorySubject, PromptConfig } from "./types.ts";
 import { generateProfileIfNeeded, type ProfileGenerateSummary } from "./profiles-v2.ts";
 import { nextLocalHourDelay, type BehaviorTime } from "./time.ts";
-import { memoryErrorCategory } from "./errors.ts";
+import { memoryErrorCategory, memoryOutputErrorReason } from "./errors.ts";
+import { MEMORY_PROFILE_PROMPT_VERSION } from "./prompts.ts";
 
 export function computeNextProfileRunDelay(now: Date, hour: number, timezone: string): number {
   return nextLocalHourDelay(now, hour, timezone);
@@ -38,6 +39,13 @@ export interface ProfileRuntimeDeps {
     readonly trigger: string;
     readonly outcome: "ok" | "failed";
     readonly detail: string;
+    readonly model?: string;
+    readonly promptVersion?: string;
+    readonly inputTokens?: number;
+    readonly outputTokens?: number;
+    readonly llmCalls?: number;
+    readonly startedAt: Date;
+    readonly finishedAt: Date;
   }) => Promise<void>;
 }
 
@@ -57,6 +65,7 @@ async function runAllProfiles(
     callLlm: deps.callLlm,
   };
   for (const subject of deps.profileSubjects) {
+    const startedAt = new Date();
     try {
       const result: ProfileGenerateSummary = await generateProfileIfNeeded(
         profileDeps,
@@ -66,9 +75,14 @@ async function runAllProfiles(
         result.trimmedCount !== undefined && result.trimmedCount > 0
           ? ` trimmed=${String(result.trimmedCount)}`
           : "";
+      const contentTrimmedSuffix = result.contentTrimmed ? " contentTrimmed=true" : "";
+      const droppedClaimsSuffix =
+        result.droppedClaims !== undefined && result.droppedClaims > 0
+          ? ` droppedClaims=${String(result.droppedClaims)}`
+          : "";
       if (result.regenerated) {
         log(
-          `[MEMORY] profile ${subject.id} regenerated (${trigger}): sources=${String(result.sourceCount)}${trimmedSuffix}` +
+          `[MEMORY] profile ${subject.id} regenerated (${trigger}): sources=${String(result.sourceCount)}${trimmedSuffix}${contentTrimmedSuffix}${droppedClaimsSuffix}` +
             `${result.skippedReason !== undefined ? ` [${result.skippedReason}]` : ""}`,
         );
       }
@@ -78,19 +92,32 @@ async function runAllProfiles(
         outcome: "ok",
         detail: `trigger=${trigger} regenerated=${String(result.regenerated)}` +
           `${result.skippedReason !== undefined ? ` skipped=${result.skippedReason}` : ""}` +
-          ` sources=${String(result.sourceCount)}${trimmedSuffix}`,
+          ` sources=${String(result.sourceCount)}${trimmedSuffix}${contentTrimmedSuffix}${droppedClaimsSuffix}`,
+        ...(result.model !== undefined ? { model: result.model } : {}),
+        ...(result.promptVersion !== undefined ? { promptVersion: result.promptVersion } : {}),
+        ...(result.inputTokens !== undefined ? { inputTokens: result.inputTokens } : {}),
+        ...(result.outputTokens !== undefined ? { outputTokens: result.outputTokens } : {}),
+        ...(result.llmCalls !== undefined ? { llmCalls: result.llmCalls } : {}),
+        startedAt,
+        finishedAt: new Date(),
       });
     } catch (error) {
       const category = memoryErrorCategory(error);
+      const reason = memoryOutputErrorReason(error);
+      const reasonSuffix = reason !== null ? ` reason=${reason}` : "";
       console.error(
         `[MEMORY] profile ${subject.id} generation failed (${trigger}):`,
-        category,
+        `${category}${reasonSuffix}`,
       );
       await deps.onResult?.({
         subject: subject.id,
         trigger,
         outcome: "failed",
-        detail: `trigger=${trigger} error=${category}`,
+        detail: `trigger=${trigger} error=${category}${reasonSuffix}`,
+        model: deps.config.model,
+        promptVersion: MEMORY_PROFILE_PROMPT_VERSION,
+        startedAt,
+        finishedAt: new Date(),
       }).catch(() => undefined);
     }
   }

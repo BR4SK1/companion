@@ -12,6 +12,7 @@
  * promotion idempotency work.
  */
 
+import type { MemoryLlmOutputReason } from "./errors.ts";
 import {
   hashArtifact,
 } from "./hashing.ts";
@@ -33,9 +34,14 @@ import type {
  * details, logs).
  */
 export class MemoryLlmOutputError extends Error {
-  constructor(message: string) {
+  readonly reason?: MemoryLlmOutputReason;
+
+  constructor(message: string, reason?: MemoryLlmOutputReason) {
     super(message);
     this.name = "MemoryLlmOutputError";
+    if (reason !== undefined) {
+      this.reason = reason;
+    }
   }
 }
 
@@ -200,15 +206,38 @@ export function buildFactExtractionPrompt(
   };
 }
 
+function stripJsonCodeFence(text: string): string {
+  const trimmed = text.trim();
+  const match = /^```(?:json)?\s*\r?\n?([\s\S]*?)\r?\n?```$/i.exec(trimmed);
+  return match?.[1] !== undefined ? match[1].trim() : trimmed;
+}
+
 function parseObject(text: string, label: string): Record<string, unknown> {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new MemoryLlmOutputError(`${label} response was not valid JSON`);
+    const unfenced = stripJsonCodeFence(text);
+    if (unfenced === text) {
+      throw new MemoryLlmOutputError(
+        `${label} response was not valid JSON`,
+        "json_parse",
+      );
+    }
+    try {
+      parsed = JSON.parse(unfenced);
+    } catch {
+      throw new MemoryLlmOutputError(
+        `${label} response was not valid JSON`,
+        "json_parse",
+      );
+    }
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new MemoryLlmOutputError(`${label} response was not an object`);
+    throw new MemoryLlmOutputError(
+      `${label} response was not an object`,
+      "not_object",
+    );
   }
   return parsed as Record<string, unknown>;
 }
@@ -725,22 +754,32 @@ export function parseProfileV1Output(text: string): ProfileV1Output {
 
 const MAX_PROFILE_CONTENT_CHARS = 4000;
 
+/** Compact prompt-local observation handle (`O1`, `O2`, ...) mapped back to canonical IDs. */
+export function profileObservationHandle(index: number): string {
+  return `O${String(index + 1)}`;
+}
+
 export function buildObservationProfileResponseFormat() {
   return {
     type: "json_schema",
     json_schema: {
       name: "memory_profile_v2",
+      strict: true,
       schema: {
         type: "object",
         properties: {
-          content: { type: "string" },
+          content: {
+            type: "string",
+            minLength: 1,
+            maxLength: MAX_PROFILE_CONTENT_CHARS,
+          },
           claims: {
             type: "array",
             items: {
               type: "object",
               properties: {
-                observationId: { type: "string" },
-                text: { type: "string" },
+                observationId: { type: "string", minLength: 1 },
+                text: { type: "string", minLength: 1, maxLength: 400 },
               },
               required: ["observationId", "text"],
               additionalProperties: false,
@@ -767,6 +806,10 @@ export function buildObservationProfilePrompt(
     distinctDayCount: number;
   }>,
 ): PromptSpec {
+  const promptObservations = observations.map((observation, index) => ({
+    ...observation,
+    observationId: profileObservationHandle(index),
+  }));
   return {
     systemPrompt,
     messages: [
@@ -774,7 +817,7 @@ export function buildObservationProfilePrompt(
         role: "user",
         content: [
           "REVIEWED OBSERVATIONS",
-          JSON.stringify(observations),
+          JSON.stringify(promptObservations),
           "",
           "Write the reference sheet in your voice, then list every observation you used in claims.",
         ].join("\n"),
@@ -783,9 +826,44 @@ export function buildObservationProfilePrompt(
   };
 }
 
+/**
+ * Bound profile prose to `maxChars` without failing a completed response.
+ * Prefers trimming at a clean line/bullet boundary (stripping any trailing
+ * orphan Markdown headings) and falls back to sentence-boundary trimming.
+ */
+export function trimProfileContent(
+  text: string,
+  maxChars: number = MAX_PROFILE_CONTENT_CHARS,
+): { readonly content: string; readonly trimmed: boolean } {
+  if (text.length <= maxChars) {
+    return { content: text, trimmed: false };
+  }
+  const candidate = text.slice(0, maxChars + 1);
+  const lastNewline = candidate.lastIndexOf("\n");
+  if (lastNewline >= Math.floor(maxChars * 0.55)) {
+    const lines = candidate.slice(0, lastNewline).trimEnd().split("\n");
+    while (lines.length > 0 && /^#{1,6}\s/.test(lines[lines.length - 1]!.trim())) {
+      lines.pop();
+      while (lines.length > 0 && lines[lines.length - 1]!.trim().length === 0) {
+        lines.pop();
+      }
+    }
+    const lineTrimmed = lines.join("\n").trim();
+    if (lineTrimmed.length > 0) {
+      return { content: lineTrimmed, trimmed: true };
+    }
+  }
+  return {
+    content: trimAtSentenceBoundary(text, maxChars),
+    trimmed: true,
+  };
+}
+
 export interface ParsedProfileV2 {
   readonly content: string;
   readonly claims: ReadonlyArray<{ observationId: string; text: string }>;
+  readonly contentTrimmed: boolean;
+  readonly droppedClaims: number;
 }
 
 export function parseProfileV2Output(
@@ -794,33 +872,46 @@ export function parseProfileV2Output(
 ): ParsedProfileV2 {
   const parsed = parseObject(text, "Profile");
   if (typeof parsed.content !== "string") {
-    throw new MemoryLlmOutputError("Profile response was missing content");
-  }
-  const content = parsed.content.trim();
-  if (!content) throw new MemoryLlmOutputError("Profile content was empty");
-  if (content.length > MAX_PROFILE_CONTENT_CHARS) {
     throw new MemoryLlmOutputError(
-      `Profile content exceeded ${MAX_PROFILE_CONTENT_CHARS} characters`,
+      "Profile response was missing content",
+      "missing_content",
     );
   }
-  const knownIds = new Set(observations.map((observation) => observation.observationId));
+  const rawContent = parsed.content.trim();
+  if (!rawContent) {
+    throw new MemoryLlmOutputError(
+      "Profile content was empty",
+      "empty_content",
+    );
+  }
+  const { content, trimmed: contentTrimmed } = trimProfileContent(
+    rawContent,
+    MAX_PROFILE_CONTENT_CHARS,
+  );
+  const handleToId = new Map<string, string>();
+  const knownIds = new Set<string>();
+  for (const [index, observation] of observations.entries()) {
+    handleToId.set(profileObservationHandle(index), observation.observationId);
+    knownIds.add(observation.observationId);
+  }
   const claims: Array<{ observationId: string; text: string }> = [];
+  let droppedClaims = 0;
   if (Array.isArray(parsed.claims)) {
     for (const rawClaim of parsed.claims) {
       if (!rawClaim || typeof rawClaim !== "object" || Array.isArray(rawClaim)) continue;
       const record = rawClaim as Record<string, unknown>;
-      const observationId = typeof record.observationId === "string" ? record.observationId : "";
+      const rawId = typeof record.observationId === "string" ? record.observationId.trim() : "";
       const claimText = typeof record.text === "string" ? record.text.trim() : "";
-      if (!observationId || !claimText) continue;
-      if (!knownIds.has(observationId)) {
-        throw new MemoryLlmOutputError(
-          "Profile claim referenced an unknown observation id",
-        );
+      if (!rawId || !claimText) continue;
+      const resolvedId = handleToId.get(rawId) ?? (knownIds.has(rawId) ? rawId : null);
+      if (resolvedId === null) {
+        droppedClaims += 1;
+        continue;
       }
-      claims.push({ observationId, text: claimText.slice(0, 400) });
+      claims.push({ observationId: resolvedId, text: claimText.slice(0, 400) });
     }
   }
-  return { content, claims };
+  return { content, claims, contentTrimmed, droppedClaims };
 }
 
 // ---------------------------------------------------------------------------

@@ -9,7 +9,9 @@ import assert from "node:assert/strict";
 
 import {
   MEMORY_ERROR_CATEGORIES,
+  MEMORY_LLM_OUTPUT_REASONS,
   memoryErrorCategory,
+  memoryOutputErrorReason,
   MemoryLlmTruncatedError,
   MemorySourceBudgetError,
   OpenRouterTransportError,
@@ -125,5 +127,21 @@ describe("memory error categories", () => {
         `category is not from the closed set: ${category}`,
       );
     }
+  });
+
+  it("extracts closed-set output-validation sub-reasons without leaking error text", () => {
+    for (const reason of MEMORY_LLM_OUTPUT_REASONS) {
+      const error = new MemoryLlmOutputError(`bad output ${CANARY}`, reason);
+      assert.equal(memoryErrorCategory(error), "llm_output_invalid");
+      assert.equal(memoryOutputErrorReason(error), reason);
+    }
+    assert.equal(memoryOutputErrorReason(new MemoryLlmOutputError(CANARY)), null);
+    assert.equal(
+      memoryOutputErrorReason(
+        Object.assign(new MemoryLlmOutputError(CANARY), { reason: CANARY }),
+      ),
+      null,
+    );
+    assert.equal(memoryOutputErrorReason(new Error(CANARY)), null);
   });
 });

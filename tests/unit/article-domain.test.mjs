@@ -921,15 +921,31 @@ describe("reaction prompt envelopes", () => {
     assert.equal(articleTaskPresets.consolidation.reasoningEffort, "low");
   });
 
-  it("applies a reasoning-effort override to every article preset", () => {
+  it("applies a reasoning-effort override with headroom to every article preset", () => {
     const presets = articleTaskPresetsWithReasoningEffort("high");
     assert.equal(presets.generation.reasoningEffort, "high");
     assert.equal(presets.review.reasoningEffort, "high");
     assert.equal(presets.consolidation.reasoningEffort, "high");
+    assert.equal(presets.generation.maxTokens, 4_500);
+    assert.equal(presets.review.maxTokens, 4_000);
+    assert.equal(presets.consolidation.maxTokens, 4_500);
+    assert.equal(presets.review.honorMaxTokens, true);
+
+    // Lowering reasoning effort never shrinks maxTokens below defaults.
+    const low = articleTaskPresetsWithReasoningEffort("low");
+    assert.equal(low.generation.maxTokens, articleTaskPresets.generation.maxTokens);
+    assert.equal(low.review.maxTokens, articleTaskPresets.review.maxTokens);
+    const none = articleTaskPresetsWithReasoningEffort("none");
+    assert.equal(none.review.maxTokens, articleTaskPresets.review.maxTokens);
+
     // Unset preserves the low defaults.
     assert.equal(
       articleTaskPresetsWithReasoningEffort().generation.reasoningEffort,
       "low",
+    );
+    assert.equal(
+      articleTaskPresetsWithReasoningEffort().review.maxTokens,
+      articleTaskPresets.review.maxTokens,
     );
   });
 

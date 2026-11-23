@@ -498,7 +498,7 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
       const startedAt = new Date();
       try {
         const summary = await generateTemporalSummary(temporalDeps, period, now);
-        if (summary !== null) {
+        if (summary !== null && !summary.cached) {
           generated += 1;
           await recordMemoryOperation(pool, {
             kind: "temporal_summary",
@@ -668,8 +668,13 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
         kind: "observation_profile",
         outcome: result.outcome,
         detail: `subject=${result.subject} ${result.detail}`,
-        startedAt: new Date(),
-        finishedAt: new Date(),
+        ...(result.model !== undefined ? { model: result.model } : {}),
+        ...(result.promptVersion !== undefined ? { promptVersion: result.promptVersion } : {}),
+        ...(result.inputTokens !== undefined ? { inputTokens: result.inputTokens } : {}),
+        ...(result.outputTokens !== undefined ? { outputTokens: result.outputTokens } : {}),
+        ...(result.llmCalls !== undefined ? { llmCalls: result.llmCalls } : {}),
+        startedAt: result.startedAt,
+        finishedAt: result.finishedAt,
       }).catch(() => undefined);
     },
   });
