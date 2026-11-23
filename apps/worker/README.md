@@ -330,7 +330,7 @@ Environment variables (secrets are supplied at runtime, never committed):
 | `WORKER_CHAT_REASONING_EFFORT` | no | — (no reasoning options sent) | Reasoning effort for main chat (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`); when set, chat sends `reasoning: { effort, exclude: true }` and adds effort-scaled reasoning headroom to tier-derived `max_tokens`. Invalid values fail startup. |
 | `WORKER_ARTICLE_MODEL` | no | — (database `article_behavior.model`) | Article LLM model override (reaction generation/review and interest consolidation); takes precedence over the database model without mutating it or changing enablement/other policy. |
 | `WORKER_ARTICLE_REASONING_EFFORT` | no | — (`low` presets) | Reasoning effort applied to every article task preset; invalid values fail startup. |
-| `WORKER_DECISION_MODEL` | yes | — | Model id used for response-pattern, article-share, and optional prompt-module applicability decisions |
+| `WORKER_DECISION_MODEL` | yes | — | Model id (or comma-separated pool of unique model ids) used for response-pattern, article-share, and optional prompt-module applicability decisions. Multiple models are balanced round-robin per call with automatic failover on retryable transport errors (HTTP 429, 408, 5xx, timeout, network, invalid JSON) plus one short backoff pass across the pool. `trace_attempt_decision` retains one row per `(attempt, question)` recording the final attempted/winning model, and intermediate failover hops are logged with sanitized error categories. |
 | `WORKER_API_TOKEN` | yes | — | Bearer credential for the private HTTP API; the web BFF holds the same value as `WEB_WORKER_TOKEN`. No unauthenticated mode exists. |
 | `WORKER_PROMPT_MODULE_SETTINGS_JSON` | no | `{}` | Non-secret named string settings. Credentials take precedence on matching names. |
 | `WORKER_PROMPT_MODULE_CREDENTIALS_JSON` | no | `{}` | Optional JSON object of named string settings; trusted functions receive the map, while HTTP modules read only their explicit setting names. Values are never copied to traces or logs. |
@@ -407,7 +407,7 @@ pnpm --filter @companion/worker migrate
 
 ## Open questions
 
-- Whether transient provider failures should be retried automatically in addition to the explicit owner retry.
+- Whether transient main-chat provider failures should also be retried automatically in addition to the explicit owner retry (decision calls already support multi-model round-robin failover and one backoff retry pass on retryable transport errors).
 - Decision fallback/calibration: thresholds, top-N ranking, behavior for unusable or low-confidence answers.
 - Trace retention: what is kept in the `trace_attempt*` tables and for how long (currently no platform-wide filtering or expiration), and the legacy `conversation_turn.decision` JSONB column's eventual disposition.
 - Whether response patterns and the conversation schema should move to a shared domain home as more of the thread surface needs the same tables.

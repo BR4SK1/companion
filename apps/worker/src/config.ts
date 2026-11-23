@@ -21,7 +21,16 @@ export interface OpenRouterWorkerConfig {
    * legacy behavior: no reasoning options are sent.
    */
   readonly chatReasoningEffort?: ReasoningEffort;
+  /**
+   * Primary (first configured) decision model id. Preserved for single-model
+   * callers; multi-model round-robin and failover consume `decisionModels`.
+   */
   readonly decisionModel: string;
+  /**
+   * Ordered non-empty pool of decision model ids parsed from
+   * `WORKER_DECISION_MODEL` (comma-separated).
+   */
+  readonly decisionModels: readonly [string, ...string[]];
   readonly chatTimeoutMs: number;
   readonly decisionTimeoutMs: number;
 }
@@ -83,6 +92,31 @@ function requireString(
     throw new WorkerConfigError(`missing required environment variable: ${name}`);
   }
   return value;
+}
+
+function parseDecisionModels(
+  env: Record<string, string | undefined>,
+  name: string,
+): readonly [string, ...string[]] {
+  const raw = requireString(env, name);
+  const parts = raw.split(",").map((entry) => entry.trim());
+  const seen = new Set<string>();
+  const models: string[] = [];
+  for (const part of parts) {
+    if (part.length === 0) {
+      throw new WorkerConfigError(
+        `${name} must be a model id or comma-separated list of non-empty model ids: ${raw}`,
+      );
+    }
+    if (seen.has(part)) {
+      throw new WorkerConfigError(
+        `${name} contains duplicate model id ${part}: ${raw}`,
+      );
+    }
+    seen.add(part);
+    models.push(part);
+  }
+  return models as [string, ...string[]];
 }
 
 function optionalUrl(
@@ -228,7 +262,8 @@ export function loadWorkerConfig(
     env,
     "WORKER_CHAT_REASONING_EFFORT",
   );
-  const decisionModel = requireString(env, "WORKER_DECISION_MODEL");
+  const decisionModels = parseDecisionModels(env, "WORKER_DECISION_MODEL");
+  const decisionModel = decisionModels[0];
   // The private HTTP API has no unauthenticated mode: without a configured
   // service credential the worker must fail at startup, not serve openly.
   const apiToken = requireString(env, "WORKER_API_TOKEN");
@@ -246,6 +281,7 @@ export function loadWorkerConfig(
       chatModel,
       ...(chatReasoningEffort !== undefined ? { chatReasoningEffort } : {}),
       decisionModel,
+      decisionModels,
       chatTimeoutMs: optionalNumber(
         env,
         "WORKER_CHAT_TIMEOUT_MS",

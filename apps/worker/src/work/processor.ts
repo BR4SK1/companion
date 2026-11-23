@@ -75,6 +75,10 @@ import {
   DECISION_QUESTION_ID,
   selectResponsePattern,
 } from "./decision.ts";
+import {
+  runWithDecisionModelPool,
+  type DecisionModelPool,
+} from "./decision-pool.ts";
 import { buildChatPrompt } from "./chat.ts";
 import { buildDynamicInitiativePrompt } from "./initiative.ts";
 import { buildRecallQuery } from "../memory/recall.ts";
@@ -156,6 +160,12 @@ interface PromptModuleServices {
 
 export interface TurnProcessorDeps {
   readonly decisionModel: string;
+  /**
+   * Optional multi-model pool supplying round-robin selection and automatic
+   * failover/backoff retry for Decisions API calls. When absent, decisions
+   * run once against `decisionModel`.
+   */
+  readonly decisionModelPool?: DecisionModelPool;
   readonly chatModel: string;
   /**
    * Optional reasoning effort for main chat, from
@@ -531,48 +541,63 @@ export async function processTurnWork(
 
   decisions: if (patterns.length > 0 || articleShareAsked) {
     const state = decisionState(history, work.messages);
-    const baseRequest = patterns.length > 0
-      ? buildPatternChoiceRequest({
-          model: deps.decisionModel,
-          patterns,
-          state,
-        })
-      : {
-          model: deps.decisionModel,
-          state,
-          questions: {} as Record<string, never>,
-        };
     const articleQuestion = articleShareAsked
       ? buildArticleShareQuestion(articleCandidates)
       : undefined;
-    const request: DecisionsRequest = articleQuestion === undefined
-      ? baseRequest
-      : {
-          model: baseRequest.model,
-          state: baseRequest.state,
-          questions: {
-            ...baseRequest.questions,
-            [articleQuestion.questionId]: articleQuestion.question,
-          },
+
+    const decisionCall = await runWithDecisionModelPool({
+      pool: deps.decisionModelPool,
+      fallbackModel: deps.decisionModel,
+      scope: `turn:${work.turn.id}`,
+      log: deps.log,
+      buildRequest: (model) => {
+        const baseRequest = patterns.length > 0
+          ? buildPatternChoiceRequest({
+              model,
+              patterns,
+              state,
+            })
+          : {
+              model,
+              state,
+              questions: {} as Record<string, never>,
+            };
+        const request: DecisionsRequest = articleQuestion === undefined
+          ? baseRequest
+          : {
+              model: baseRequest.model,
+              state: baseRequest.state,
+              questions: {
+                ...baseRequest.questions,
+                [articleQuestion.questionId]: articleQuestion.question,
+              },
+            };
+        // Round-trip the built request through the contract parser so what is
+        // sent is exactly what the contract validates.
+        return {
+          baseRequest,
+          validated: parseDecisionsRequest(request),
         };
-    // Round-trip the built request through the contract parser so what is
-    // sent is exactly what the contract validates.
-    const validated = parseDecisionsRequest(request);
+      },
+      // Decision request boundary: persisted before each provider call, one
+      // row per asked question (the per-(attempt, question) trace). This write
+      // is deliberate, not best-effort: a failure here fails the attempt
+      // rather than calling the provider with an unrecorded request. On
+      // failover the idempotent upsert updates `request_model` to the
+      // currently attempted model.
+      beforeCall: async ({ validated }) => {
+        if (deps.recordDecisionRequest !== undefined) {
+          for (const questionId of Object.keys(validated.questions)) {
+            await deps.recordDecisionRequest({ trace: { questionId, request: validated } });
+          }
+        }
+      },
+      call: ({ validated }) => deps.callDecisions(validated),
+    });
 
-    // Decision request boundary: persisted before the provider call, one row
-    // per asked question (the per-(attempt, question) trace). This write is
-    // deliberate, not best-effort: a failure here fails the attempt rather
-    // than calling the provider with an unrecorded request.
-    if (deps.recordDecisionRequest !== undefined) {
-      for (const questionId of Object.keys(validated.questions)) {
-        await deps.recordDecisionRequest({ trace: { questionId, request: validated } });
-      }
-    }
-
-    let rawResponse: unknown;
-    try {
-      rawResponse = await deps.callDecisions(validated);
-    } catch (error) {
+    const { baseRequest, validated } = decisionCall.request;
+    if (!decisionCall.ok) {
+      const error = decisionCall.error;
       // Transport failure: record the actual error (best-effort — a trace
       // write failure must never mask the original error) and rethrow so the
       // engine records a failed turn.
@@ -598,6 +623,7 @@ export async function processTurnWork(
       }
       throw error;
     }
+    const rawResponse: unknown = decisionCall.response;
 
     let response: DecisionsResponse;
     let invalidArticle = false;
@@ -863,6 +889,9 @@ export async function processTurnWork(
           turnId: work.turn.id,
           leaseOwner: moduleServices.leaseOwner,
           decisionModel: deps.decisionModel,
+          ...(deps.decisionModelPool !== undefined
+            ? { decisionModelPool: deps.decisionModelPool }
+            : {}),
           state: decisionState(history, work.messages),
           modules,
           context: {

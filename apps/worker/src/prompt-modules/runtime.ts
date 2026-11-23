@@ -8,6 +8,10 @@ import {
 } from "@companion/openrouter";
 
 import { buildPromptModuleDecisionRequest, promptModuleDecisionAnswer, selectPromptModule } from "./decision.ts";
+import {
+  runWithDecisionModelPool,
+  type DecisionModelPool,
+} from "../work/decision-pool.ts";
 import type {
   PromptModuleContext,
   PromptModuleDefinition,
@@ -20,6 +24,7 @@ export interface PromptModuleRuntimeDeps {
   readonly turnId: string;
   readonly leaseOwner: string;
   readonly decisionModel: string;
+  readonly decisionModelPool?: DecisionModelPool;
   readonly state: DecisionsState;
   readonly modules: readonly PromptModuleDefinition[];
   readonly context: Omit<PromptModuleContext, "turnId">;
@@ -113,12 +118,24 @@ export async function runPromptModules(
     let response: ReturnType<typeof parseDecisionsExchange> | undefined;
     let failure: PromptModuleDecisionTrace["failureKind"] = null;
     try {
-      request = parseDecisionsRequest(buildPromptModuleDecisionRequest({
-        model: deps.decisionModel,
-        modules: gatedModules,
-        state: deps.state,
-      }));
-      response = parseDecisionsExchange(request, await deps.callDecisions(request));
+      const decisionCall = await runWithDecisionModelPool({
+        pool: deps.decisionModelPool,
+        fallbackModel: deps.decisionModel,
+        scope: `prompt_modules:${deps.turnId}`,
+        log: deps.log,
+        buildRequest: (model) =>
+          parseDecisionsRequest(buildPromptModuleDecisionRequest({
+            model,
+            modules: gatedModules,
+            state: deps.state,
+          })),
+        call: (candidateRequest) => deps.callDecisions(candidateRequest),
+      });
+      request = decisionCall.request;
+      if (!decisionCall.ok) {
+        throw decisionCall.error;
+      }
+      response = parseDecisionsExchange(request, decisionCall.response);
     } catch (error) {
       failure = error instanceof OpenRouterTransportError
         ? "decision_transport"
