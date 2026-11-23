@@ -265,16 +265,21 @@ function validateSnapshot(snapshot: Snapshot): string[] {
       m["http_request_max_bytes"],
       m["http_response_max_bytes"],
     ];
-    const otherHttp = [
+    const requestFields = [
       m["http_turn_id_field"],
       m["http_local_datetime_field"],
+      m["http_engagement_state_field"],
       m["http_previous_assistant_field"],
       m["http_user_message_field"],
       m["http_prior_conversation_field"],
     ];
+    const publishedKeyField = m["http_published_routine_message_key_field"];
+    const holdField = m["http_unavailable_until_field"];
+    const revisionField = m["http_availability_revision_field"];
     if (mode === "function") {
       if (!nonNullText(fn)) errors.push(`${ctx} function_definition must be non-empty for function modules`);
-      const stray = [endpoint, scopeSetting, scopeField, responseField, ...otherHttp, ...httpNums];
+      const stray = [endpoint, scopeSetting, scopeField, responseField, ...requestFields,
+        publishedKeyField, holdField, revisionField, ...httpNums];
       if (stray.some((v) => v !== null && v !== undefined)) {
         errors.push(`${ctx} http_post fields must be null for function modules`);
       }
@@ -295,6 +300,26 @@ function validateSnapshot(snapshot: Snapshot): string[] {
       if (scopeSetting !== null && scopeSetting !== undefined && scopeSetting === endpoint) {
         errors.push(`${ctx} http_scope_setting must differ from http_endpoint_setting`);
       }
+      if (holdField !== null && holdField !== undefined && holdField === responseField) {
+        errors.push(`${ctx} http_unavailable_until_field must differ from http_response_text_field`);
+      }
+      if (nonNullText(publishedKeyField) && [scopeField, ...requestFields].includes(publishedKeyField)) {
+        errors.push(`${ctx} http_published_routine_message_key_field must differ from other request fields`);
+      }
+      if (nonNullText(revisionField) &&
+          (!nonNullText(holdField) || revisionField === holdField || revisionField === responseField)) {
+        errors.push(`${ctx} http_availability_revision_field requires a distinct configured hold field and response text field`);
+      }
+    }
+  }
+
+  // routine_external_provider: scope_setting must differ from endpoint_setting.
+  const externalRoutine = one("routine_external_provider");
+  if (externalRoutine !== undefined) {
+    const ep = externalRoutine["endpoint_setting"];
+    const sc = externalRoutine["scope_setting"];
+    if (sc !== null && sc !== undefined && sc === ep) {
+      errors.push("routine_external_provider.scope_setting must differ from endpoint_setting");
     }
   }
 

@@ -45,6 +45,10 @@ import { renderRelationshipContext } from "./relationship/runtime.ts";
 import { createRoutineStore } from "./routine/store.ts";
 import { renderRoutineContext } from "./routine/runtime.ts";
 import { startRoutineRuntime } from "./routine/runtime-loop.ts";
+import {
+  EXTERNAL_ROUTINE_HOLD_KEY,
+  runExternalRoutineTick,
+} from "./routine/external.ts";
 import { loadMemoryConfig } from "./memory/config.ts";
 import { createMemoryLlmCaller, taskPresets } from "./memory/llm.ts";
 import { startArticleRuntime } from "./articles/runner.ts";
@@ -249,6 +253,53 @@ async function main(): Promise<void> {
             };
           },
         }),
+      tickExternal: async () => {
+        const outcome = await runExternalRoutineTick({
+          loadProvider: () => routineStore.loadExternalProvider(),
+          credentials: config.promptModuleCredentials,
+          timezone: temporalSettings.timezone,
+          ...(engagementStore !== undefined
+            ? {
+                loadEngagementState: (now) =>
+                  engagementStore.getSummary(now).then((summary) => summary.state),
+              }
+            : {}),
+          hasQueuedUserMessages: () =>
+            store.getThreadStatus().then((status) => status.queuedUserMessages > 0),
+          applyAvailabilityHold: (unavailableUntil, revision) =>
+            routineStore.setAvailabilityHold(EXTERNAL_ROUTINE_HOLD_KEY, unavailableUntil, revision),
+          publishAssistantMessage: (message, revision) =>
+            store.publishScheduledAssistantMessage({
+              skipIfUserMessagesQueued: true,
+              prepare: async (client) => {
+                if (revision !== undefined && !(await routineStore.lockCurrentAvailabilityRevision(
+                  client,
+                  EXTERNAL_ROUTINE_HOLD_KEY,
+                  revision,
+                ))) return null;
+                if (await routineStore.hasPublishedExternalMessage(client, message.clientKey)) {
+                  return null;
+                }
+                return {
+                  content: message.content,
+                  validUntil: null,
+                  cancel: async () => {},
+                  recordPublication: (transaction, messageId, publishedAt) =>
+                    routineStore.recordExternalMessagePublication(
+                      transaction,
+                      message.clientKey,
+                      messageId,
+                      publishedAt,
+                    ),
+                };
+              },
+            }),
+          log: (message) => console.log(message),
+        });
+        if (outcome.status === "failed") {
+          console.warn(`[ROUTINE] external tick failed reason=${outcome.reason}`);
+        }
+      },
       log: (message) => console.log(message),
     });
 
@@ -736,6 +787,21 @@ async function main(): Promise<void> {
               const snapshot = await provisionedRoutineStore.getSnapshot(referenceTime);
               return snapshot === null ? null : renderRoutineContext(snapshot);
             },
+            ...(engagementStore !== undefined
+              ? {
+                  loadEngagementState: (referenceTime) =>
+                    engagementStore
+                      .getSummary(referenceTime)
+                      .then((summary) => summary.state),
+                }
+              : {}),
+            loadPublishedRoutineMessageKey: provisionedRoutineStore.loadPublishedMessageKeyBeforeTurn,
+            applyAvailabilityHold: ({ unavailableUntil, availabilityRevision }) =>
+              provisionedRoutineStore.setAvailabilityHold(
+                EXTERNAL_ROUTINE_HOLD_KEY,
+                unavailableUntil,
+                availabilityRevision,
+              ),
             ...(articleRuntime !== undefined
               ? {
                   loadArticleShareCandidates: (input: {

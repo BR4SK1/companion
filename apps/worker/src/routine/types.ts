@@ -51,3 +51,21 @@ export interface RoutineSnapshot {
   readonly applied: RoutineAppliedState | null;
   readonly next: RoutineOccurrence;
 }
+
+export interface RoutineExternalProviderConfig {
+  readonly enabled: boolean;
+  readonly endpointSetting: string;
+  readonly scopeSetting: string | null;
+  readonly timeoutMs: number;
+}
+
+export interface RoutineExternalAssistantMessage {
+  readonly clientKey: string;
+  readonly content: string;
+}
+
+export interface RoutineExternalTickResponse {
+  readonly unavailableUntil?: Date | null;
+  readonly availabilityRevision?: number;
+  readonly assistantMessage?: RoutineExternalAssistantMessage | null;
+}

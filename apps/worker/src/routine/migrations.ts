@@ -146,9 +146,56 @@ const ADD_ROUTINE_CHAT_CHUNK = `
     CHECK (chunk IN ('identity', 'profiles', 'temporal', 'recall', 'article', 'relationship', 'routine', 'guidance', 'conversation'));
 `;
 
+const ADD_ROUTINE_EXTERNAL_PROVIDER = `
+-- Optional external HTTP routine/schedule provider, independent of the built-in
+-- weekly routine_settings / routine_transition tables. No URLs or secrets are
+-- stored here; endpoint_setting and scope_setting name entries in the worker's
+-- configured module settings map.
+CREATE TABLE routine_external_provider (
+  id boolean PRIMARY KEY DEFAULT true CHECK (id),
+  enabled boolean NOT NULL DEFAULT false,
+  endpoint_setting text NOT NULL
+    CHECK (endpoint_setting ~ '^[A-Za-z][A-Za-z0-9_.-]{0,63}$'),
+  scope_setting text
+    CHECK (scope_setting IS NULL OR scope_setting ~ '^[A-Za-z][A-Za-z0-9_.-]{0,63}$'),
+  timeout_ms integer NOT NULL DEFAULT 5000
+    CHECK (timeout_ms BETWEEN 1 AND 30000),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (scope_setting IS NULL OR scope_setting <> endpoint_setting)
+);
+
+-- Durable temporary availability holds checked by turn admission. Keyed by
+-- source so external ticks and per-turn modules can set or clear holds cleanly.
+CREATE TABLE routine_availability_hold (
+  source_key text PRIMARY KEY
+    CHECK (length(btrim(source_key)) > 0 AND length(source_key) <= 128),
+  unavailable_until timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Durable idempotency ledger for assistant messages published by an external
+-- routine provider tick, committed atomically with the conversation_message row.
+CREATE TABLE routine_external_message (
+  client_key text PRIMARY KEY
+    CHECK (length(btrim(client_key)) > 0 AND length(client_key) <= 128),
+  message_id uuid NOT NULL UNIQUE REFERENCES conversation_message (id),
+  published_at timestamptz NOT NULL DEFAULT now()
+);
+`;
+
+const ORDER_ROUTINE_AVAILABILITY_HOLDS = `
+ALTER TABLE routine_availability_hold
+  ALTER COLUMN unavailable_until DROP NOT NULL,
+  ADD COLUMN revision bigint CHECK (revision BETWEEN 1 AND 9007199254740991),
+  ADD CONSTRAINT routine_availability_hold_deadline_or_revision_check
+    CHECK (unavailable_until IS NOT NULL OR revision IS NOT NULL);
+`;
+
 export const routineMigrations: readonly Migration[] = [
   { id: "0012_routine_schedule", sql: ROUTINE_SCHEMA },
   { id: "0013_routine_chat_chunk", sql: ADD_ROUTINE_CHAT_CHUNK },
   { id: "0014_routine_announcement", sql: CREATE_ROUTINE_ANNOUNCEMENT },
   { id: "0015_routine_announcement_period_id", sql: UPGRADE_ROUTINE_ANNOUNCEMENT_PERIOD_ID },
+  { id: "0026_routine_external_provider", sql: ADD_ROUTINE_EXTERNAL_PROVIDER },
+  { id: "0028_routine_hold_revision", sql: ORDER_ROUTINE_AVAILABILITY_HOLDS },
 ];

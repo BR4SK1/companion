@@ -366,9 +366,108 @@ ALTER TABLE prompt_module
   );
 `;
 
+const PROMPT_MODULE_ENGAGEMENT_AND_HOLD = `
+ALTER TABLE prompt_module
+  ADD COLUMN http_engagement_state_field text
+    CHECK (http_engagement_state_field IS NULL OR http_engagement_state_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD COLUMN http_unavailable_until_field text
+    CHECK (http_unavailable_until_field IS NULL OR http_unavailable_until_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$');
+
+ALTER TABLE prompt_module
+  DROP CONSTRAINT prompt_module_execution_config_shape;
+
+ALTER TABLE prompt_module
+  ADD CONSTRAINT prompt_module_execution_config_shape CHECK (
+    (
+      execution_mode = 'function'
+      AND function_definition IS NOT NULL
+      AND length(btrim(function_definition)) > 0
+      AND length(function_definition) <= 131072
+      AND http_endpoint_setting IS NULL
+      AND http_scope_setting IS NULL
+      AND http_scope_field IS NULL
+      AND http_turn_id_field IS NULL
+      AND http_local_datetime_field IS NULL
+      AND http_engagement_state_field IS NULL
+      AND http_previous_assistant_field IS NULL
+      AND http_user_message_field IS NULL
+      AND http_prior_conversation_field IS NULL
+      AND http_response_text_field IS NULL
+      AND http_unavailable_until_field IS NULL
+      AND http_field_max_bytes IS NULL
+      AND http_prior_message_limit IS NULL
+      AND http_request_max_bytes IS NULL
+      AND http_response_max_bytes IS NULL
+    ) OR (
+      execution_mode = 'http_post'
+      AND function_definition IS NULL
+      AND http_endpoint_setting IS NOT NULL
+      AND (
+        (http_scope_setting IS NULL AND http_scope_field IS NULL) OR
+        (http_scope_setting IS NOT NULL AND http_scope_field IS NOT NULL
+          AND http_scope_setting <> http_endpoint_setting)
+      )
+      AND http_response_text_field IS NOT NULL
+      AND (http_unavailable_until_field IS NULL OR http_unavailable_until_field <> http_response_text_field)
+      AND http_field_max_bytes IS NOT NULL
+      AND http_prior_message_limit IS NOT NULL
+      AND http_request_max_bytes IS NOT NULL
+      AND http_response_max_bytes IS NOT NULL
+      AND (http_scope_field IS NULL OR http_turn_id_field IS NULL OR http_scope_field <> http_turn_id_field)
+      AND (http_scope_field IS NULL OR http_local_datetime_field IS NULL OR http_scope_field <> http_local_datetime_field)
+      AND (http_scope_field IS NULL OR http_engagement_state_field IS NULL OR http_scope_field <> http_engagement_state_field)
+      AND (http_scope_field IS NULL OR http_previous_assistant_field IS NULL OR http_scope_field <> http_previous_assistant_field)
+      AND (http_scope_field IS NULL OR http_user_message_field IS NULL OR http_scope_field <> http_user_message_field)
+      AND (http_scope_field IS NULL OR http_prior_conversation_field IS NULL OR http_scope_field <> http_prior_conversation_field)
+      AND (http_turn_id_field IS NULL OR http_local_datetime_field IS NULL OR http_turn_id_field <> http_local_datetime_field)
+      AND (http_turn_id_field IS NULL OR http_engagement_state_field IS NULL OR http_turn_id_field <> http_engagement_state_field)
+      AND (http_turn_id_field IS NULL OR http_previous_assistant_field IS NULL OR http_turn_id_field <> http_previous_assistant_field)
+      AND (http_turn_id_field IS NULL OR http_user_message_field IS NULL OR http_turn_id_field <> http_user_message_field)
+      AND (http_turn_id_field IS NULL OR http_prior_conversation_field IS NULL OR http_turn_id_field <> http_prior_conversation_field)
+      AND (http_local_datetime_field IS NULL OR http_engagement_state_field IS NULL OR http_local_datetime_field <> http_engagement_state_field)
+      AND (http_local_datetime_field IS NULL OR http_previous_assistant_field IS NULL OR http_local_datetime_field <> http_previous_assistant_field)
+      AND (http_local_datetime_field IS NULL OR http_user_message_field IS NULL OR http_local_datetime_field <> http_user_message_field)
+      AND (http_local_datetime_field IS NULL OR http_prior_conversation_field IS NULL OR http_local_datetime_field <> http_prior_conversation_field)
+      AND (http_engagement_state_field IS NULL OR http_previous_assistant_field IS NULL OR http_engagement_state_field <> http_previous_assistant_field)
+      AND (http_engagement_state_field IS NULL OR http_user_message_field IS NULL OR http_engagement_state_field <> http_user_message_field)
+      AND (http_engagement_state_field IS NULL OR http_prior_conversation_field IS NULL OR http_engagement_state_field <> http_prior_conversation_field)
+      AND (http_previous_assistant_field IS NULL OR http_user_message_field IS NULL OR http_previous_assistant_field <> http_user_message_field)
+      AND (http_previous_assistant_field IS NULL OR http_prior_conversation_field IS NULL OR http_previous_assistant_field <> http_prior_conversation_field)
+      AND (http_user_message_field IS NULL OR http_prior_conversation_field IS NULL OR http_user_message_field <> http_prior_conversation_field)
+    )
+  );
+`;
+
+const PROMPT_MODULE_ROUTINE_METADATA = `
+ALTER TABLE prompt_module
+  ADD COLUMN http_published_routine_message_key_field text
+    CHECK (http_published_routine_message_key_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD COLUMN http_availability_revision_field text
+    CHECK (http_availability_revision_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD CONSTRAINT prompt_module_published_routine_message_key_field_check CHECK (
+    http_published_routine_message_key_field IS NULL OR (
+      execution_mode = 'http_post'
+      AND NOT (http_published_routine_message_key_field = ANY (array_remove(ARRAY[
+        http_scope_field, http_turn_id_field, http_local_datetime_field, http_engagement_state_field,
+        http_previous_assistant_field, http_user_message_field, http_prior_conversation_field
+      ], NULL)))
+    )
+  ),
+  ADD CONSTRAINT prompt_module_availability_revision_field_check CHECK (
+    http_availability_revision_field IS NULL OR (
+      execution_mode = 'http_post'
+      AND http_unavailable_until_field IS NOT NULL
+      AND http_availability_revision_field <> http_unavailable_until_field
+      AND http_availability_revision_field <> http_response_text_field
+    )
+  );
+`;
+
 export const promptModuleMigrations: readonly Migration[] = [
   { id: "0018_generic_prompt_modules", sql: PROMPT_MODULE_SCHEMA },
   { id: "0019_prompt_module_chat_attribution", sql: PROMPT_MODULE_CHAT_ATTRIBUTION },
   { id: "0022_prompt_module_activation_modes", sql: PROMPT_MODULE_ACTIVATION_MODES },
   { id: "0023_prompt_module_http_post", sql: PROMPT_MODULE_HTTP_POST },
+  { id: "0027_prompt_module_engagement_and_hold", sql: PROMPT_MODULE_ENGAGEMENT_AND_HOLD },
+  { id: "0029_prompt_module_routine_metadata", sql: PROMPT_MODULE_ROUTINE_METADATA },
 ];

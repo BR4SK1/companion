@@ -60,10 +60,14 @@ interface PromptModuleRow {
   readonly http_scope_field: string | null;
   readonly http_turn_id_field: string | null;
   readonly http_local_datetime_field: string | null;
+  readonly http_engagement_state_field?: string | null;
+  readonly http_published_routine_message_key_field?: string | null;
   readonly http_previous_assistant_field: string | null;
   readonly http_user_message_field: string | null;
   readonly http_prior_conversation_field: string | null;
   readonly http_response_text_field: string | null;
+  readonly http_unavailable_until_field?: string | null;
+  readonly http_availability_revision_field?: string | null;
   readonly http_field_max_bytes: number | null;
   readonly http_prior_message_limit: number | null;
   readonly http_request_max_bytes: number | null;
@@ -73,6 +77,15 @@ interface PromptModuleRow {
   readonly position: number;
   readonly activation_mode: PromptModuleDefinition["activationMode"];
   readonly output_kind: PromptModuleDefinition["outputKind"];
+}
+
+function routineHttpFields(row: PromptModuleRow) {
+  const publishedRoutineMessageKeyField = row.http_published_routine_message_key_field;
+  const availabilityRevisionField = row.http_availability_revision_field;
+  return {
+    ...(publishedRoutineMessageKeyField != null ? { publishedRoutineMessageKeyField } : {}),
+    ...(availabilityRevisionField != null ? { availabilityRevisionField } : {}),
+  };
 }
 
 function httpConfigFromRow(row: PromptModuleRow): PromptModuleHttpPostConfig | null {
@@ -91,10 +104,13 @@ function httpConfigFromRow(row: PromptModuleRow): PromptModuleHttpPostConfig | n
     scopeField: row.http_scope_field,
     turnIdField: row.http_turn_id_field,
     localDateTimeField: row.http_local_datetime_field,
+    engagementStateField: row.http_engagement_state_field ?? null,
     previousAssistantResponseField: row.http_previous_assistant_field,
     userMessageField: row.http_user_message_field,
     priorConversationField: row.http_prior_conversation_field,
     responseTextField: row.http_response_text_field!,
+    unavailableUntilField: row.http_unavailable_until_field ?? null,
+    ...routineHttpFields(row),
     fieldMaxBytes: row.http_field_max_bytes!,
     priorMessageLimit: row.http_prior_message_limit!,
     requestMaxBytes: row.http_request_max_bytes!,
@@ -114,10 +130,13 @@ function definitionFingerprint(
         scopeField: row.http_scope_field,
         turnIdField: row.http_turn_id_field,
         localDateTimeField: row.http_local_datetime_field,
+        engagementStateField: row.http_engagement_state_field ?? null,
         previousAssistantResponseField: row.http_previous_assistant_field,
         userMessageField: row.http_user_message_field,
         priorConversationField: row.http_prior_conversation_field,
         responseTextField: row.http_response_text_field,
+        unavailableUntilField: row.http_unavailable_until_field ?? null,
+        ...routineHttpFields(row),
         fieldMaxBytes: row.http_field_max_bytes,
         priorMessageLimit: row.http_prior_message_limit,
         requestMaxBytes: row.http_request_max_bytes,
@@ -149,8 +168,10 @@ export function createPromptModuleStore(pool: PostgresPool): PromptModuleStore {
       `SELECT id, module_key, decision_description, function_definition,
               execution_mode, http_endpoint_setting, http_scope_setting,
               http_scope_field, http_turn_id_field, http_local_datetime_field,
+              http_engagement_state_field, http_published_routine_message_key_field,
               http_previous_assistant_field, http_user_message_field,
               http_prior_conversation_field, http_response_text_field,
+              http_unavailable_until_field, http_availability_revision_field,
               http_field_max_bytes, http_prior_message_limit,
               http_request_max_bytes, http_response_max_bytes,
               fallback_content, timeout_ms, position, activation_mode, output_kind

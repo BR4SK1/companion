@@ -10,6 +10,8 @@ import type {
 const SETTING_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;
 const JSON_FIELD_NAME = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const LOCAL_DATE_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?[+-]\d{2}:\d{2}$/;
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+const ENGAGEMENT_STATES = new Set(["engaged", "lull", "idle", "gone"]);
 const MAX_ENDPOINT_BYTES = 4096;
 const MAX_OUTPUT_CHARACTERS = 16_000;
 
@@ -21,10 +23,19 @@ function result(
   startedAt: number,
   kind: PromptModuleRunResult["kind"],
   content?: string,
+  unavailableUntil?: Date | null,
+  availabilityRevision?: number,
 ): PromptModuleRunResult {
-  return kind === "succeeded"
-    ? { kind, content: content!, durationMs: durationMs(startedAt) }
-    : { kind, durationMs: durationMs(startedAt) };
+  if (kind === "succeeded") {
+    return {
+      kind,
+      content: content!,
+      durationMs: durationMs(startedAt),
+      ...(unavailableUntil !== undefined ? { unavailableUntil } : {}),
+      ...(availabilityRevision !== undefined ? { availabilityRevision } : {}),
+    };
+  }
+  return { kind, durationMs: durationMs(startedAt) };
 }
 
 function integerInRange(value: number, minimum: number, maximum: number): boolean {
@@ -47,10 +58,15 @@ function validConfig(config: PromptModuleHttpPostConfig): boolean {
       (!isSettingName(config.scopeSetting) || config.scopeSetting === config.endpointSetting))
   ) return false;
 
+  const engagementStateField = config.engagementStateField ?? null;
+  const unavailableUntilField = config.unavailableUntilField ?? null;
+  const availabilityRevisionField = config.availabilityRevisionField ?? null;
   const optionalRequestFields = [
     config.scopeField,
     config.turnIdField,
     config.localDateTimeField,
+    engagementStateField,
+    config.publishedRoutineMessageKeyField ?? null,
     config.previousAssistantResponseField,
     config.userMessageField,
     config.priorConversationField,
@@ -58,6 +74,13 @@ function validConfig(config: PromptModuleHttpPostConfig): boolean {
   if (
     !optionalRequestFields.every((field) => field === null || isJsonFieldName(field)) ||
     !isJsonFieldName(config.responseTextField) ||
+    (unavailableUntilField !== null &&
+      (!isJsonFieldName(unavailableUntilField) || unavailableUntilField === config.responseTextField)) ||
+    (availabilityRevisionField !== null &&
+      (!isJsonFieldName(availabilityRevisionField) ||
+        unavailableUntilField === null ||
+        availabilityRevisionField === unavailableUntilField ||
+        availabilityRevisionField === config.responseTextField)) ||
     !integerInRange(config.fieldMaxBytes, 1, 262_144) ||
     !integerInRange(config.priorMessageLimit, 0, 200) ||
     !integerInRange(config.requestMaxBytes, 128, 1_048_576) ||
@@ -195,6 +218,24 @@ export async function executeHttpPromptModule(input: {
     ) return result(startedAt, "invalid_result");
     body[config.localDateTimeField] = localDateTime;
   }
+  const engagementStateField = config.engagementStateField ?? null;
+  if (engagementStateField !== null) {
+    const engagementState = context.engagementState ?? null;
+    if (
+      engagementState !== null &&
+      (typeof engagementState !== "string" || !ENGAGEMENT_STATES.has(engagementState))
+    ) return result(startedAt, "invalid_result");
+    body[engagementStateField] = engagementState;
+  }
+  const publishedRoutineMessageKeyField = config.publishedRoutineMessageKeyField ?? null;
+  if (publishedRoutineMessageKeyField !== null) {
+    const key = context.publishedRoutineMessageKey ?? null;
+    if (key !== null && (typeof key !== "string" || key.trim().length === 0 ||
+        key.length > 128 || byteLength(key) > config.fieldMaxBytes)) {
+      return result(startedAt, "invalid_result");
+    }
+    body[publishedRoutineMessageKeyField] = key;
+  }
   if (config.previousAssistantResponseField !== null) {
     const previousAssistantResponse = context.previousAssistantResponse;
     if (
@@ -291,7 +332,36 @@ export async function executeHttpPromptModule(input: {
       content.length > MAX_OUTPUT_CHARACTERS ||
       byteLength(content) > config.responseMaxBytes
     ) return result(startedAt, "invalid_result");
-    return result(startedAt, "succeeded", content);
+    const unavailableUntilField = config.unavailableUntilField ?? null;
+    let unavailableUntil: Date | null | undefined;
+    if (
+      unavailableUntilField !== null &&
+      Object.hasOwn(parsed, unavailableUntilField)
+    ) {
+      const rawHold = (parsed as Record<string, unknown>)[unavailableUntilField];
+      if (rawHold === null) {
+        unavailableUntil = null;
+      } else if (
+        typeof rawHold === "string" &&
+        ISO_TIMESTAMP.test(rawHold) &&
+        Number.isFinite(Date.parse(rawHold))
+      ) {
+        unavailableUntil = new Date(rawHold);
+      } else {
+        return result(startedAt, "invalid_result");
+      }
+    }
+    const revisionField = config.availabilityRevisionField ?? null;
+    let availabilityRevision: number | undefined;
+    if (revisionField !== null && Object.hasOwn(parsed, revisionField)) {
+      const rawRevision = (parsed as Record<string, unknown>)[revisionField];
+      if (unavailableUntil === undefined || typeof rawRevision !== "number" ||
+          !integerInRange(rawRevision, 1, Number.MAX_SAFE_INTEGER)) {
+        return result(startedAt, "invalid_result");
+      }
+      availabilityRevision = rawRevision;
+    }
+    return result(startedAt, "succeeded", content, unavailableUntil, availabilityRevision);
   } catch {
     return result(startedAt, timedOut ? "timed_out" : "failed");
   } finally {

@@ -537,6 +537,7 @@ export interface ConversationStore {
   publishReply(params: PublishReplyParams): Promise<PublishOutcome>;
   /** Publish one scheduled assistant-only message and its domain event atomically. */
   publishScheduledAssistantMessage(params: {
+    readonly skipIfUserMessagesQueued?: boolean;
     readonly prepare: (
       client: PostgresPoolClient,
     ) => Promise<PreparedAssistantMessage | null>;
@@ -1638,6 +1639,7 @@ export function createConversationStore(
   }
 
   async function publishScheduledAssistantMessage(params: {
+    readonly skipIfUserMessagesQueued?: boolean;
     readonly prepare: (
       client: PostgresPoolClient,
     ) => Promise<PreparedAssistantMessage | null>;
@@ -1653,6 +1655,14 @@ export function createConversationStore(
         `SELECT 1 FROM conversation_turn WHERE status = 'in_flight' LIMIT 1`,
       );
       if (active.rows.length > 0) return false;
+
+      if (params.skipIfUserMessagesQueued === true) {
+        const queued = await client.query(
+          `SELECT 1 FROM conversation_message
+           WHERE role = 'user' AND turn_id IS NULL LIMIT 1`,
+        );
+        if (queued.rows.length > 0) return false;
+      }
 
       // Acquire the message-table write lock before preparing and sampling the
       // final publication time, so a DDL lock wait cannot carry a stale notice

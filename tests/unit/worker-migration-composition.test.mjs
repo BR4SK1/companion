@@ -28,6 +28,8 @@ test("worker startup and migration-only command share the complete ordered schem
       "0013_routine_chat_chunk",
       "0014_routine_announcement",
       "0015_routine_announcement_period_id",
+      "0026_routine_external_provider",
+      "0028_routine_hold_revision",
       "0016_authoritative_temporal_context",
       "0017_trace_attempt_temporal_context",
       "0020_companion_time_day_start_hour",
@@ -35,6 +37,8 @@ test("worker startup and migration-only command share the complete ordered schem
       "0019_prompt_module_chat_attribution",
       "0022_prompt_module_activation_modes",
       "0023_prompt_module_http_post",
+      "0027_prompt_module_engagement_and_hold",
+      "0029_prompt_module_routine_metadata",
       "0025_time_chat_chunk",
     ],
   );
