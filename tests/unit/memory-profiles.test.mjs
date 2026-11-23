@@ -18,7 +18,6 @@ import {
   buildObservationProfileResponseFormat,
   parseProfileV2Output,
   profileObservationHandle,
-  trimProfileContent,
   MemoryLlmOutputError,
 } from "../../apps/worker/src/memory/prompts.ts";
 import {
@@ -553,13 +552,13 @@ describe("observation profile fingerprint", () => {
 });
 
 describe("observation profile v2 schema, handles, and parser hardening", () => {
-  it("enforces strict json_schema with bounded content length", () => {
+  it("enforces strict json_schema without imposing an arbitrary character cap on profile content", () => {
     const format = buildObservationProfileResponseFormat();
     assert.equal(format.type, "json_schema");
     assert.equal(format.json_schema.strict, true);
     assert.equal(format.json_schema.schema.additionalProperties, false);
     assert.equal(format.json_schema.schema.properties.content.minLength, 1);
-    assert.equal(format.json_schema.schema.properties.content.maxLength, 4000);
+    assert.equal("maxLength" in format.json_schema.schema.properties.content, false);
     assert.equal(format.json_schema.schema.properties.claims.items.properties.text.maxLength, 400);
   });
 
@@ -584,7 +583,6 @@ describe("observation profile v2 schema, handles, and parser hardening", () => {
       }),
       observations,
     );
-    assert.equal(parsed.contentTrimmed, false);
     assert.equal(parsed.droppedClaims, 1);
     assert.deepEqual(parsed.claims, [
       { observationId: "memory-observation-v1-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", text: "Likes mornings" },
@@ -603,33 +601,20 @@ describe("observation profile v2 schema, handles, and parser hardening", () => {
     assert.equal(parsed.claims[0].observationId, "obs-1");
   });
 
-  it("trims oversized profile prose cleanly at a bullet boundary without orphan headings", () => {
-    const bulletA = "- First durable bullet describing preferences in detail.";
-    const bulletB = "- Second durable bullet describing habits in detail.";
-    const longText = [
-      "## Preferences & Tastes",
-      bulletA,
-      bulletB,
+  it("preserves full-length multi-section profiles without character-count truncation", () => {
+    const longProfile = [
+      "## Life & Background",
+      ...Array.from({ length: 80 }, (_, idx) => `- Detail ${String(idx + 1)}: ${"word ".repeat(15).trim()}.`),
       "",
-      "## Trailing Heading",
-      "- " + "x".repeat(200),
+      "## Dynamics & How I Feel",
+      "- I feel genuinely comfortable and heard in our conversations.",
     ].join("\n");
-    const budget = "## Preferences & Tastes\n".length + bulletA.length + 1 + bulletB.length + "\n\n## Trailing Heading\n".length + 5;
-    const trimmed = trimProfileContent(longText, budget);
-    assert.equal(trimmed.trimmed, true);
-    assert.equal(trimmed.content.length <= budget, true);
-    assert.equal(trimmed.content.includes("## Trailing Heading"), false);
-    assert.ok(trimmed.content.endsWith(bulletB));
-
-    // Also bounds over-4,000-char parser output instead of throwing.
-    const huge = Array.from({ length: 80 }, (_, idx) => `- Bullet ${String(idx + 1)}: ${"word ".repeat(12).trim()}.`).join("\n");
+    assert.ok(longProfile.length > 4500);
     const parsed = parseProfileV2Output(
-      JSON.stringify({ content: huge, claims: [{ observationId: "O1", text: "Likes mornings" }] }),
+      JSON.stringify({ content: longProfile, claims: [{ observationId: "O1", text: "Likes mornings" }] }),
       [observation()],
     );
-    assert.equal(parsed.contentTrimmed, true);
-    assert.ok(parsed.content.length <= 4000);
-    assert.ok(parsed.content.length > 2500);
+    assert.equal(parsed.content, longProfile);
   });
 
   it("attaches closed-set validation reasons on genuine output errors", () => {

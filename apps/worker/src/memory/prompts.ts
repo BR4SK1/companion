@@ -752,8 +752,6 @@ export function parseProfileV1Output(text: string): ProfileV1Output {
 // Observation profiles (v2, from canonical observations)
 // ---------------------------------------------------------------------------
 
-const MAX_PROFILE_CONTENT_CHARS = 4000;
-
 /** Compact prompt-local observation handle (`O1`, `O2`, ...) mapped back to canonical IDs. */
 export function profileObservationHandle(index: number): string {
   return `O${String(index + 1)}`;
@@ -771,7 +769,6 @@ export function buildObservationProfileResponseFormat() {
           content: {
             type: "string",
             minLength: 1,
-            maxLength: MAX_PROFILE_CONTENT_CHARS,
           },
           claims: {
             type: "array",
@@ -826,43 +823,9 @@ export function buildObservationProfilePrompt(
   };
 }
 
-/**
- * Bound profile prose to `maxChars` without failing a completed response.
- * Prefers trimming at a clean line/bullet boundary (stripping any trailing
- * orphan Markdown headings) and falls back to sentence-boundary trimming.
- */
-export function trimProfileContent(
-  text: string,
-  maxChars: number = MAX_PROFILE_CONTENT_CHARS,
-): { readonly content: string; readonly trimmed: boolean } {
-  if (text.length <= maxChars) {
-    return { content: text, trimmed: false };
-  }
-  const candidate = text.slice(0, maxChars + 1);
-  const lastNewline = candidate.lastIndexOf("\n");
-  if (lastNewline >= Math.floor(maxChars * 0.55)) {
-    const lines = candidate.slice(0, lastNewline).trimEnd().split("\n");
-    while (lines.length > 0 && /^#{1,6}\s/.test(lines[lines.length - 1]!.trim())) {
-      lines.pop();
-      while (lines.length > 0 && lines[lines.length - 1]!.trim().length === 0) {
-        lines.pop();
-      }
-    }
-    const lineTrimmed = lines.join("\n").trim();
-    if (lineTrimmed.length > 0) {
-      return { content: lineTrimmed, trimmed: true };
-    }
-  }
-  return {
-    content: trimAtSentenceBoundary(text, maxChars),
-    trimmed: true,
-  };
-}
-
 export interface ParsedProfileV2 {
   readonly content: string;
   readonly claims: ReadonlyArray<{ observationId: string; text: string }>;
-  readonly contentTrimmed: boolean;
   readonly droppedClaims: number;
 }
 
@@ -877,17 +840,13 @@ export function parseProfileV2Output(
       "missing_content",
     );
   }
-  const rawContent = parsed.content.trim();
-  if (!rawContent) {
+  const content = parsed.content.trim();
+  if (!content) {
     throw new MemoryLlmOutputError(
       "Profile content was empty",
       "empty_content",
     );
   }
-  const { content, trimmed: contentTrimmed } = trimProfileContent(
-    rawContent,
-    MAX_PROFILE_CONTENT_CHARS,
-  );
   const handleToId = new Map<string, string>();
   const knownIds = new Set<string>();
   for (const [index, observation] of observations.entries()) {
@@ -911,7 +870,7 @@ export function parseProfileV2Output(
       claims.push({ observationId: resolvedId, text: claimText.slice(0, 400) });
     }
   }
-  return { content, claims, contentTrimmed, droppedClaims };
+  return { content, claims, droppedClaims };
 }
 
 // ---------------------------------------------------------------------------

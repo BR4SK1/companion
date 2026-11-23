@@ -50,8 +50,6 @@ export interface ProfileGenerateSummary {
   readonly sourceCount: number;
   /** Number of older active observations omitted to fit `profileMaxSourceChars`. */
   readonly trimmedCount?: number;
-  /** True when the generated profile prose was bounded to the max character limit. */
-  readonly contentTrimmed?: boolean;
   /** Count of unrecognized claim IDs ignored while retaining valid provenance. */
   readonly droppedClaims?: number;
   readonly model?: string;
@@ -595,7 +593,6 @@ export async function generateProfileIfNeeded(
     inputTokens: result.inputTokens,
     outputTokens: result.outputTokens,
     llmCalls: result.attemptCount,
-    ...(parsed.contentTrimmed ? { contentTrimmed: true } : {}),
     ...(parsed.droppedClaims > 0 ? { droppedClaims: parsed.droppedClaims } : {}),
   };
   if (saved === "stale") {

@@ -39,7 +39,6 @@ export const MEMORY_LLM_OUTPUT_REASONS = [
   "not_object",
   "missing_content",
   "empty_content",
-  "content_too_long",
   "unknown_observation_id",
   "schema_mismatch",
   "attribution_invalid",
