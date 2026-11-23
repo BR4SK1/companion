@@ -13,6 +13,11 @@
 *.p12
 *.pfx
 
+# Local-only implementation-specific E2E suite (scaffold holds no implementation
+# details; only the directory README is tracked, as an explanation pointer)
+/tests/e2e/*
+!/tests/e2e/README.md
+
 # Local caches, test output, and generated build artifacts
 node_modules/
 .next/
