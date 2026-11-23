@@ -67,6 +67,7 @@ function validConfig(config: PromptModuleHttpPostConfig): boolean {
     config.localDateTimeField,
     engagementStateField,
     config.publishedRoutineMessageKeyField ?? null,
+    config.patternIdField ?? null,
     config.previousAssistantResponseField,
     config.userMessageField,
     config.priorConversationField,
@@ -235,6 +236,19 @@ export async function executeHttpPromptModule(input: {
       return result(startedAt, "invalid_result");
     }
     body[publishedRoutineMessageKeyField] = key;
+  }
+  const patternIdField = config.patternIdField ?? null;
+  if (patternIdField !== null) {
+    const patternId = context.patternId ?? null;
+    if (
+      patternId !== null &&
+      (typeof patternId !== "string" ||
+        patternId.trim().length === 0 ||
+        byteLength(patternId) > config.fieldMaxBytes)
+    ) {
+      return result(startedAt, "invalid_result");
+    }
+    body[patternIdField] = patternId;
   }
   if (config.previousAssistantResponseField !== null) {
     const previousAssistantResponse = context.previousAssistantResponse;

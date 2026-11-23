@@ -40,6 +40,7 @@ test("worker startup and migration-only command share the complete ordered schem
       "0023_prompt_module_http_post",
       "0027_prompt_module_engagement_and_hold",
       "0029_prompt_module_routine_metadata",
+      "0031_prompt_module_pattern_id",
       "0025_time_chat_chunk",
     ],
   );

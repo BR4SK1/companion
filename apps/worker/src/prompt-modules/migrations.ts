@@ -463,6 +463,22 @@ ALTER TABLE prompt_module
   );
 `;
 
+const PROMPT_MODULE_PATTERN_ID = `
+ALTER TABLE prompt_module
+  ADD COLUMN http_pattern_id_field text
+    CHECK (http_pattern_id_field ~ '^[A-Za-z][A-Za-z0-9_]{0,63}$'),
+  ADD CONSTRAINT prompt_module_pattern_id_field_check CHECK (
+    http_pattern_id_field IS NULL OR (
+      execution_mode = 'http_post'
+      AND NOT (http_pattern_id_field = ANY (array_remove(ARRAY[
+        http_scope_field, http_turn_id_field, http_local_datetime_field, http_engagement_state_field,
+        http_published_routine_message_key_field, http_previous_assistant_field,
+        http_user_message_field, http_prior_conversation_field
+      ], NULL)))
+    )
+  );
+`;
+
 export const promptModuleMigrations: readonly Migration[] = [
   { id: "0018_generic_prompt_modules", sql: PROMPT_MODULE_SCHEMA },
   { id: "0019_prompt_module_chat_attribution", sql: PROMPT_MODULE_CHAT_ATTRIBUTION },
@@ -470,4 +486,5 @@ export const promptModuleMigrations: readonly Migration[] = [
   { id: "0023_prompt_module_http_post", sql: PROMPT_MODULE_HTTP_POST },
   { id: "0027_prompt_module_engagement_and_hold", sql: PROMPT_MODULE_ENGAGEMENT_AND_HOLD },
   { id: "0029_prompt_module_routine_metadata", sql: PROMPT_MODULE_ROUTINE_METADATA },
+  { id: "0031_prompt_module_pattern_id", sql: PROMPT_MODULE_PATTERN_ID },
 ];

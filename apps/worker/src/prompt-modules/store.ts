@@ -62,6 +62,7 @@ interface PromptModuleRow {
   readonly http_local_datetime_field: string | null;
   readonly http_engagement_state_field?: string | null;
   readonly http_published_routine_message_key_field?: string | null;
+  readonly http_pattern_id_field?: string | null;
   readonly http_previous_assistant_field: string | null;
   readonly http_user_message_field: string | null;
   readonly http_prior_conversation_field: string | null;
@@ -81,9 +82,11 @@ interface PromptModuleRow {
 
 function routineHttpFields(row: PromptModuleRow) {
   const publishedRoutineMessageKeyField = row.http_published_routine_message_key_field;
+  const patternIdField = row.http_pattern_id_field;
   const availabilityRevisionField = row.http_availability_revision_field;
   return {
     ...(publishedRoutineMessageKeyField != null ? { publishedRoutineMessageKeyField } : {}),
+    ...(patternIdField != null ? { patternIdField } : {}),
     ...(availabilityRevisionField != null ? { availabilityRevisionField } : {}),
   };
 }
@@ -169,6 +172,7 @@ export function createPromptModuleStore(pool: PostgresPool): PromptModuleStore {
               execution_mode, http_endpoint_setting, http_scope_setting,
               http_scope_field, http_turn_id_field, http_local_datetime_field,
               http_engagement_state_field, http_published_routine_message_key_field,
+              http_pattern_id_field,
               http_previous_assistant_field, http_user_message_field,
               http_prior_conversation_field, http_response_text_field,
               http_unavailable_until_field, http_availability_revision_field,
