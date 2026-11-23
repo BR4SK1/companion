@@ -51,8 +51,8 @@
  * Behavior on unusable results is deliberately strict for this slice: a
  * decision that does not name an offered pattern, or a chat response that
  * fails the contract, propagates as a thrown error so the engine records a
- * failed turn. No silent fallback, retry, or normalization is applied; retry
- * policy remains an open decision.
+ * failed turn. Optional article decisions can be omitted. The owner may
+ * request a new attempt for the latest failed turn.
  */
 
 import type {
@@ -88,7 +88,6 @@ import {
 } from "../articles/share.ts";
 import type { ArticleMemoryCandidate } from "../articles/types.ts";
 import type {
-  RelationshipExtractionItem,
   SelectedInitiativeQuestion,
 } from "../relationship/types.ts";
 import { mainReplyProviderMaxTokensForBaseTierOrdinal } from "../relationship/runtime.ts";
@@ -127,6 +126,34 @@ import {
   parseDecisionsRequest,
 } from "@companion/openrouter";
 
+interface PromptModuleServices {
+  readonly leaseOwner: string;
+  /** Enabled prompt modules are loaded afresh for each attempt. */
+  readonly loadPromptModules: () => Promise<readonly PromptModuleDefinition[]>;
+  /** Explicit service credentials only; the full worker environment is not passed to module code. */
+  readonly promptModuleCredentials?: Readonly<Record<string, string>>;
+  readonly executePromptModule: (input: {
+    readonly module: PromptModuleDefinition;
+    readonly context: PromptModuleContext;
+  }) => Promise<PromptModuleRunResult>;
+  readonly recordPromptModuleDefinitions: (input: {
+    readonly turnId: string;
+    readonly leaseOwner: string;
+    readonly decisionModel: string;
+    readonly modules: readonly PromptModuleDefinition[];
+  }) => Promise<void>;
+  readonly recordPromptModuleDecision: (input: {
+    readonly turnId: string;
+    readonly leaseOwner: string;
+    readonly result: PromptModuleDecisionTrace;
+  }) => Promise<void>;
+  readonly recordPromptModuleExecution: (input: {
+    readonly turnId: string;
+    readonly leaseOwner: string;
+    readonly result: PromptModuleExecutionTrace;
+  }) => Promise<void>;
+}
+
 export interface TurnProcessorDeps {
   readonly decisionModel: string;
   readonly chatModel: string;
@@ -137,8 +164,6 @@ export interface TurnProcessorDeps {
    * no reasoning options are sent.
    */
   readonly chatReasoningEffort?: ChatReasoningEffort;
-  /** Current lease owner for fenced prompt-module trace writes. */
-  readonly leaseOwner?: string;
   /** Injectable wall-clock source for deterministic attempt-context tests. */
   readonly now?: () => Date;
   /** Perform the Decisions call; resolves with the raw response body. */
@@ -278,45 +303,16 @@ export interface TurnProcessorDeps {
     readonly unavailableUntil: Date | null;
     readonly availabilityRevision?: number;
   }) => Promise<void>;
-  /** Enabled prompt modules are loaded afresh for each attempt. */
-  readonly loadPromptModules?: () => Promise<readonly PromptModuleDefinition[]>;
-  /** Explicit service credentials only; the full worker environment is not passed to module code. */
-  readonly promptModuleCredentials?: Readonly<Record<string, string>>;
-  readonly executePromptModule?: (input: {
-    readonly module: PromptModuleDefinition;
-    readonly context: PromptModuleContext;
-  }) => Promise<PromptModuleRunResult>;
-  readonly recordPromptModuleDefinitions?: (input: {
-    readonly turnId: string;
-    readonly leaseOwner: string;
-    readonly decisionModel: string;
-    readonly modules: readonly PromptModuleDefinition[];
-  }) => Promise<void>;
-  readonly recordPromptModuleDecision?: (input: {
-    readonly turnId: string;
-    readonly leaseOwner: string;
-    readonly result: PromptModuleDecisionTrace;
-  }) => Promise<void>;
-  readonly recordPromptModuleExecution?: (input: {
-    readonly turnId: string;
-    readonly leaseOwner: string;
-    readonly result: PromptModuleExecutionTrace;
-  }) => Promise<void>;
+  readonly promptModules?: PromptModuleServices;
   readonly log?: (message: string) => void;
-  /** Learns only from the just-completed new turn; failures never fail chat. */
-  readonly extractRelationshipAnswers?: (input: {
-    readonly turnId: string;
-    readonly userText: string;
-    readonly assistantText: string;
-  }) => Promise<readonly RelationshipExtractionItem[]>;
+
 }
 
 /** The terminal result of one attempt, published by the engine. */
 export interface TurnOutcome {
   readonly reply: string;
   readonly selectedPatternId: string | null;
-  /** Prepared interpretations committed atomically with this reply when present. */
-  readonly relationshipAnswers?: readonly RelationshipExtractionItem[];
+
 }
 
 /** Conversation state presented to the decision model: the visible thread so far. */
@@ -533,7 +529,7 @@ export async function processTurnWork(
   }
   const articleShareAsked = articleCandidates.length > 0;
 
-  if (patterns.length > 0 || articleShareAsked) {
+  decisions: if (patterns.length > 0 || articleShareAsked) {
     const state = decisionState(history, work.messages);
     const baseRequest = patterns.length > 0
       ? buildPatternChoiceRequest({
@@ -588,31 +584,58 @@ export async function processTurnWork(
               outcome: decisionFailureTrace(error),
             });
           }
-        } catch {
-          // best-effort; the original error propagates
+        } catch (traceError) {
+          if (traceError instanceof TraceWriteFencedError) throw traceError;
         }
+      }
+      if (patterns.length === 0) {
+        articleCandidates = [];
+        await deps.recordDecisionSelection?.({
+          questionId: ARTICLE_SHARE_QUESTION_ID,
+          selection: { kind: "rejected", reason: "article decision unavailable" },
+        });
+        break decisions;
       }
       throw error;
     }
 
     let response: DecisionsResponse;
+    let invalidArticle = false;
     try {
       response = parseDecisionsExchange(validated, rawResponse);
     } catch (error) {
-      // Contract failure: a body arrived but did not validate.
-      if (deps.recordDecisionOutcome !== undefined) {
+      // Independently validate the required pattern if the optional article
+      // answer is unusable. Preserve the shared exchange contract and actual
+      // usage, model and returned pattern in the trace.
+      let required: DecisionsResponse | undefined;
+      if (articleShareAsked && patterns.length && typeof rawResponse === "object" && rawResponse !== null &&
+          "answers" in rawResponse && typeof rawResponse.answers === "object" && rawResponse.answers !== null) {
+        const { [ARTICLE_SHARE_QUESTION_ID]: _article, ...answers } =
+          rawResponse.answers as Record<string, unknown>;
         try {
-          for (const questionId of Object.keys(validated.questions)) {
-            await deps.recordDecisionOutcome({
-              trace: { questionId, request: validated },
-              outcome: { kind: "invalid", message: errorMessage(error) },
-            });
-          }
-        } catch {
-          // best-effort; the original error propagates
-        }
+          required = parseDecisionsExchange(baseRequest, { ...rawResponse, answers });
+        } catch { /* The required exchange is also invalid. */ }
       }
-      throw error;
+      for (const questionId of Object.keys(validated.questions)) {
+        if (required && questionId !== ARTICLE_SHARE_QUESTION_ID) continue;
+        await deps.recordDecisionOutcome?.({
+          trace: { questionId, request: validated },
+          outcome: { kind: "invalid", message: errorMessage(error) },
+        });
+      }
+      if (articleShareAsked) {
+        invalidArticle = true;
+        articleCandidates = [];
+        await deps.recordDecisionSelection?.({
+          questionId: ARTICLE_SHARE_QUESTION_ID,
+          selection: { kind: "rejected", reason: errorMessage(error) },
+        });
+      }
+      if (!required) {
+        if (patterns.length) throw error;
+        break decisions;
+      }
+      response = required;
     }
 
     // Decision outcome boundary: the full validated exchange, persisted
@@ -621,7 +644,7 @@ export async function processTurnWork(
     // is deliberate, not best-effort: a failure here fails the attempt rather
     // than selecting from an unrecorded response.
     if (deps.recordDecisionOutcome !== undefined) {
-      for (const questionId of Object.keys(validated.questions)) {
+      for (const questionId of Object.keys(response.answers)) {
         await deps.recordDecisionOutcome({
           trace: { questionId, request: validated },
           outcome: {
@@ -670,24 +693,18 @@ export async function processTurnWork(
 
     // The article-share selection resolves the optional context question: a
     // chosen candidate becomes this turn's article context chunk, `none`
-    // includes nothing. An unusable answer is an error, consistent with the
-    // pattern selection policy — no silent fallback.
-    if (articleShareAsked) {
+    // includes nothing. An unusable article answer is traced and omitted.
+    if (articleShareAsked && !invalidArticle) {
       let articleSelection;
       try {
         articleSelection = selectArticleShare(response, articleCandidates);
       } catch (error) {
-        if (deps.recordDecisionSelection !== undefined) {
-          try {
-            await deps.recordDecisionSelection({
-              questionId: ARTICLE_SHARE_QUESTION_ID,
-              selection: { kind: "rejected", reason: errorMessage(error) },
-            });
-          } catch {
-            // best-effort; the original error propagates
-          }
-        }
-        throw error;
+        await deps.recordDecisionSelection?.({
+          questionId: ARTICLE_SHARE_QUESTION_ID,
+          selection: { kind: "rejected", reason: errorMessage(error) },
+        });
+        articleCandidates = [];
+        break decisions;
       }
       if (deps.recordDecisionSelection !== undefined) {
         await deps.recordDecisionSelection({
@@ -822,15 +839,10 @@ export async function processTurnWork(
   }
 
   let promptModuleChunks: readonly PromptModulePromptOutput[] = [];
-  const promptModuleTracingReady =
-    deps.recordPromptModuleDefinitions !== undefined &&
-    deps.recordPromptModuleDecision !== undefined &&
-    deps.recordPromptModuleExecution !== undefined &&
-    deps.executePromptModule !== undefined &&
-    deps.leaseOwner !== undefined;
-  if (deps.loadPromptModules !== undefined && promptModuleTracingReady) {
+  const moduleServices = deps.promptModules;
+  if (moduleServices !== undefined) {
     try {
-      const modules = await deps.loadPromptModules();
+      const modules = await moduleServices.loadPromptModules();
       if (modules.length > 0) {
         const previousAssistantResponse =
           await deps.loadPreviousPublishedAssistantReply(work.turn.id) ?? "";
@@ -849,12 +861,12 @@ export async function processTurnWork(
           : null;
         promptModuleChunks = await runPromptModules({
           turnId: work.turn.id,
-          leaseOwner: deps.leaseOwner!,
+          leaseOwner: moduleServices.leaseOwner,
           decisionModel: deps.decisionModel,
           state: decisionState(history, work.messages),
           modules,
           context: {
-            credentials: deps.promptModuleCredentials ?? {},
+            credentials: moduleServices.promptModuleCredentials ?? {},
             conversation: [...history, ...work.messages].map((message) => ({
               role: message.role,
               content: message.content,
@@ -875,15 +887,15 @@ export async function processTurnWork(
             publishedRoutineMessageKey,
           },
           callDecisions: deps.callDecisions,
-          execute: deps.executePromptModule!,
+          execute: moduleServices.executePromptModule,
           recordDefinitions: (input) => recordPromptModuleTrace("definitions", () =>
-            deps.recordPromptModuleDefinitions!(input),
+            moduleServices.recordPromptModuleDefinitions(input),
           ),
           recordDecision: (input) => recordPromptModuleTrace("decision", () =>
-            deps.recordPromptModuleDecision!(input),
+            moduleServices.recordPromptModuleDecision(input),
           ),
           recordExecution: (input) => recordPromptModuleTrace("execution", () =>
-            deps.recordPromptModuleExecution!(input),
+            moduleServices.recordPromptModuleExecution(input),
           ),
           ...(deps.log !== undefined ? { log: deps.log } : {}),
         });
@@ -992,22 +1004,12 @@ export async function processTurnWork(
       ...(resolvedMaxTokens !== undefined ? { maxTokens: resolvedMaxTokens } : {}),
     });
   let { request: chatRequest, messages: assembledMessages } = assemblePrompt(promptModuleChunks);
-  const alignedChatTrace = () => ({
-    messageSources: assembledMessages.map((message) => message.sourceMessageId),
-    messageChunks: assembledMessages.map((message) => message.chunk),
-    messagePromptModuleIds: assembledMessages.map((message) => message.promptModuleId),
-  });
-  let { messageSources, messageChunks, messagePromptModuleIds } = alignedChatTrace();
-
   // Chat request boundary: persisted before the provider call. If the optional
   // module-to-message association alone cannot be recorded, discard all module
   // outputs and retry the mandatory baseline chat trace without them.
   if (deps.recordChatRequest !== undefined) {
     const recordRequest = () => deps.recordChatRequest!({
-      request: chatRequest,
-      messageSources,
-      messageChunks,
-      messagePromptModuleIds,
+      request: { ...chatRequest, messages: assembledMessages },
       identityRevision: identity.revision,
       temporalContext: temporalTrace,
     });
@@ -1024,7 +1026,6 @@ export async function processTurnWork(
       );
       promptModuleChunks = [];
       ({ request: chatRequest, messages: assembledMessages } = assemblePrompt([]));
-      ({ messageSources, messageChunks, messagePromptModuleIds } = alignedChatTrace());
       await recordRequest();
     }
   }
@@ -1050,10 +1051,7 @@ export async function processTurnWork(
     if (deps.recordChatOutcome !== undefined) {
       try {
         await deps.recordChatOutcome({
-          request: chatRequest,
-          messageSources,
-          messageChunks,
-          messagePromptModuleIds,
+          request: { ...chatRequest, messages: assembledMessages },
           identityRevision: identity.revision,
           outcome: chatFailureTrace(error),
         });
@@ -1088,10 +1086,7 @@ export async function processTurnWork(
     if (deps.recordChatOutcome !== undefined) {
       try {
         await deps.recordChatOutcome({
-          request: chatRequest,
-          messageSources,
-          messageChunks,
-          messagePromptModuleIds,
+          request: { ...chatRequest, messages: assembledMessages },
           identityRevision: identity.revision,
           outcome: chatInvalidTrace(error),
         });
@@ -1103,10 +1098,10 @@ export async function processTurnWork(
     }
     throw error;
   }
-  const choice = chatResponse.choices[0];
-  const reply = choice?.message.content ?? null;
+  const choice = chatResponse.choices[0]!; // The provider contract enforces at least one choice.
+  const reply = choice.message.content;
   const applicationRejection =
-    choice === undefined ? "chat response has no choices" : null;
+    reply.trim().length === 0 ? "chat response contains a blank reply" : null;
 
   // Structured diagnostics for the responded call, emitted before the
   // deliberate outcome trace write below so they stay visible even when
@@ -1129,10 +1124,7 @@ export async function processTurnWork(
   // unrecorded boundary.
   if (deps.recordChatOutcome !== undefined) {
     await deps.recordChatOutcome({
-      request: chatRequest,
-      messageSources,
-      messageChunks,
-      messagePromptModuleIds,
+      request: { ...chatRequest, messages: assembledMessages },
       identityRevision: identity.revision,
       outcome: {
         kind: "responded",
@@ -1143,42 +1135,10 @@ export async function processTurnWork(
     });
   }
 
-  if (choice === undefined) {
-    throw new Error("chat response has no choices");
-  }
+  if (applicationRejection !== null) throw new Error(applicationRejection);
 
-  // Relationship answer interpretation is a best-effort extraction over this
-  // new turn only. The resulting typed updates are committed by the
-  // conversation store in the same transaction as publication, so a fenced or
-  // failed attempt never changes the current answers.
-  let relationshipAnswers: readonly RelationshipExtractionItem[] | undefined;
-  if (deps.extractRelationshipAnswers !== undefined) {
-    const userText = work.messages
-      .filter((message) => message.role === "user")
-      .map((message) => message.content.trim())
-      .filter(Boolean)
-      .join("\n");
-    if (userText.length > 0 && choice.message.content.trim().length > 0) {
-      try {
-        relationshipAnswers = await deps.extractRelationshipAnswers({
-          turnId: work.turn.id,
-          userText,
-          assistantText: choice.message.content,
-        });
-      } catch {
-        console.warn(
-          `[RELATIONSHIP] answer interpretation failed for turn ${work.turn.id}; continuing without this turn's answer updates`,
-        );
-      }
-    }
-  }
-
-  // `choice` is narrowed here by the throw above, so the reply is a string.
   return {
     reply: choice.message.content,
     selectedPatternId: selected !== undefined ? selected.id : null,
-    ...(relationshipAnswers !== undefined && relationshipAnswers.length > 0
-      ? { relationshipAnswers }
-      : {}),
   };
 }

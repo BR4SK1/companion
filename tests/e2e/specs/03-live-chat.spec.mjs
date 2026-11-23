@@ -30,8 +30,21 @@ test("live chat round-trip persists user message and assistant reply across relo
 
   const composer = page.getByPlaceholder("Message");
   await expect(composer).toBeVisible();
+  // Forward the real write, then simulate a lost acknowledgment body. The
+  // browser must offer a same-key retry even when polling already saw the row.
+  let originalKey;
+  await page.route("**/api/messages", async route => {
+    originalKey = route.request().postDataJSON().clientKey;
+    const accepted = await route.fetch();
+    expect(accepted.status()).toBe(200);
+    await route.fulfill({ status: 200, contentType: "application/json", body: "{" });
+  }, { times: 1 });
   await composer.fill(promptText);
   await page.getByRole("button", { name: "Send message" }).click();
+
+  const replay = page.waitForRequest(request => request.url().endsWith("/api/messages") && request.method() === "POST");
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  expect((await replay).postDataJSON().clientKey).toBe(originalKey);
 
   // User message appears in the live UI.
   await expect(log).toContainText(marker);
@@ -49,6 +62,7 @@ test("live chat round-trip persists user message and assistant reply across relo
           (m) => m.role === "user" && m.seq > prevMaxSeq && typeof m.text === "string" && m.text.includes(marker),
         );
         if (!sent) return false;
+        expect(snapshot.messages.filter(m => m.role === "user" && m.text === promptText)).toHaveLength(1);
         const reply = snapshot.messages.find(
           (m) => m.role === "assistant" && m.seq > sent.seq && typeof m.text === "string" && m.text.trim().length > 0,
         );

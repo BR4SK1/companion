@@ -398,6 +398,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
       "0004_chat_identity",
       "0005_message_timing",
       "0006_conversation_thread_order",
+      "0024_response_pattern_initiative",
       "0003_memory_work",
       "0004_memory_semantic_shadow",
       "0021_memory_operation_turn_attribution",
@@ -1891,7 +1892,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     assert.equal(shares.rows[0].n, 0);
   });
 
-  it("fails the turn on an unusable share answer, with no silent fallback", async () => {
+  it("continues chat without an unusable share answer", async () => {
     await provisionArticleConfig(pool);
     await seedAcceptedReaction(pool, {
       url: "https://example.com/tea/one",
@@ -1903,9 +1904,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
     });
     const turnId = await insertTestTurn(pool);
 
-    await assert.rejects(
-      () =>
-        processTurnWork(
+    const outcome = await processTurnWork(
           {
             turn: { id: turnId, status: "in_flight", attempt: 1, lease_owner: "turn-owner", lease_expires_at: new Date(Date.now() + 300_000) },
             messages: [{ id: "m-1", role: "user", content: "hello there" }],
@@ -1921,7 +1920,7 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
               usage: { input_tokens: 5, output_tokens: 2 },
             }),
             callChat: async () => {
-              throw new Error("chat must not be called after an unusable decision");
+              return { model: "chat", choices: [{message: {role: "assistant", content: "reply"}}] };
             },
             loadIdentity: async () => ({ content: "FIXTURE IDENTITY", revision: 1 }),
             loadPatterns: async () => [],
@@ -1933,9 +1932,8 @@ describe("article domain work (PostgreSQL)", { skip: !hasDatabase }, () => {
             recordArticleShareInclusion: async (input) =>
               recordArticleShareInclusion(pool, input),
           },
-        ),
-      /not an offered option/,
     );
+    assert.equal(outcome.reply, "reply");
   });
 
   // --- Turn-free article interest consolidation -------------------------------

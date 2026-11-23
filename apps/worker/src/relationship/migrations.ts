@@ -78,4 +78,11 @@ export const relationshipMigrations: readonly Migration[] = [
         CHECK (chunk IN ('identity', 'profiles', 'temporal', 'recall', 'article', 'relationship', 'guidance', 'conversation'));
     `,
   },
+  {
+    id: "0030_relationship_learning_cursor",
+    sql: `CREATE TABLE relationship_learning_cursor (
+      singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+      reply_seq bigint NOT NULL
+    )`,
+  },
 ];

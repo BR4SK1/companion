@@ -255,6 +255,13 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
     assert.deepEqual(newest.messages.map((message) => message.seq), [5, 6, 7]);
     assert.deepEqual(newest.page, { oldestSeq: 5, hasMore: true });
 
+    const forward = await getThread("?limit=3&after=1");
+    assert.deepEqual(forward.messages.map(m => m.seq), [2, 3, 4]);
+    assert.equal(forward.page.hasMore, true);
+    const tail = await getThread("?limit=3&after=4");
+    assert.deepEqual(tail.messages.map(m => m.seq), [5, 6, 7]);
+    assert.equal(tail.page.hasMore, false);
+
     const middle = await getThread("?limit=3&before=5");
     assert.deepEqual(middle.messages.map((message) => message.seq), [2, 3, 4]);
     assert.deepEqual(middle.page, { oldestSeq: 2, hasMore: true });
@@ -316,7 +323,7 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
     assert.equal(committed.status.highestAllocatedSeq, 3);
   });
 
-  it("keeps reporting a burned seq so clients can keep probing its hole", async () => {
+  it("skips a burned seq when polling forward", async () => {
     await store.appendUserMessage({ content: "one", clientKey: "k1" });
 
     // A rolled-back insert consumes a seq that will never become visible:
@@ -338,16 +345,13 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
       [1],
     );
     assert.equal(after.status.highestAllocatedSeq, 2);
-
-    // The next real message continues after the burned seq; a consumer
-    // sees the permanent hole at 2 and keeps probing it (bounded work per
-    // cycle, no timing assumption) rather than ever treating the range as
-    // complete.
+    // The next committed message is immediately reachable from the previous cursor.
     const next = await store.appendUserMessage({
       content: "three",
       clientKey: "k3",
     });
     assert.equal(next.seq, 3);
+    assert.deepEqual((await getThread("?after=1")).messages.map(m => m.seq), [3]);
     const resumed = await getThread();
     assert.deepEqual(
       resumed.messages.map((message) => message.seq),
@@ -394,6 +398,22 @@ describe("worker private HTTP API (PostgreSQL)", { skip: !hasDatabase }, () => {
     );
     const afterCompletion = await getThread();
     assert.equal(afterCompletion.status.hasRecentFailure, false);
+  });
+
+  it("only retries the named failure once and republishes the same grouped turn", async () => {
+    await store.appendUserMessage({ content: "recover" });
+    const { work } = await store.claimNextTurn({ owner: "first", leaseSeconds: 60 });
+    await store.failTurn({ turnId: work.turn.id, leaseOwner: "first", error: "blank reply" });
+    const { status: { retryAttemptId } } = await getThread();
+    const retry = () => fetch(`${baseUrl}/v1/thread/retry?attempt=${retryAttemptId}`, { method: "POST", headers: authHeaders });
+    assert.equal((await retry()).status, 200);
+    assert.equal((await retry()).status, 409);
+    const next = await store.claimNextTurn({ owner: "second", leaseSeconds: 60 });
+    assert.equal(next.work.turn.id, work.turn.id);
+    assert.equal(next.work.turn.attempt, 2);
+    await store.publishReply({ turnId: work.turn.id, leaseOwner: "second", content: "reply" });
+    assert.deepEqual((await getThread()).messages.map(m => m.content), ["recover", "reply"]);
+    assert.equal((await retry()).status, 409);
   });
 
   it("runs the full accept → process → publish → poll path with fake provider calls", async () => {

@@ -523,7 +523,7 @@ describe("chat diagnostics: successful reply unchanged", () => {
     assertNoLeakage(logs, outcomes, [USER_TEXT]);
   });
 
-  it("keeps blank-string acceptance exactly as the existing contract defines it", async () => {
+  it("records the native blank response and rejects it for publication", async () => {
     const raw = {
       model: "resp-model-diag",
       choices: [
@@ -533,9 +533,10 @@ describe("chat diagnostics: successful reply unchanged", () => {
         },
       ],
     };
-    const { deps, logs } = harness({ rawChatResponse: raw });
-    const outcome = await processTurnWork(work, deps);
-    assert.equal(outcome.reply, "   ");
+    const { deps, logs, outcomes } = harness({ rawChatResponse: raw });
+    await assert.rejects(processTurnWork(work, deps), /blank reply/);
+    assert.equal(outcomes[0].outcome.applicationRejection, "chat response contains a blank reply");
+    assert.deepEqual(outcomes[0].outcome.response.choices, raw.choices);
     const [record] = diagnostics(logs);
     assert.equal(record.outcome, "responded");
     assert.equal(record.contentShape, "string_blank");

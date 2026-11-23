@@ -71,7 +71,7 @@ messages through the gate is real conversation work and can incur
 model/provider charges, so keep model use bounded and coordinated. Never
 create a Service, Ingress, or other route for the test port, and never
 enable the gate in production values (see
-[`production/README.md`](production/README.md)).
+[`production/README.md`](../production/README.md)).
 
 ## Database integration safety
 

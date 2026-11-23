@@ -40,6 +40,7 @@ export interface ThreadSnapshot {
   readonly highestAllocatedSeq: number;
   /** Sanitized trailing-failure flag; no error detail is ever attached. */
   readonly hasRecentFailure: boolean;
+  readonly retryAttemptId?: string;
   readonly page: {
     readonly oldestSeq: number | null;
     readonly hasMore: boolean;
@@ -58,6 +59,7 @@ export type GetThreadResult =
   | { readonly ok: false; readonly kind: "unavailable" | "bad_request" };
 
 export interface WorkerClient {
+  readonly retryGeneration: (attemptId: string) => Promise<number>;
   readonly sendMessage: (
     text: string,
     clientKey: string,
@@ -70,6 +72,7 @@ export interface WorkerClient {
   readonly getThread: (
     limit: number,
     before?: number,
+    after?: number,
   ) => Promise<GetThreadResult>;
 }
 
@@ -161,6 +164,7 @@ function parseThreadSnapshot(value: unknown): ThreadSnapshot | null {
     generating,
     highestAllocatedSeq,
     hasRecentFailure,
+    ...(typeof status.retryAttemptId === "string" ? { retryAttemptId: status.retryAttemptId } : {}),
     page: { oldestSeq, hasMore },
   };
 }
@@ -193,6 +197,10 @@ export function createWorkerClient(deps: WorkerClientDeps): WorkerClient {
   }
 
   return {
+    retryGeneration: async attemptId => {
+      const response = await request(`/v1/thread/retry?attempt=${encodeURIComponent(attemptId)}`, { method: "POST" });
+      return response && [200, 400, 409].includes(response.status) ? response.status : 502;
+    },
     sendMessage: async (
       text,
       clientKey,
@@ -235,8 +243,9 @@ export function createWorkerClient(deps: WorkerClientDeps): WorkerClient {
       return { ok: true, message };
     },
 
-    getThread: async (limit, before): Promise<GetThreadResult> => {
+    getThread: async (limit, before, after): Promise<GetThreadResult> => {
       const query = new URLSearchParams({ limit: String(limit) });
+      if (after !== undefined) query.set("after", String(after));
       if (before !== undefined) {
         query.set("before", String(before));
       }

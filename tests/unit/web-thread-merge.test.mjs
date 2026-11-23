@@ -1,21 +1,11 @@
-// Unit tests for the web client's live-thread state logic
-// (apps/web/src/lib/thread-state.ts): snapshot merging keyed by message id
-// (never a bare seq watermark), gap detection and bounded gap-walk
-// decisions for reconciliation without timing assumptions, the
-// may-have-earlier-history rule, pending-send lifecycle, snapshot response
-// validation, and client-key generation.
-
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
   appendPending,
   createClientKey,
-  detectThreadGaps,
   dropConfirmedPending,
-  mayHaveEarlierHistory,
   mergeThreadMessages,
-  nextGapWalkStep,
   parseThreadSnapshotResponse,
   removePending,
   updatePending,
@@ -23,22 +13,6 @@ import {
 
 function threadMessage(id, seq, role = "user", text = `text ${id}`) {
   return { id, seq, role, text, sentAt: "2026-10-30T00:00:00.000Z" };
-}
-
-function page(overrides = {}) {
-  return { oldestSeq: 1, hasMore: false, messages: [], ...overrides };
-}
-
-/** A loaded range with interior gaps: seqs 1..3, 5, 7..8. */
-function gappedMessages() {
-  return [
-    threadMessage("a", 1),
-    threadMessage("b", 2),
-    threadMessage("c", 3),
-    threadMessage("d", 5),
-    threadMessage("e", 7),
-    threadMessage("f", 8),
-  ];
 }
 
 describe("thread snapshot merging", () => {
@@ -133,131 +107,6 @@ describe("pending send lifecycle", () => {
       remaining.map((entry) => entry.clientKey),
       ["k2", "k3"],
       "entries whose durable message arrived are dropped; unconfirmed and not-yet-arrived entries stay",
-    );
-  });
-});
-
-describe("thread gap detection", () => {
-  it("finds no gaps in a contiguous loaded range", () => {
-    const messages = [
-      threadMessage("a", 1),
-      threadMessage("b", 2),
-      threadMessage("c", 3),
-    ];
-    assert.deepEqual(detectThreadGaps(messages), []);
-  });
-
-  it("finds no gaps in an empty or single-message range", () => {
-    assert.deepEqual(detectThreadGaps([]), []);
-    assert.deepEqual(detectThreadGaps([threadMessage("a", 9)]), []);
-  });
-
-  it("reports one gap per unloaded run between loaded messages", () => {
-    // Loaded seqs 1..3, 5, 7..8: two interior gaps (4 and 6).
-    assert.deepEqual(detectThreadGaps(gappedMessages()), [
-      { after: 3, before: 5 },
-      { after: 5, before: 7 },
-    ]);
-  });
-
-  it("derives gaps from the loaded seqs alone, with no span cap", () => {
-    // A very old loaded range with a wide gap is detected like any other:
-    // detection is O(loaded messages), so neither long history nor a large
-    // allocated bound can disable it.
-    const messages = [
-      threadMessage("old", 1),
-      threadMessage("new", 500_000),
-    ];
-    assert.deepEqual(detectThreadGaps(messages), [
-      { after: 1, before: 500_000 },
-    ]);
-  });
-
-  it("is order-insensitive", () => {
-    const messages = [threadMessage("e", 7), threadMessage("a", 1), threadMessage("d", 5)];
-    assert.deepEqual(detectThreadGaps(messages), [
-      { after: 1, before: 5 },
-      { after: 5, before: 7 },
-    ]);
-  });
-});
-
-describe("gap walk step decision", () => {
-  /** Gap between loaded seqs 3 and 9. */
-  const gap = { after: 3, before: 9 };
-
-  it("stops at an empty page (nothing committed below the cursor)", () => {
-    assert.deepEqual(
-      nextGapWalkStep(page({ oldestSeq: null, hasMore: false }), gap),
-      { kind: "stop" },
-    );
-  });
-
-  it("stops when the page reaches the gap's lower neighbor", () => {
-    const fetched = page({
-      oldestSeq: 3,
-      hasMore: true,
-      messages: Array.from({ length: 100 }, (_, i) => ({})),
-    });
-    assert.deepEqual(nextGapWalkStep(fetched, gap), { kind: "stop" });
-  });
-
-  it("stops on a not-full page above the lower neighbor", () => {
-    // Everything committed below the cursor is now loaded; the rest of the
-    // gap is in flight or burned and needs no further fetching now.
-    const fetched = page({
-      oldestSeq: 5,
-      hasMore: false,
-      messages: Array.from({ length: 7 }, (_, i) => ({})),
-    });
-    assert.deepEqual(nextGapWalkStep(fetched, gap), { kind: "stop" });
-  });
-
-  it("continues downward from the page bottom on a full page above the lower neighbor", () => {
-    const fetched = page({
-      oldestSeq: 5,
-      hasMore: true,
-      messages: Array.from({ length: 100 }, (_, i) => ({})),
-    });
-    assert.deepEqual(nextGapWalkStep(fetched, gap), {
-      kind: "continue",
-      cursor: 5,
-    });
-  });
-});
-
-describe("may-have-earlier-history rule", () => {
-  it("trusts the worker's hasMore when it is true", () => {
-    assert.equal(mayHaveEarlierHistory(page({ hasMore: true, oldestSeq: 40 }), 50), true);
-  });
-
-  it("keeps ambiguity when the page bottoms out above seq 1", () => {
-    // No committed messages below seq 40, but seqs 1..39 were allocated
-    // (contiguity from any committed seq above them) — in flight or
-    // burned, so they may still appear.
-    assert.equal(mayHaveEarlierHistory(page({ hasMore: false, oldestSeq: 40 }), 100), true);
-  });
-
-  it("hides the control only once the walk demonstrably reaches seq 1", () => {
-    assert.equal(mayHaveEarlierHistory(page({ hasMore: false, oldestSeq: 1 }), 100), false);
-  });
-
-  it("resolves the empty-page ambiguity from the allocation bound", () => {
-    // Cursor 41 with nothing committed below it: seqs 1..40 were drawn
-    // (allocated bound), so they are in flight or burned — keep the control.
-    assert.equal(
-      mayHaveEarlierHistory(page({ hasMore: false, oldestSeq: null }), 40, 41),
-      true,
-    );
-    // Nothing below the cursor was ever drawn: no earlier history exists.
-    assert.equal(
-      mayHaveEarlierHistory(page({ hasMore: false, oldestSeq: null }), 40, 45),
-      false,
-    );
-    // An empty newest page (no cursor) means an empty thread, not history.
-    assert.equal(
-      mayHaveEarlierHistory(page({ hasMore: false, oldestSeq: null }), 3),
-      false,
     );
   });
 });

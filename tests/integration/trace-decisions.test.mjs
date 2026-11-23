@@ -111,9 +111,7 @@ describe("turn trace report: every decision question (PostgreSQL)", { skip: !has
       turnId: claim.work.turn.id,
       leaseOwner: "owner-temporal-date",
       payload: {
-        request: { model: "synthetic-chat-model", messages: [{ role: "system", content: "temporal context" }] },
-        messageSources: [null],
-        messageChunks: ["temporal"],
+        request: { model: "synthetic-chat-model", messages: [{ role: "system", content: "temporal context", chunk: "temporal", sourceMessageId: null, promptModuleId: null }] },
         identityRevision: 1,
         temporalContext,
       },

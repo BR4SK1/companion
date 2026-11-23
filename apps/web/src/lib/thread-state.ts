@@ -1,27 +1,4 @@
-/**
- * Client-side state logic for the live thread.
- *
- * The visible thread is one continuous conversation fed by bounded page
- * reads. The key correctness rules:
- *
- * - Merges are keyed by message id, never by a pure "newer than last seen"
- *   watermark. A reply's `seq` is assigned inside the worker's publication
- *   transaction but becomes visible only at commit, so a message observed
- *   earlier can carry a higher `seq` than a reply committed later; an
- *   id-keyed merge is immune to that ordering, while a watermark read would
- *   silently drop the late-committed reply.
- * - Continuity of the loaded range is verified by GAP detection, re-derived
- *   from the loaded messages themselves on every cycle: any run of allocated
- *   seqs between two loaded messages is a gap, and a page walk downward from
- *   the gap's top recovers whatever has committed inside it. Nothing is ever
- *   discarded on a timing assumption: a seq whose transaction has not
- *   committed yet and a seq burned by a rollback look identical at every
- *   single snapshot, so no client-side deadline can distinguish them. An
- *   unresolved gap therefore keeps its (bounded, per-cycle) share of probing
- *   forever; a burned seq's cost is one cheap page read per visit, never a
- *   missed message.
- */
-
+/** Client thread pages and optimistic send state. */
 import type { MessageRole } from "./messages";
 import { isValidInstant } from "./time.ts";
 
@@ -38,147 +15,25 @@ export interface ThreadMessage {
 export interface ThreadStatus {
   readonly queued: number;
   readonly generating: boolean;
-  /**
-   * Highest seq allocated (committed-visible, in-flight, or burned). The
-   * gap-based reconciliation in this module derives gaps from the loaded
-   * messages and does not require this field, but the allocation invariant
-   * is what makes that reasoning sound, and `mayHaveEarlierHistory` uses it
-   * to resolve the empty-page ambiguity at a history cursor.
-   */
+  /** Allocation metadata retained for wire compatibility. */
   readonly highestAllocatedSeq: number;
   /** Sanitized trailing-failure flag; carries no error detail. */
   readonly hasRecentFailure: boolean;
+  readonly retryAttemptId?: string;
 }
 
 /** Paging bounds delivered with each page. */
 export interface ThreadPage {
   /** Smallest seq in the page; null when the page is empty. */
   readonly oldestSeq: number | null;
-  /** True when committed messages exist below this page. */
+  /** True when more committed messages exist in the requested direction. */
   readonly hasMore: boolean;
-  /**
-   * The messages delivered in this page (the same array the snapshot
-   * carries at top level). The gap-walk stop rule needs the page's
-   * fullness (`messages.length < THREAD_PAGE_SIZE`), which the wire
-   * format's bare `oldestSeq`/`hasMore` bounds cannot express.
-   */
+  /** Messages in this page. */
   readonly messages: readonly ThreadMessage[];
 }
 
-/**
- * Fixed thread page size — the single source of truth for the BFF's page
- * bound (apps/web/src/app/api/thread/route.ts requests it from the worker)
- * and for the page-fullness check in gap walking. Change it only here.
- */
+/** BFF page bound in either direction. */
 export const THREAD_PAGE_SIZE = 100;
-
-/**
- * One run of allocated seqs between two loaded messages that the client has
- * not observed: the seqs strictly between `after` and `before`.
- */
-export interface ThreadGap {
-  /** Exclusive lower neighbor: a loaded message's seq. */
-  readonly after: number;
-  /** Exclusive upper neighbor: a loaded message's seq. */
-  readonly before: number;
-}
-
-/**
- * Interior gaps of the loaded range, ascending.
- *
- * A gap is derived from the loaded messages themselves — two loaded seqs
- * more than one apart prove the seqs between them were allocated (a
- * sequence is drawn in increasing order, so drawing `before` drew
- * everything below it) but not loaded: committed-but-unfetched, in flight,
- * or burned. Detection is O(loaded messages) with no seq-by-seq scan, so
- * long history and burn storms cost nothing extra to detect.
- *
- * Seqs above the newest loaded message are intentionally NOT reported:
- * they are in flight or burned, and any of them that commits either lands
- * in the newest-page poll (while it is within the page window) or splits an
- * interior gap that later cycles detect — so the tail needs no probing and
- * no timing assumption. The input is defensively re-sorted; callers pass
- * the seq-ordered output of `mergeThreadMessages`.
- */
-export function detectThreadGaps(
-  messages: readonly ThreadMessage[],
-): ThreadGap[] {
-  const sorted = [...messages].sort((a, b) => a.seq - b.seq);
-  const gaps: ThreadGap[] = [];
-  let previous: ThreadMessage | undefined;
-  for (const message of sorted) {
-    if (previous !== undefined) {
-      const after = previous.seq;
-      const before = message.seq;
-      if (before - after > 1) {
-        gaps.push({ after, before });
-      }
-    }
-    previous = message;
-  }
-  return gaps;
-}
-
-/**
- * What one fetched page tells a gap walk. Walking continues downward (to
- * the cursor the page bottomed out at) only while the page was full and
- * still ended above the gap's lower neighbor — meaning more committed
- * messages may exist below inside the gap. Walking stops when the page
- * reached the lower neighbor (the gap is fully loaded), when the page was
- * not full (everything committed below the cursor is now loaded, so the
- * rest of the gap is in flight or burned), or when the page was empty.
- * Both stop cases resolve the WALK, not the gap: gap detection re-derives
- * from the loaded seqs every cycle, so a seq that commits later re-creates
- * a — smaller — gap and is probed again. No timing assumption anywhere.
- */
-export type GapWalkStep =
-  | { readonly kind: "continue"; readonly cursor: number }
-  | { readonly kind: "stop" };
-
-export function nextGapWalkStep(
-  page: ThreadPage,
-  gap: ThreadGap,
-): GapWalkStep {
-  if (
-    page.oldestSeq === null ||
-    page.oldestSeq <= gap.after ||
-    page.messages.length < THREAD_PAGE_SIZE
-  ) {
-    return { kind: "stop" };
-  }
-  return { kind: "continue", cursor: page.oldestSeq };
-}
-
-/**
- * Whether older history may still exist below a fetched page — the rule
- * that decides whether the "load earlier" control stays visible and whether
- * a history walk continues.
- *
- * The worker's `hasMore` covers committed messages only. Because allocation
- * is contiguous from 1, seqs below a committed seq were all drawn, so when
- * a non-empty page bottoms out above seq 1 with `hasMore` false, the seqs
- * below it are drawn-but-uncommitted (in flight or burned) and may still
- * become visible: ambiguity, and therefore the control, survives until the
- * walk demonstrably reaches seq 1. For an empty page the requested cursor
- * and the allocation bound are the only signal: nothing below the cursor
- * was ever drawn only if `highestAllocatedSeq` stops short of it.
- */
-export function mayHaveEarlierHistory(
-  page: ThreadPage,
-  highestAllocatedSeq: number,
-  requestedBefore?: number,
-): boolean {
-  if (page.hasMore) {
-    return true;
-  }
-  if (page.oldestSeq !== null) {
-    return page.oldestSeq > 1;
-  }
-  if (requestedBefore === undefined) {
-    return false;
-  }
-  return requestedBefore >= 2 && highestAllocatedSeq >= requestedBefore - 1;
-}
 
 /**
  * Merge two snapshots into one ordered thread: keyed by message id (the
@@ -316,7 +171,9 @@ export function parseThreadSnapshotResponse(
   }
   return {
     messages,
-    status: { queued, generating, highestAllocatedSeq, hasRecentFailure },
+    status: { queued, generating, highestAllocatedSeq, hasRecentFailure,
+      ...(typeof statusRecord.retryAttemptId === "string" ? { retryAttemptId: statusRecord.retryAttemptId } : {}),
+    },
     page: { oldestSeq, hasMore, messages },
     timezone,
   };

@@ -15,17 +15,8 @@
  *   stable, generic error kinds. Internal error details are logged on the
  *   server side only, never in responses.
  *
- * Thread reads are cursor-paged: `GET /v1/thread?limit=N` returns the newest
- * page (ascending `seq`) with `page.oldestSeq`/`page.hasMore`, and
- * `?before=<seq>` returns the page immediately below that bound, so callers
- * can walk the full durable history. `status.highestAllocatedSeq` reports
- * the allocation invariant (every seq up to it is committed-visible,
- * in-flight, or burned; allocation is contiguous), which lets a consumer
- * reason about what may exist below any page; the web client reconciles by
- * re-deriving gaps between its loaded seqs and walking pages downward with
- * a bounded per-cycle budget and no timing assumption.
- * `status.hasRecentFailure` is a sanitized trailing-failure flag; provider
- * error text never crosses this boundary.
+ * Thread reads return the newest page, older rows before a cursor, or newer
+ * rows after a cursor. A retry targets the specific latest failed attempt.
  *
  * Composition rules: behavior lives in the domain store; this module owns
  * only transport concerns (parsing, limits, auth framing, status codes).
@@ -345,15 +336,15 @@ const MAX_SEQ_VALUE = Number.MAX_SAFE_INTEGER;
  * Parse the optional `before` history cursor: null when absent, the seq
  * value when valid, undefined when malformed.
  */
-function parseThreadBefore(
-  query: URLSearchParams,
+function parseThreadCursor(
+  query: URLSearchParams, name: "before" | "after",
 ): number | null | undefined {
-  const raw = query.get("before");
+  const raw = query.get(name);
   if (raw === null) {
     return null;
   }
   const value = Number(raw);
-  if (!Number.isInteger(value) || value < 1 || value > MAX_SEQ_VALUE) {
+  if (!raw.trim() || !Number.isInteger(value) || value < (name === "after" ? 0 : 1) || value > MAX_SEQ_VALUE) {
     return undefined;
   }
   return value;
@@ -404,6 +395,7 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
     if (
       url.pathname !== "/v1/messages" &&
       url.pathname !== "/v1/thread" &&
+      url.pathname !== "/v1/thread/retry" &&
       url.pathname !== "/v1/memory/recall" &&
       url.pathname !== "/v1/articles/memories" &&
       url.pathname !== "/v1/engagement"
@@ -417,7 +409,7 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       request.resume();
       return;
     }
-    if (url.pathname === "/v1/messages" && request.method !== "POST") {
+    if ((url.pathname === "/v1/messages" || url.pathname === "/v1/thread/retry") && request.method !== "POST") {
       writeJson(response, 405, { error: "method_not_allowed" }, { allow: "POST" });
       request.resume();
       return;
@@ -447,6 +439,19 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       writeGenericError(response, 401, "unauthorized");
       // Drain any unread body so the connection can close or be reused.
       request.resume();
+      return;
+    }
+
+    if (route === "POST /v1/thread/retry") {
+      request.resume();
+      const attemptId = url.searchParams.get("attempt");
+      if (!attemptId || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(attemptId)) {
+        writeGenericError(response, 400, "bad_request");
+      } else if (await deps.store.retryFailedAttempt(attemptId)) {
+        writeJson(response, 200, { accepted: true });
+      } else {
+        writeGenericError(response, 409, "stale_attempt");
+      }
       return;
     }
 
@@ -490,13 +495,14 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
 
     if (route === "GET /v1/thread") {
       const limit = parseThreadLimit(url.searchParams);
-      const before = parseThreadBefore(url.searchParams);
-      if (limit === undefined || before === undefined) {
+      const before = parseThreadCursor(url.searchParams, "before");
+      const after = parseThreadCursor(url.searchParams, "after");
+      if (limit === undefined || before === undefined || after === undefined || (before !== null && after !== null)) {
         writeGenericError(response, 400, "bad_request");
         return;
       }
       const [page, status] = await Promise.all([
-        deps.store.getThreadPage({ limit, ...(before !== null ? { before } : {}) }),
+        deps.store.getThreadPage({ limit, ...(before !== null ? { before } : {}), ...(after !== null ? { after } : {}) }),
         deps.store.getThreadStatus(),
       ]);
       writeJson(response, 200, {
@@ -507,6 +513,7 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
           generating: status.generating,
           highestAllocatedSeq: status.highestAllocatedSeq,
           hasRecentFailure: status.hasRecentFailure,
+          ...(status.retryAttemptId ? { retryAttemptId: status.retryAttemptId } : {}),
         },
         page: {
           oldestSeq: page.oldestSeq,

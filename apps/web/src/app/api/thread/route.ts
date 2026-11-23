@@ -23,6 +23,7 @@ import { jsonError, jsonOk, nowSeconds } from "@/lib/server/respond";
 import { SESSION_COOKIE_NAME, TEST_SESSION_COOKIE_NAME } from "@/lib/server/session";
 import {
   resolveRequestChannel,
+  stateChangeAllowedForChannel,
   TEST_ATTESTATION_HEADER,
   verifyAccessForChannel,
 } from "@/lib/server/test-gate";
@@ -35,24 +36,24 @@ export const dynamic = "force-dynamic";
 /** Upper sanity bound for the history cursor (safe-integer seq range). */
 const MAX_SEQ_VALUE = Number.MAX_SAFE_INTEGER;
 
-function parseBeforeParam(
-  raw: string | null,
-): { ok: true; before?: number } | { ok: false } {
+function parseCursor(
+  raw: string | null, minimum = 1,
+): { ok: true; cursor?: number } | { ok: false } {
   if (raw === null) {
     return { ok: true };
   }
   const value = Number(raw);
   if (
     !Number.isInteger(value) ||
-    value < 1 ||
+    !raw.trim() || value < minimum ||
     value > MAX_SEQ_VALUE
   ) {
     return { ok: false };
   }
-  return { ok: true, before: value };
+  return { ok: true, cursor: value };
 }
 
-export async function GET(request: NextRequest) {
+async function threadRequest(request: NextRequest, retry: boolean) {
   const configResult = loadWebConfigSafe(process.env);
   if (!configResult.ok) {
     return jsonError(503, "unavailable");
@@ -62,6 +63,9 @@ export async function GET(request: NextRequest) {
     config,
     request.headers.get(TEST_ATTESTATION_HEADER),
   );
+  if (retry && !stateChangeAllowedForChannel(config, channel, request.headers.get("origin"))) {
+    return jsonError(403, "forbidden");
+  }
   const access = verifyAccessForChannel(
     config,
     channel,
@@ -72,21 +76,30 @@ export async function GET(request: NextRequest) {
   if (!access.ok) {
     return jsonError(access.status, access.kind);
   }
-  const beforeParam = parseBeforeParam(
-    request.nextUrl.searchParams.get("before"),
-  );
-  if (!beforeParam.ok) {
-    return jsonError(400, "bad_request");
-  }
-
   const client = createWorkerClient({
     baseUrl: config.workerUrl,
     token: config.workerToken,
     timeoutMs: config.workerTimeoutMs,
   });
+  if (retry) {
+    const attempt = request.nextUrl.searchParams.get("attempt");
+    if (!attempt) return jsonError(400, "bad_request");
+    const status = await client.retryGeneration(attempt);
+    if (status === 200) return jsonOk({ accepted: true });
+    return jsonError(status, status === 409 ? "stale_attempt" : status === 400 ? "bad_request" : "unavailable");
+  }
+  const beforeParam = parseCursor(
+    request.nextUrl.searchParams.get("before"),
+  );
+  const afterParam = parseCursor(request.nextUrl.searchParams.get("after"), 0);
+  if (!beforeParam.ok || !afterParam.ok || (beforeParam.cursor !== undefined && afterParam.cursor !== undefined)) {
+    return jsonError(400, "bad_request");
+  }
+
   const result = await client.getThread(
     THREAD_PAGE_SIZE,
-    beforeParam.before,
+    beforeParam.cursor,
+    afterParam.cursor,
   );
   if (result.ok) {
     return jsonOk({
@@ -97,6 +110,7 @@ export async function GET(request: NextRequest) {
         generating: result.snapshot.generating,
         highestAllocatedSeq: result.snapshot.highestAllocatedSeq,
         hasRecentFailure: result.snapshot.hasRecentFailure,
+        retryAttemptId: result.snapshot.retryAttemptId,
       },
       page: result.snapshot.page,
     });
@@ -104,4 +118,12 @@ export async function GET(request: NextRequest) {
   // The page size and cursor are BFF-validated, so a bad_request can only
   // mean a contract mismatch — report it generically, never to the client.
   return jsonError(result.kind === "bad_request" ? 500 : 502, "unavailable");
+}
+
+export function GET(request: NextRequest) {
+  return threadRequest(request, false);
+}
+
+export function POST(request: NextRequest) {
+  return threadRequest(request, true);
 }

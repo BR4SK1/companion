@@ -140,9 +140,25 @@ describe("declarative HTTP prompt modules", () => {
       const deps = {
         decisionModel: "unused-for-every-turn",
         chatModel: "synthetic-chat-model",
-        leaseOwner: "synthetic-lease",
+        promptModules: {
+          leaseOwner: "synthetic-lease",
+          promptModuleCredentials: httpContext(mock.endpoint).credentials,
+          loadPromptModules: () => store.loadEnabled(),
+          executePromptModule,
+          recordPromptModuleDefinitions: async (input) => {
+            traces.definitions.push(input.modules.map(({ executionMode, definitionHash }) => ({ executionMode, definitionHash })));
+            assert.equal(await store.recordDefinitions(input), true);
+          },
+          recordPromptModuleDecision: async (input) => {
+            traces.decisions.push(input.result);
+            assert.equal(await store.recordDecision(input), true);
+          },
+          recordPromptModuleExecution: async (input) => {
+            traces.executions.push(input.result);
+            assert.equal(await store.recordExecution(input), true);
+          },
+        },
         temporalSettings: { timezone: "UTC", seasonHemisphere: null, birthdayMonth: null, birthdayDay: null },
-        promptModuleCredentials: httpContext(mock.endpoint).credentials,
         callDecisions: async () => { throw new Error("every-turn module must not call a provider"); },
         callChat: async () => ({
           id: "synthetic-chat-id",
@@ -157,20 +173,6 @@ describe("declarative HTTP prompt modules", () => {
           { id: "newest-assistant", turnId: "older-turn-3", role: "assistant", content: "newest prior reply" },
         ],
         loadPreviousPublishedAssistantReply: async () => "",
-        loadPromptModules: () => store.loadEnabled(),
-        executePromptModule,
-        recordPromptModuleDefinitions: async (input) => {
-          traces.definitions.push(input.modules.map(({ executionMode, definitionHash }) => ({ executionMode, definitionHash })));
-          assert.equal(await store.recordDefinitions(input), true);
-        },
-        recordPromptModuleDecision: async (input) => {
-          traces.decisions.push(input.result);
-          assert.equal(await store.recordDecision(input), true);
-        },
-        recordPromptModuleExecution: async (input) => {
-          traces.executions.push(input.result);
-          assert.equal(await store.recordExecution(input), true);
-        },
         recordChatRequest: async (trace) => chatTraces.push(trace),
         log: (message) => logs.push(message),
       };
@@ -209,7 +211,7 @@ describe("declarative HTTP prompt modules", () => {
       assert.equal(traces.decisions[0].state, "not_required");
       assert.equal(traces.executions[0].state, "succeeded");
       assert.equal(traces.executions[0].outputReady, true);
-      assert.deepEqual(chatTraces[0].messagePromptModuleIds, [
+      assert.deepEqual(chatTraces[0].request.messages.map(message => message.promptModuleId), [
         null,
         null,
         "00000000-0000-4000-8000-000000000101",
@@ -356,9 +358,19 @@ describe("declarative HTTP prompt modules", () => {
       }, {
         decisionModel: "unused-model",
         chatModel: "test-chat-model",
-        leaseOwner: "lease-fallback",
+        promptModules: {
+          leaseOwner: "lease-fallback",
+          promptModuleCredentials: httpContext(mock.endpoint).credentials,
+          loadPromptModules: () => store.loadEnabled(),
+          executePromptModule,
+          recordPromptModuleDefinitions: (input) => store.recordDefinitions(input),
+          recordPromptModuleDecision: (input) => store.recordDecision(input),
+          recordPromptModuleExecution: async (input) => {
+            traces.push(input.result);
+            assert.equal(await store.recordExecution(input), true);
+          },
+        },
         temporalSettings: { timezone: "UTC", seasonHemisphere: null, birthdayMonth: null, birthdayDay: null },
-        promptModuleCredentials: httpContext(mock.endpoint).credentials,
         callDecisions: async () => { throw new Error("must not call"); },
         callChat: async () => ({
           id: "synthetic-chat-id-fallback",
@@ -369,22 +381,14 @@ describe("declarative HTTP prompt modules", () => {
         loadIdentity: async () => ({ content: "identity", revision: 1 }),
         loadContext: async () => [],
         loadPreviousPublishedAssistantReply: async () => null,
-        loadPromptModules: () => store.loadEnabled(),
-        executePromptModule,
-        recordPromptModuleDefinitions: (input) => store.recordDefinitions(input),
-        recordPromptModuleDecision: (input) => store.recordDecision(input),
-        recordPromptModuleExecution: async (input) => {
-          traces.push(input.result);
-          assert.equal(await store.recordExecution(input), true);
-        },
-        recordChatRequest: async ({ request, messagePromptModuleIds }) => {
-          chatRequest = { request, messagePromptModuleIds };
+        recordChatRequest: async (trace) => {
+          chatRequest = trace;
         },
         log: (message) => logs.push(message),
       });
       assert.equal(outcome.reply, "reply");
       assert.deepEqual(traces.map(({ state }) => state), ["failed", "succeeded"]);
-      assert.deepEqual(chatRequest.messagePromptModuleIds, [
+      assert.deepEqual(chatRequest.request.messages.map(message => message.promptModuleId), [
         null,
         null,
         "00000000-0000-4000-8000-000000000101",
@@ -589,7 +593,18 @@ describe("declarative HTTP prompt modules", () => {
         {
           decisionModel: "synthetic-decision",
           chatModel: "synthetic-chat",
-          leaseOwner: "worker:test",
+          promptModules: {
+            leaseOwner: "worker:test",
+            loadPromptModules: () => store.loadEnabled(),
+            promptModuleCredentials: {
+              [config.endpointSetting]: mock.endpoint,
+              [config.scopeSetting]: "scope-prod",
+            },
+            executePromptModule,
+            recordPromptModuleDefinitions: async () => {},
+            recordPromptModuleDecision: async () => {},
+            recordPromptModuleExecution: async () => {},
+          },
           temporalSettings: {
             timezone: "America/New_York",
             seasonHemisphere: null,
@@ -612,15 +627,6 @@ describe("declarative HTTP prompt modules", () => {
             return "schedule:2026-06-15:morning_change:ask:1";
           },
           applyAvailabilityHold: async (hold) => { holds.push(hold); },
-          loadPromptModules: () => store.loadEnabled(),
-          promptModuleCredentials: {
-            [config.endpointSetting]: mock.endpoint,
-            [config.scopeSetting]: "scope-prod",
-          },
-          executePromptModule,
-          recordPromptModuleDefinitions: async () => {},
-          recordPromptModuleDecision: async () => {},
-          recordPromptModuleExecution: async () => {},
         },
       );
       assert.equal(outcome.reply, "brb!");
