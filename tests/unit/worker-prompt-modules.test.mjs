@@ -94,11 +94,19 @@ function runtimeDeps(modules, overrides = {}) {
   return { deps, trace };
 }
 
-function processorDeps(overrides = {}) {
+function processorDeps({ promptModules, ...overrides } = {}) {
   return {
     decisionModel: "decision-model",
     chatModel: "chat-model",
-    leaseOwner: "lease-processor-test",
+    promptModules: {
+      leaseOwner: "lease-processor-test",
+      loadPromptModules: async () => [],
+      executePromptModule: async () => ({ kind: "succeeded", content: "context output", durationMs: 1 }),
+      recordPromptModuleDefinitions: async () => {},
+      recordPromptModuleDecision: async () => {},
+      recordPromptModuleExecution: async () => {},
+      ...promptModules,
+    },
     callDecisions: async (request) => responseFor(request, {}),
     callChat: async () => ({
       id: "chat-processor-test",
@@ -109,11 +117,6 @@ function processorDeps(overrides = {}) {
     loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
     loadContext: async () => [],
     loadPreviousPublishedAssistantReply: async () => null,
-    loadPromptModules: async () => [],
-    executePromptModule: async () => ({ kind: "succeeded", content: "context output", durationMs: 1 }),
-    recordPromptModuleDefinitions: async () => {},
-    recordPromptModuleDecision: async () => {},
-    recordPromptModuleExecution: async () => {},
     log: () => {},
     ...overrides,
   };
@@ -509,7 +512,18 @@ describe("generic prompt modules", () => {
     const processorDeps = {
       decisionModel: "decision-model",
       chatModel: "chat-model",
-      leaseOwner: "lease-processor",
+      promptModules: {
+        leaseOwner: "lease-processor",
+        loadPromptModules: async () => [module],
+        promptModuleCredentials: { serviceToken: "configured" },
+        executePromptModule: async ({ context }) => {
+          assert.equal(context.credentials.serviceToken, "configured");
+          return { kind: "succeeded", content: "current thought", durationMs: 1 };
+        },
+        recordPromptModuleDefinitions: async () => {},
+        recordPromptModuleDecision: async (trace) => calls.traces.push(trace),
+        recordPromptModuleExecution: async (trace) => calls.traces.push(trace),
+      },
       callDecisions: async (request) => {
         calls.decisions += 1;
         return responseFor(request, { processor: PROMPT_MODULE_INCLUDE });
@@ -522,15 +536,6 @@ describe("generic prompt modules", () => {
       loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
       loadContext: async () => [],
       loadPreviousPublishedAssistantReply: async () => null,
-      loadPromptModules: async () => [module],
-      promptModuleCredentials: { serviceToken: "configured" },
-      executePromptModule: async ({ context }) => {
-        assert.equal(context.credentials.serviceToken, "configured");
-        return { kind: "succeeded", content: "current thought", durationMs: 1 };
-      },
-      recordPromptModuleDefinitions: async () => {},
-      recordPromptModuleDecision: async (trace) => calls.traces.push(trace),
-      recordPromptModuleExecution: async (trace) => calls.traces.push(trace),
       recordChatRequest: async (trace) => { calls.prompt = trace; },
       log: (message) => calls.logs.push(message),
     };
@@ -541,8 +546,8 @@ describe("generic prompt modules", () => {
     assert.equal(outcome.reply, "reply");
     assert.equal(calls.decisions, 1);
     assert.equal(calls.chat, 1);
-    assert.deepEqual(calls.prompt.messageChunks, ["identity", "prompt_module", "conversation"]);
-    assert.deepEqual(calls.prompt.messagePromptModuleIds, [null, "processor", null]);
+    assert.deepEqual(calls.prompt.request.messages.map(message => message.chunk), ["identity", "prompt_module", "conversation"]);
+    assert.deepEqual(calls.prompt.request.messages.map(message => message.promptModuleId), [null, "processor", null]);
     assert.match(calls.prompt.request.messages[1].content, /current thought/);
     assert.equal(calls.traces.length, 2);
 
@@ -555,7 +560,10 @@ describe("generic prompt modules", () => {
         return chatResponse;
       },
       recordChatRequest: async (trace) => { failingCalls.prompt = trace; },
-      executePromptModule: async () => { throw new Error("must not execute"); },
+      promptModules: {
+        ...processorDeps.promptModules,
+        executePromptModule: async () => { throw new Error("must not execute"); },
+      },
     };
     const degraded = await processTurnWork({
       turn: { id: "turn-module-failure", leaseOwner: "lease-processor" },
@@ -563,7 +571,7 @@ describe("generic prompt modules", () => {
     }, failedModuleDeps);
     assert.equal(degraded.reply, "reply");
     assert.equal(failingCalls.chat, 1);
-    assert.deepEqual(failingCalls.prompt.messageChunks, ["identity", "conversation"]);
+    assert.deepEqual(failingCalls.prompt.request.messages.map(message => message.chunk), ["identity", "conversation"]);
     assert.ok(!JSON.stringify(failingCalls.prompt.request).includes("private provider response"));
   });
 
@@ -582,7 +590,17 @@ describe("generic prompt modules", () => {
     const deps = {
       decisionModel: "decision-model",
       chatModel: "chat-model",
-      leaseOwner: "lease-context",
+      promptModules: {
+        leaseOwner: "lease-context",
+        loadPromptModules: async () => [moduleDefinition("context", { activationMode: "every_turn" })],
+        executePromptModule: async ({ context }) => {
+          invocations.push(context);
+          return { kind: "succeeded", content: "context output", durationMs: 1 };
+        },
+        recordPromptModuleDefinitions: async () => {},
+        recordPromptModuleDecision: async () => {},
+        recordPromptModuleExecution: async () => {},
+      },
       now: () => attemptTimes.shift(),
       temporalSettings: { timezone: "America/New_York", seasonHemisphere: null, birthdayMonth: null, birthdayDay: null },
       callDecisions: async () => { throw new Error("every-turn activation must not need a decision"); },
@@ -598,17 +616,9 @@ describe("generic prompt modules", () => {
         assert.equal(turnId, "stable-turn-id");
         return "The previous published reply.";
       },
-      loadPromptModules: async () => [moduleDefinition("context", { activationMode: "every_turn" })],
-      executePromptModule: async ({ context }) => {
-        invocations.push(context);
-        return { kind: "succeeded", content: "context output", durationMs: 1 };
-      },
       recordChatRequest: async ({ temporalContext }) => {
         chatTemporalContexts.push(temporalContext);
       },
-      recordPromptModuleDefinitions: async () => {},
-      recordPromptModuleDecision: async () => {},
-      recordPromptModuleExecution: async () => {},
       log: () => {},
     };
     const work = {
@@ -654,9 +664,12 @@ describe("generic prompt modules", () => {
         content: "A standalone notice is not a prior companion reply.",
       }],
       loadPreviousPublishedAssistantReply: async () => null,
-      executePromptModule: async ({ context }) => {
-        absentResponse = context.previousAssistantResponse;
-        return { kind: "succeeded", content: "context output", durationMs: 1 };
+      promptModules: {
+        ...deps.promptModules,
+        executePromptModule: async ({ context }) => {
+          absentResponse = context.previousAssistantResponse;
+          return { kind: "succeeded", content: "context output", durationMs: 1 };
+        },
       },
     });
     assert.equal(absentResponse, "");
@@ -667,10 +680,12 @@ describe("generic prompt modules", () => {
     const base = processorDeps({
       now: () => new Date("2026-12-15T12:00:00.000Z"),
       temporalSettings: { timezone: "UTC", seasonHemisphere: null, birthdayMonth: null, birthdayDay: null },
-      loadPromptModules: async () => [moduleDefinition("date-context", { activationMode: "every_turn" })],
-      executePromptModule: async ({ context }) => {
-        seen.push(context.localDateTime);
-        return { kind: "succeeded", content: "context output", durationMs: 1 };
+      promptModules: {
+        loadPromptModules: async () => [moduleDefinition("date-context", { activationMode: "every_turn" })],
+        executePromptModule: async ({ context }) => {
+          seen.push(context.localDateTime);
+          return { kind: "succeeded", content: "context output", durationMs: 1 };
+        },
       },
     });
     for (const [id, createdAt, timezone] of [
@@ -700,7 +715,9 @@ describe("generic prompt modules", () => {
       },
       messages: [{ id: "module-free-user", role: "user", content: "current" }],
     }, processorDeps({
-      loadPromptModules: async () => [],
+      promptModules: {
+        loadPromptModules: async () => [],
+      },
       loadPreviousPublishedAssistantReply: async () => {
         replyLookups += 1;
         return null;
@@ -716,7 +733,14 @@ describe("generic prompt modules", () => {
     const deps = {
       decisionModel: "decision-model",
       chatModel: "chat-model",
-      leaseOwner: "lease-trace-failure",
+      promptModules: {
+        leaseOwner: "lease-trace-failure",
+        loadPromptModules: async () => [moduleDefinition("trace-failure")],
+        executePromptModule: async () => ({ kind: "succeeded", content: "thought", durationMs: 1 }),
+        recordPromptModuleDefinitions: async () => { throw new Error("SQL password and provider body"); },
+        recordPromptModuleDecision: async () => {},
+        recordPromptModuleExecution: async () => {},
+      },
       callDecisions: async () => { throw new Error("SQL password and provider body"); },
       callChat: async (request) => {
         chatCalls += 1;
@@ -731,11 +755,6 @@ describe("generic prompt modules", () => {
       loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
       loadContext: async () => [],
       loadPreviousPublishedAssistantReply: async () => null,
-      loadPromptModules: async () => [moduleDefinition("trace-failure")],
-      executePromptModule: async () => ({ kind: "succeeded", content: "thought", durationMs: 1 }),
-      recordPromptModuleDefinitions: async () => { throw new Error("SQL password and provider body"); },
-      recordPromptModuleDecision: async () => {},
-      recordPromptModuleExecution: async () => {},
       recordChatRequest: async (payload) => traces.push(payload),
       log: (message) => logs.push(message),
     };
@@ -746,7 +765,7 @@ describe("generic prompt modules", () => {
     assert.equal(result.reply, "reply");
     assert.equal(chatCalls, 1);
     assert.equal(traces.length, 1);
-    assert.deepEqual(traces[0].messageChunks, ["identity", "conversation"]);
+    assert.deepEqual(traces[0].request.messages.map(message => message.chunk), ["identity", "conversation"]);
     assert.ok(logs.some((line) => line.includes("trace_write_failed boundary=definitions")));
     assert.ok(!logs.some((line) => /password|provider body/.test(line)));
   });
@@ -760,7 +779,14 @@ describe("generic prompt modules", () => {
       }, {
         decisionModel: "decision-model",
         chatModel: "chat-model",
-        leaseOwner: "lease-fenced-module",
+        promptModules: {
+          leaseOwner: "lease-fenced-module",
+          loadPromptModules: async () => [moduleDefinition("fenced")],
+          executePromptModule: async () => ({ kind: "succeeded", content: "thought", durationMs: 1 }),
+          recordPromptModuleDefinitions: async () => { throw new TraceWriteFencedError("stale lease"); },
+          recordPromptModuleDecision: async () => {},
+          recordPromptModuleExecution: async () => {},
+        },
         callDecisions: async () => ({}),
         callChat: async () => {
           chatCalls += 1;
@@ -770,11 +796,6 @@ describe("generic prompt modules", () => {
         loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
         loadContext: async () => [],
         loadPreviousPublishedAssistantReply: async () => null,
-        loadPromptModules: async () => [moduleDefinition("fenced")],
-        executePromptModule: async () => ({ kind: "succeeded", content: "thought", durationMs: 1 }),
-        recordPromptModuleDefinitions: async () => { throw new TraceWriteFencedError("stale lease"); },
-        recordPromptModuleDecision: async () => {},
-        recordPromptModuleExecution: async () => {},
       }),
       TraceWriteFencedError,
     );
@@ -788,7 +809,14 @@ describe("generic prompt modules", () => {
     const deps = {
       decisionModel: "decision-model",
       chatModel: "chat-model",
-      leaseOwner: "lease-attribution",
+      promptModules: {
+        leaseOwner: "lease-attribution",
+        loadPromptModules: async () => [moduleDefinition("attributed", { key: "attributed" })],
+        executePromptModule: async () => ({ kind: "succeeded", content: "ready thought", durationMs: 1 }),
+        recordPromptModuleDefinitions: async () => {},
+        recordPromptModuleDecision: async () => {},
+        recordPromptModuleExecution: async () => {},
+      },
       callDecisions: async (request) => responseFor(request, { attributed: PROMPT_MODULE_INCLUDE }),
       callChat: async (request) => {
         chatRequest = request;
@@ -802,11 +830,6 @@ describe("generic prompt modules", () => {
       loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
       loadContext: async () => [],
       loadPreviousPublishedAssistantReply: async () => null,
-      loadPromptModules: async () => [moduleDefinition("attributed", { key: "attributed" })],
-      executePromptModule: async () => ({ kind: "succeeded", content: "ready thought", durationMs: 1 }),
-      recordPromptModuleDefinitions: async () => {},
-      recordPromptModuleDecision: async () => {},
-      recordPromptModuleExecution: async () => {},
       recordChatRequest: async (payload) => {
         requestTraces.push(payload);
         if (requestTraces.length === 1) {
@@ -821,10 +844,10 @@ describe("generic prompt modules", () => {
     }, deps);
     assert.equal(result.reply, "reply");
     assert.equal(requestTraces.length, 2);
-    assert.deepEqual(requestTraces[0].messageChunks, ["identity", "prompt_module", "conversation"]);
-    assert.deepEqual(requestTraces[0].messagePromptModuleIds, [null, "attributed", null]);
-    assert.deepEqual(requestTraces[1].messageChunks, ["identity", "conversation"]);
-    assert.deepEqual(requestTraces[1].messagePromptModuleIds, [null, null]);
+    assert.deepEqual(requestTraces[0].request.messages.map(message => message.chunk), ["identity", "prompt_module", "conversation"]);
+    assert.deepEqual(requestTraces[0].request.messages.map(message => message.promptModuleId), [null, "attributed", null]);
+    assert.deepEqual(requestTraces[1].request.messages.map(message => message.chunk), ["identity", "conversation"]);
+    assert.deepEqual(requestTraces[1].request.messages.map(message => message.promptModuleId), [null, null]);
     assert.deepEqual(chatRequest.messages.map((message) => message.role), ["system", "user"]);
     assert.ok(!JSON.stringify(chatRequest).includes("ready thought"));
     assert.ok(logs.some((line) => line.includes("trace_write_failed boundary=chat_attribution")));
@@ -864,7 +887,14 @@ describe("generic prompt modules", () => {
         }, {
           decisionModel: "decision-model",
           chatModel: "chat-model",
-          leaseOwner,
+          promptModules: {
+            leaseOwner,
+            loadPromptModules: async () => [moduleDefinition("outcome", { key: "outcome" })],
+            executePromptModule: async () => ({ kind: "succeeded", content: "module thought", durationMs: 1 }),
+            recordPromptModuleDefinitions: async () => {},
+            recordPromptModuleDecision: async () => {},
+            recordPromptModuleExecution: async () => {},
+          },
           callDecisions: async (request) => responseFor(request, {
             outcome: PROMPT_MODULE_INCLUDE,
           }),
@@ -876,11 +906,6 @@ describe("generic prompt modules", () => {
           loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
           loadContext: async () => [],
           loadPreviousPublishedAssistantReply: async () => null,
-          loadPromptModules: async () => [moduleDefinition("outcome", { key: "outcome" })],
-          executePromptModule: async () => ({ kind: "succeeded", content: "module thought", durationMs: 1 }),
-          recordPromptModuleDefinitions: async () => {},
-          recordPromptModuleDecision: async () => {},
-          recordPromptModuleExecution: async () => {},
           recordChatRequest: async () => {},
           recordChatOutcome: async (payload) => {
             outcomePayloads.push(payload);
@@ -892,8 +917,8 @@ describe("generic prompt modules", () => {
         /transport unavailable|ChatContractError/i,
       );
       assert.equal(outcomePayloads.length, 1);
-      assert.deepEqual(outcomePayloads[0].messageChunks, ["identity", "prompt_module", "conversation"]);
-      assert.deepEqual(outcomePayloads[0].messagePromptModuleIds, [null, "outcome", null]);
+      assert.deepEqual(outcomePayloads[0].request.messages.map(message => message.chunk), ["identity", "prompt_module", "conversation"]);
+      assert.deepEqual(outcomePayloads[0].request.messages.map(message => message.promptModuleId), [null, "outcome", null]);
       assert.ok(sqlCalls.some(({ sql }) => sql.includes("INSERT INTO trace_attempt_chat")));
     }
   });

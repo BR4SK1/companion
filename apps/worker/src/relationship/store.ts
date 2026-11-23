@@ -386,6 +386,7 @@ export function createRelationshipStore(input: {
       configuration,
       answers: currentAnswers,
     });
+    if (questions.length === 0) return [];
     const selectedKeys = new Set(questions.map((question) => question.key));
     const result = await params.callLlm({
       systemPrompt: "Extract only evidence from the supplied new conversation turn into the supplied shared-bank question slots. Follow the supplied runtime instructions and response contract.",

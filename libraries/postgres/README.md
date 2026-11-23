@@ -18,4 +18,4 @@ No endpoint, hostname, or credential is included; connection configuration is su
 
 ## Open questions
 
-Safe-rollout policies and migration-runner tooling (checksum verification, down-migrations, a CLI) remain open. Backup/recovery and hardening of the external PostgreSQL service belong to that service, not to this project. Do not imply database rollback is transactional or guaranteed without a designed mechanism.
+Safe-rollout policies and migration-runner tooling (checksum verification, down-migrations) remain open. The worker provides a migration-only command over the shared runner. Backup/recovery and hardening of the external PostgreSQL service belong to that service, not to this project. Do not imply database rollback is transactional or guaranteed without a designed mechanism.

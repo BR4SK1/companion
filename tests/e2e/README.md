@@ -20,7 +20,7 @@ Optional environment overrides: `E2E_NAMESPACE` (default `companion-np`), `E2E_R
 
 1. `01-access-and-safety.spec.mjs` — test-gate session issuance, OIDC absence on the test channel, owner-only main channel redirect and API refusal, cross-channel cookie isolation, Host and forwarding-header rejections on the gate listener, same-origin checks, and worker health/readiness + bearer-token boundaries.
 2. `02-pwa.spec.mjs` — public PWA assets (`manifest.webmanifest`, `sw.js`, `offline.html`, generated PNG icons) on both channels, document head metadata, service worker registration and offline-page-only caching, offline navigation fallback and recovery, `/api` exclusion, and HTTP error preservation.
-3. `03-live-chat.spec.mjs` — real end-to-end browser chat turn through the composer -> web BFF -> worker -> PostgreSQL -> live OpenRouter reply -> reload persistence.
+3. `03-live-chat.spec.mjs` — real end-to-end browser chat turn, including same-key retry after an interrupted acceptance acknowledgment, through the composer -> web BFF -> worker -> PostgreSQL -> live OpenRouter reply -> reload persistence.
 
 ## Boundaries
 

@@ -498,15 +498,15 @@ describe("processor: modular assembly with memory, patterns, and trace metadata"
     ];
     const expectedSources = [null, null, "id-1", "id-2", "id-3", "id-4"];
     for (const payload of [...requests, ...outcomes]) {
-      assert.deepEqual(payload.messageChunks, expectedChunks);
-      assert.deepEqual(payload.messageSources, expectedSources);
+      assert.deepEqual(payload.request.messages.map(message => message.chunk), expectedChunks);
+      assert.deepEqual(payload.request.messages.map(message => message.sourceMessageId), expectedSources);
       assert.equal(payload.identityRevision, 7);
       assert.equal(
-        payload.messageChunks.length,
+        payload.request.messages.map(message => message.chunk).length,
         payload.request.messages.length,
       );
       assert.equal(
-        payload.messageSources.length,
+        payload.request.messages.map(message => message.sourceMessageId).length,
         payload.request.messages.length,
       );
     }
@@ -608,7 +608,7 @@ describe("processor: modular assembly with memory, patterns, and trace metadata"
       loadRelationshipContext: async () => ({ context: "FAMILIARITY", baseTierOrdinal: 0 }),
       recordChatRequest: async (payload) => { trace = payload; },
     }));
-    assert.deepEqual(trace.messageChunks, [
+    assert.deepEqual(trace.request.messages.map(message => message.chunk), [
       "identity",
       "profiles",
       "relationship",
@@ -683,8 +683,8 @@ describe("processor: modular assembly with memory, patterns, and trace metadata"
     }));
     assert.equal(initiativeCalls, 1);
     assert.deepEqual(inclusions, [{ turnId: "turn-1", reactionId: candidate.reactionId }]);
-    assert.ok(!trace.messageChunks.includes("article"), "article is folded into dynamic guidance without duplication");
-    const guidanceIndex = trace.messageChunks.indexOf("guidance");
+    assert.ok(!trace.request.messages.map(message => message.chunk).includes("article"), "article is folded into dynamic guidance without duplication");
+    const guidanceIndex = trace.request.messages.map(message => message.chunk).indexOf("guidance");
     assert.ok(guidanceIndex > 0);
     const guidanceText = trace.request.messages[guidanceIndex].content;
     assert.match(guidanceText, /The user seems distracted/);
@@ -715,7 +715,7 @@ describe("processor: modular assembly with memory, patterns, and trace metadata"
       recordChatRequest: async (payload) => { normalTrace = payload; },
     }));
     assert.equal(normalInitiativeCalls, 0);
-    assert.ok(!normalTrace.messageChunks.includes("guidance"));
+    assert.ok(!normalTrace.request.messages.map(message => message.chunk).includes("guidance"));
   });
 
   it("buildDynamicInitiativePrompt handles questions-only and article-only cleanly", () => {

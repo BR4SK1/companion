@@ -1,5 +1,4 @@
-// Focused PostgreSQL coverage for relationship configuration and the atomic
-// answer-write publication hook. Uses synthetic configuration only and no
+// Focused PostgreSQL coverage for configuration and post-publication learning. Uses synthetic configuration only and no
 // provider/network calls. This suite is skipped without an explicitly supplied
 // isolated disposable WORKER_TEST_DATABASE_URL.
 
@@ -17,6 +16,7 @@ import { engagementMigrations } from "../../apps/worker/src/engagement/migration
 import { articleMigrations } from "../../apps/worker/src/articles/migrations.ts";
 import { relationshipMigrations } from "../../apps/worker/src/relationship/migrations.ts";
 import { temporalMigrations } from "../../apps/worker/src/temporal/migrations.ts";
+import { learnNextReply } from "../../apps/worker/src/relationship/learning.ts";
 import { behavioralDay } from "../../apps/worker/src/memory/time.ts";
 import {
   createConversationStore,
@@ -236,101 +236,24 @@ describe("relationship familiarity (PostgreSQL)", { skip: !hasDatabase }, () => 
     ]), [["user", "synthetic persisted answer", true]]);
   });
 
-  it("fences answer writes, commits them with publication, and makes duplicate publication a no-op", async () => {
-    await conversationStore.appendUserMessage({ content: "synthetic user input" });
-    const claim = await conversationStore.claimNextTurn({ owner: "relationship-owner-1", leaseSeconds: 60 });
-    assert.equal(claim.kind, "claimed");
-    let hookCalls = 0;
-    const updates = [{
-      questionKey: "synthetic-question",
-      participant: "user",
-      answer: "synthetic interpreted answer",
-      clarificationNeeded: true,
-    }];
-    const publishArgs = {
-      turnId: claim.work.turn.id,
-      leaseOwner: "relationship-owner-1",
-      content: "synthetic assistant reply",
-      onPublicationTransaction: async (client) => {
-        hookCalls += 1;
-        await relationshipStore.recordAnswers(client, updates);
+  it("learns a committed reply once and resumes after a persistence failure", async () => {
+    await pool.query("INSERT INTO relationship_learning_cursor (reply_seq) VALUES (0) ON CONFLICT (singleton) DO UPDATE SET reply_seq = 0");
+    await conversationStore.appendUserMessage({ content: "first" });
+    await conversationStore.appendUserMessage({ content: "second" });
+    const claim = await conversationStore.claimNextTurn({ owner: "owner", leaseSeconds: 60 });
+    const fixture = {
+      ...relationshipStore,
+      extractAnswers: async ({ userText, assistantText }) => {
+        assert.equal(userText, "first\nsecond");
+        assert.equal(assistantText, "published");
+        return [{ questionKey: "synthetic-question", participant: "user", answer: "learned", clarificationNeeded: false }];
       },
     };
-
-    const fenced = await conversationStore.publishReply({
-      ...publishArgs,
-      leaseOwner: "not-the-owner",
-    });
-    assert.equal(fenced, "fenced");
-    assert.equal(hookCalls, 0);
-    assert.equal((await pool.query(`SELECT count(*)::int AS count FROM relationship_answer`)).rows[0].count, 0);
-
-    assert.equal(await conversationStore.publishReply(publishArgs), "published");
-    assert.equal(hookCalls, 1);
-    const saved = await pool.query(
-      `SELECT participant, current_answer, clarification_needed
-       FROM relationship_answer WHERE question_id = $1`,
-      [QUESTION_ID],
-    );
-    assert.deepEqual(saved.rows, [{
-      participant: "user",
-      current_answer: "synthetic interpreted answer",
-      clarification_needed: true,
-    }]);
-
-    assert.equal(await conversationStore.publishReply(publishArgs), "already_published");
-    assert.equal(hookCalls, 1, "duplicate publication must not replay the answer hook");
-    assert.equal((await pool.query(`SELECT count(*)::int AS count FROM relationship_answer`)).rows[0].count, 1);
-  });
-
-  it("rolls back partial optional answer writes to a savepoint without blocking reply publication", async () => {
-    await conversationStore.appendUserMessage({ content: "second synthetic user input" });
-    const claim = await conversationStore.claimNextTurn({ owner: "relationship-owner-2", leaseSeconds: 60 });
-    assert.equal(claim.kind, "claimed");
-    const previousAnswer = await pool.query(
-      `INSERT INTO relationship_answer (question_id, participant, current_answer)
-       VALUES ($1, 'user', 'previous answer') RETURNING current_answer`,
-      [QUESTION_ID],
-    );
-    assert.equal(previousAnswer.rows[0].current_answer, "previous answer");
-
-    const oldWarn = console.warn;
-    const warnings = [];
-    console.warn = (...args) => warnings.push(args.join(" "));
-    try {
-      const outcome = await conversationStore.publishReply({
-        turnId: claim.work.turn.id,
-        leaseOwner: "relationship-owner-2",
-        content: "second synthetic assistant reply",
-        onPublicationTransaction: async (client) => {
-          await relationshipStore.recordAnswers(client, [{
-            questionKey: "synthetic-question",
-            participant: "user",
-            answer: "partial replacement",
-            clarificationNeeded: false,
-          }]);
-          // Deliberately violate the participant CHECK after a valid write.
-          await client.query(
-            `INSERT INTO relationship_answer (question_id, participant, current_answer)
-             VALUES ($1, 'invalid-participant', 'invalid')`,
-            [QUESTION_ID],
-          );
-        },
-      });
-      assert.equal(outcome, "published");
-      assert.equal(warnings.length, 1);
-    } finally {
-      console.warn = oldWarn;
-    }
-    const answer = await pool.query(
-      `SELECT current_answer FROM relationship_answer WHERE question_id = $1 AND participant = 'user'`,
-      [QUESTION_ID],
-    );
-    assert.equal(answer.rows[0].current_answer, "previous answer");
-    const reply = await pool.query(
-      `SELECT content FROM conversation_message WHERE turn_id = $1 AND role = 'assistant'`,
-      [claim.work.turn.id],
-    );
-    assert.deepEqual(reply.rows, [{ content: "second synthetic assistant reply" }]);
+    assert.equal(await learnNextReply(pool, fixture), false);
+    await conversationStore.publishReply({ turnId: claim.work.turn.id, leaseOwner: "owner", content: "published" });
+    await assert.rejects(learnNextReply(pool, { ...fixture, recordAnswers: async () => { throw Error("write failed"); } }), /write failed/);
+    assert.equal(await learnNextReply(pool, fixture), true);
+    assert.equal(await learnNextReply(pool, fixture), false);
+    assert.deepEqual((await pool.query("SELECT current_answer FROM relationship_answer")).rows, [{current_answer: "learned"}]);
   });
 });

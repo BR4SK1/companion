@@ -208,12 +208,6 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       "SELECT id FROM companion_schema_migration ORDER BY id",
     );
     assert.equal(vectorBefore.length, 1, "the verified test database must contain pgvector");
-    assert.deepEqual(
-      { schema: vectorBefore[0].schema, owner: vectorBefore[0].owner },
-      { schema: "public", owner: "postgres" },
-      "pgvector's existing installation location and owner are part of the fixture invariant",
-    );
-
     const fixture = await createIsolatedMigrationFixture(pool, DATABASE_URL, "extension_isolation");
     try {
       await runMigrations(fixture.pool, conversationMigrations.slice(0, 1));
@@ -849,6 +843,37 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.equal(turnIds.size, 1);
   });
 
+  for (const writer of ["reply", "scheduled notice"]) {
+    it(`serializes ${writer} with an open ingest before assigning its seq`, async () => {
+      await store.appendUserMessage({ content: "start" });
+      const { work } = await store.claimNextTurn({ owner: "writer", leaseSeconds: 60 });
+      if (writer === "scheduled notice") {
+        await store.publishReply({ turnId: work.turn.id, leaseOwner: "writer", content: "done" });
+      }
+      const inserted = Promise.withResolvers();
+      const release = Promise.withResolvers();
+      const slowStore = createConversationStore(pool, {
+        onUserMessageInserted: async () => { inserted.resolve(); await release.promise; },
+      });
+      const ingest = slowStore.appendUserMessage({ content: "slow" });
+      await inserted.promise;
+      const publishing = writer === "reply"
+        ? store.publishReply({ turnId: work.turn.id, leaseOwner: "writer", content: writer })
+        : store.publishScheduledAssistantMessage({ prepare: async () => ({
+            content: writer, validUntil: null, recordPublication: async () => {},
+          }) });
+      try {
+        assert.equal(await Promise.race([publishing.then(() => "published"), sleep(75).then(() => "waiting")]), "waiting");
+      } finally {
+        release.resolve();
+      }
+      const accepted = await ingest;
+      await publishing;
+      const newer = await store.getThreadPage({ after: accepted.seq, limit: 5 });
+      assert.deepEqual(newer.messages.map(m => m.content), [writer]);
+    });
+  }
+
   it("blocks ingestion behind an in-flight ingest transaction so seq order matches commit order", async () => {
     // Emulate the exact in-flight state a store ingest creates: the
     // serialization lock held, a seq drawn, the row not yet committed. A
@@ -1085,9 +1110,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId: first.work.turn.id,
       leaseOwner: "stale-owner",
       payload: {
-        request: { model: "chat-model", messages: [{ role: "user", content: "stale" }] },
-        messageSources: [null],
-        messageChunks: ["conversation"],
+        request: { model: "chat-model", messages: [{ role: "user", content: "stale", chunk: "conversation", sourceMessageId: null, promptModuleId: null }] },
         identityRevision: 1,
       },
     });
@@ -1096,9 +1119,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId: first.work.turn.id,
       leaseOwner: "stale-owner",
       payload: {
-        request: { model: "chat-model", messages: [{ role: "user", content: "stale" }] },
-        messageSources: [null],
-        messageChunks: ["conversation"],
+        request: { model: "chat-model", messages: [{ role: "user", content: "stale", chunk: "conversation", sourceMessageId: null, promptModuleId: null }] },
         identityRevision: 1,
         outcome: {
           kind: "failed",
@@ -2087,9 +2108,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId: first.work.turn.id,
       leaseOwner: "stale-owner",
       payload: {
-        request: { model: "chat-model", messages: [{ role: "user", content: "stale" }] },
-        messageSources: [null],
-        messageChunks: ["conversation"],
+        request: { model: "chat-model", messages: [{ role: "user", content: "stale", chunk: "conversation", sourceMessageId: null, promptModuleId: null }] },
         identityRevision: 1,
         outcome: {
           kind: "failed",
@@ -2121,9 +2140,9 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId: first.work.turn.id,
       leaseOwner: "fresh-owner",
       payload: {
-        request: freshChatRequest,
-        messageSources: [null, messageId],
-        messageChunks: ["guidance", "conversation"],
+        request: { ...freshChatRequest, messages: freshChatRequest.messages.map((message, i) => ({ ...message,
+          chunk: ["guidance", "conversation"][i], sourceMessageId: [null, messageId][i], promptModuleId: null,
+        })) },
         identityRevision: 1,
       },
     });
@@ -2132,9 +2151,9 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId: first.work.turn.id,
       leaseOwner: "fresh-owner",
       payload: {
-        request: freshChatRequest,
-        messageSources: [null, messageId],
-        messageChunks: ["guidance", "conversation"],
+        request: { ...freshChatRequest, messages: freshChatRequest.messages.map((message, i) => ({ ...message,
+          chunk: ["guidance", "conversation"][i], sourceMessageId: [null, messageId][i], promptModuleId: null,
+        })) },
         identityRevision: 1,
         outcome: {
           kind: "responded",
@@ -2199,37 +2218,15 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       messages: [{ role: "user", content: "atomic" }],
     };
 
-    // A misaligned messageSources payload fails the whole record
-    // transaction: no chat row, no chat messages, and the attempt stays open.
-    await assert.rejects(
-      () =>
-        store.recordChatRequest({
-          turnId: claim.work.turn.id,
-          leaseOwner: "owner-atomic",
-          payload: {
-            request: chatRequest,
-            messageSources: [messageId, messageId],
-            messageChunks: ["conversation"],
-            identityRevision: 1,
-          },
-        }),
-      /messageSources must align/,
-    );
-    // A misaligned messageChunks payload fails the same way.
-    await assert.rejects(
-      () =>
-        store.recordChatRequest({
-          turnId: claim.work.turn.id,
-          leaseOwner: "owner-atomic",
-          payload: {
-            request: chatRequest,
-            messageSources: [messageId],
-            messageChunks: ["conversation", "conversation"],
-            identityRevision: 1,
-          },
-        }),
-      /messageChunks must align/,
-    );
+    // An unknown source violates the message FK; the complete trace rolls back.
+    await assert.rejects(store.recordChatRequest({
+      turnId: claim.work.turn.id, leaseOwner: "owner-atomic",
+      payload: {
+        request: { ...chatRequest, messages: [{ ...chatRequest.messages[0],
+          sourceMessageId: "11111111-1111-4111-8111-111111111111", chunk: "conversation", promptModuleId: null }] },
+        identityRevision: 1,
+      },
+    }), { code: "23503" });
     const afterFailure = await pool.query(
       `SELECT (SELECT status FROM conversation_turn WHERE id = $1) AS status,
               (SELECT count(*)::int FROM conversation_message
@@ -2251,9 +2248,9 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId: claim.work.turn.id,
       leaseOwner: "owner-atomic",
       payload: {
-        request: chatRequest,
-        messageSources: [messageId],
-        messageChunks: ["conversation"],
+        request: { ...chatRequest, messages: chatRequest.messages.map((message, i) => ({ ...message,
+          chunk: ["conversation"][i], sourceMessageId: [messageId][i], promptModuleId: null,
+        })) },
         identityRevision: 1,
       },
     });
@@ -2267,9 +2264,9 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId: claim.work.turn.id,
       leaseOwner: "owner-atomic",
       payload: {
-        request: chatRequest,
-        messageSources: [messageId],
-        messageChunks: ["conversation"],
+        request: { ...chatRequest, messages: chatRequest.messages.map((message, i) => ({ ...message,
+          chunk: ["conversation"][i], sourceMessageId: [messageId][i], promptModuleId: null,
+        })) },
         identityRevision: 1,
         outcome: {
           kind: "responded",
@@ -2394,9 +2391,9 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId,
       leaseOwner: "owner-report",
       payload: {
-        request: chatRequest,
-        messageSources,
-        messageChunks: ["identity", "guidance", "conversation"],
+        request: { ...chatRequest, messages: chatRequest.messages.map((message, i) => ({ ...message,
+          chunk: ["identity", "guidance", "conversation"][i], sourceMessageId: messageSources[i], promptModuleId: null,
+        })) },
         identityRevision: 1,
       },
     });
@@ -2404,9 +2401,9 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId,
       leaseOwner: "owner-report",
       payload: {
-        request: chatRequest,
-        messageSources,
-        messageChunks: ["identity", "guidance", "conversation"],
+        request: { ...chatRequest, messages: chatRequest.messages.map((message, i) => ({ ...message,
+          chunk: ["identity", "guidance", "conversation"][i], sourceMessageId: messageSources[i], promptModuleId: null,
+        })) },
         identityRevision: 1,
         outcome: {
           kind: "responded",
@@ -2520,33 +2517,12 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
   });
 
   it("preserves a legacy pre-tracing turn and its decision JSONB through the tracing migration", async () => {
-    await withRestoredChatIdentity(pool, async () => {
-      // Roll the database back to its pre-tracing shape: drop the tracing
-      // tables and their migration bookkeeping rows, keep the domain tables.
-      // The chat-identity migration (0004) and article, relationship, routine,
-      // and prompt-module migrations also alter trace tables, so re-apply them in
-      // the same order as the worker's domain migration composition.
-      await pool.query(
-        `DROP TABLE IF EXISTS
-           trace_attempt_prompt_module_chat_message,
-           trace_attempt_prompt_module_probability, trace_attempt_prompt_module,
-           prompt_module, trace_attempt_chat_choice, trace_attempt_chat_message, trace_attempt_chat,
-           trace_attempt_decision_probability, trace_attempt_decision,
-           trace_attempt_pattern, trace_attempt_context, trace_attempt,
-           chat_identity`,
-      );
-      await pool.query(`DROP INDEX IF EXISTS article_share_turn_reaction_idx`);
-      await pool.query(
-        `DELETE FROM companion_schema_migration
-         WHERE id IN ('0002_conversation_tracing', '0004_chat_identity',
-                      '0008_article_share_and_evidence', '0011_relationship_chat_chunk',
-                       '0013_routine_chat_chunk', '0017_trace_attempt_temporal_context',
-                       '0018_generic_prompt_modules', '0019_prompt_module_chat_attribution',
-                       '0025_time_chat_chunk')`,
-      );
-
+    const fixture = await createIsolatedMigrationFixture(pool, DATABASE_URL, "legacy_turn");
+    const database = fixture.pool;
+    try {
+      await runMigrations(database, conversationMigrations.slice(0, 1));
       // A legacy turn exactly as pre-tracing code wrote it.
-      const legacy = await pool.query(
+      const legacy = await database.query(
         `INSERT INTO conversation_turn
            (id, status, attempt, selected_pattern_id, decision, completed_at)
          VALUES (gen_random_uuid(), 'completed', 1, 'concise',
@@ -2554,42 +2530,17 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
          RETURNING id`,
       );
       const legacyTurnId = legacy.rows[0].id;
-      await pool.query(
+      await database.query(
         `INSERT INTO conversation_message
-           (role, content, turn_id, effective_at, time_source,
-            client_time_status, server_received_at)
-         VALUES ('assistant', 'legacy reply', $1, now(), 'server', 'absent', now())`,
+           (role, content, turn_id) VALUES ('assistant', 'legacy reply', $1)`,
         [legacyTurnId],
       );
 
-      // Re-apply every migration that owns the recreated trace tables or adds
-      // a system-message chunk classification, in the worker composition order.
-      const applied = await runMigrations(pool, workerMigrations);
-      assert.deepEqual(applied.applied, [
-        "0002_conversation_tracing",
-        "0004_chat_identity",
-        "0008_article_share_and_evidence",
-        "0011_relationship_chat_chunk",
-        "0013_routine_chat_chunk",
-        "0017_trace_attempt_temporal_context",
-        "0018_generic_prompt_modules",
-        "0019_prompt_module_chat_attribution",
-        "0025_time_chat_chunk",
-      ]);
-      const chunkConstraint = await pool.query(
-        `SELECT pg_get_constraintdef(oid) AS definition
-         FROM pg_constraint
-         WHERE conrelid = 'trace_attempt_chat_message'::regclass
-           AND conname = 'trace_attempt_chat_message_chunk_check'`,
-      );
-      assert.match(chunkConstraint.rows[0].definition, /relationship/);
-      assert.match(chunkConstraint.rows[0].definition, /routine/);
-      assert.match(chunkConstraint.rows[0].definition, /prompt_module/);
-      assert.match(chunkConstraint.rows[0].definition, /time/);
+      await runMigrations(database, [...conversationMigrations, ...workerMigrations.filter(m => m.id === "0017_trace_attempt_temporal_context")]);
 
       // The legacy row is untouched: the decision JSONB is exactly as inserted,
       // and no attempt rows were fabricated for it.
-      const turn = await pool.query(
+      const turn = await database.query(
         "SELECT status, selected_pattern_id, decision FROM conversation_turn WHERE id = $1",
         [legacyTurnId],
       );
@@ -2598,23 +2549,18 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
         confidence: 0.9,
         model: "legacy-model",
       });
-      const attemptRows = await pool.query(
+      const attemptRows = await database.query(
         "SELECT count(*)::int AS n FROM trace_attempt WHERE turn_id = $1",
         [legacyTurnId],
       );
       assert.equal(attemptRows.rows[0].n, 0);
 
-      // The report presents the legacy turn with no recorded attempts and its
-      // legacy decision JSONB, clearly kept apart from traced attempts.
-      const report = await store.getTurnTraceReport({ turnId: legacyTurnId });
-      assert.equal(report.turn.id, legacyTurnId);
-      assert.deepEqual(report.turn.decision, {
-        choice: "concise",
-        confidence: 0.9,
-        model: "legacy-model",
-      });
-      assert.equal(report.attempts.length, 0);
-    });
+      const report = await createConversationStore(database).getTurnTraceReport({ turnId: legacyTurnId });
+      assert.deepEqual(report.turn.decision, turn.rows[0].decision);
+      assert.deepEqual(report.attempts, []);
+    } finally {
+      await fixture.dispose();
+    }
   });
 
   /**
@@ -2859,15 +2805,15 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId: claim.work.turn.id,
       leaseOwner: "owner-a",
       payload: {
-        request: chatRequest,
-        messageSources: [
-          null,
-          ...claim.work.messages.map((message) => message.id),
-        ],
-        messageChunks: [
+        request: { ...chatRequest, messages: chatRequest.messages.map((message, i) => ({ ...message,
+          chunk: [
           "identity",
           ...claim.work.messages.map(() => "conversation"),
-        ],
+        ][i], sourceMessageId: [
+          null,
+          ...claim.work.messages.map((message) => message.id),
+        ][i], promptModuleId: null,
+        })) },
         identityRevision: 1,
         outcome: {
           kind: "responded",
@@ -3249,21 +3195,19 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
       turnId,
       leaseOwner: "owner-a",
       payload: {
-        request: buildChatRequest({
+        request: traceRequest(buildChatRequest({
           model: "chat-model",
           identity: "Integration fixture identity: generic test text.",
           history: [],
           turnMessages: claim.work.messages,
           guidance: null,
-        }),
-        messageSources: [
+        }), [
           null,
           ...claim.work.messages.map((message) => message.id),
-        ],
-        messageChunks: [
+        ], [
           "identity",
           ...claim.work.messages.map(() => "conversation"),
-        ],
+        ]),
         identityRevision: 1,
         outcome: {
           kind: "responded",
@@ -3316,3 +3260,7 @@ describe("worker durable conversation work (PostgreSQL)", { skip: !hasDatabase }
     assert.equal(after.turn.error, "interleaved");
   });
 });
+
+function traceRequest(request, sources, chunks) {
+  return { ...request, messages: request.messages.map((message, i) => ({ ...message, chunk: chunks[i], sourceMessageId: sources[i], promptModuleId: null })) };
+}

@@ -487,6 +487,17 @@ describe("relationship extraction question bound", () => {
     );
   });
 
+  it("skips the provider when all question slots are filled", async () => {
+    const pool = { query: async () => ({ rows: ["user", "assistant"].map(participant => ({
+      question_key: "question-0", participant, current_answer: "answered", clarification_needed: false,
+    })) }) };
+    const store = createRelationshipStore({ pool, configuration: largeBank(1) });
+    assert.deepEqual(await store.extractAnswers({
+      userText: "hello", assistantText: "reply",
+      callLlm: async () => assert.fail("no eligible question"),
+    }), []);
+  });
+
   it("bounds the actual extraction prompt and filters prior interpretations to it", async () => {
     let prompt;
     const pool = {
@@ -680,7 +691,7 @@ describe("relationship conversation integration", () => {
     assert.equal(built.request.messages[1].content, "RELATIONSHIP");
   });
 
-  it("degrades to ordinary chat when relationship context and extraction fail", async () => {
+  it("degrades to ordinary chat when relationship context fails", async () => {
     const previousWarn = console.warn;
     const warnings = [];
     console.warn = (...args) => warnings.push(args.join(" "));
@@ -697,72 +708,15 @@ describe("relationship conversation integration", () => {
         loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
         loadContext: async () => [],
         loadRelationshipContext: async () => { throw new Error("synthetic failure"); },
-        extractRelationshipAnswers: async () => { throw new Error("synthetic extraction failure"); },
       });
       assert.equal(result.reply, "ordinary reply");
-      assert.equal(result.relationshipAnswers, undefined);
-      assert.equal(warnings.length, 2);
+      assert.equal(warnings.length, 1);
       assert.ok(warnings.every((warning) => !warning.includes("synthetic")), "logs do not expose raw failure text");
     } finally {
       console.warn = previousWarn;
     }
   });
 
-  it("passes answer updates only through a successful publication transaction", async () => {
-    const persisted = [];
-    const updates = [{ questionKey: "question-a", participant: "assistant", answer: "reply-derived", clarificationNeeded: false }];
-    const claimedWork = {
-      turn: { id: "turn-publish", status: "in_flight", attempt: 1 },
-      messages: [message("1", "user", "hello")],
-    };
-    const store = {
-      claimNextTurn: async () => ({ kind: "claimed", work: claimedWork }),
-      publishReply: async (params) => {
-        assert.equal(params.content, "published reply");
-        await params.onPublicationTransaction({ query: async () => ({ rows: [] }) });
-        return "published";
-      },
-    };
-    await runEngineOnce({
-      store,
-      processTurn: async () => ({ reply: "published reply", selectedPatternId: null, relationshipAnswers: updates }),
-      recordRelationshipAnswers: async (client, answers) => {
-        persisted.push(...answers);
-        await client.query("relationship answer write");
-      },
-      leaseSeconds: 3,
-      pollSeconds: 1,
-    });
-    assert.deepEqual(persisted, updates);
-  });
-
-  it("learns only the current grouped user messages after the assistant reply", async () => {
-    const events = [];
-    const work = {
-      turn: { id: "turn-a", status: "in_flight", attempt: 1, leaseOwner: "owner", leaseExpiresAt: new Date().toISOString(), selectedPatternId: null, decision: null, error: null, createdAt: new Date().toISOString(), completedAt: null },
-      messages: [message("1", "user", "first part"), message("2", "user", "second part")],
-    };
-    const result = await processTurnWork(work, {
-      decisionModel: "fake-decision",
-      chatModel: "fake-chat",
-      callDecisions: async () => { throw new Error("not expected"); },
-      callChat: async () => { events.push("chat"); return chatResponse("assistant reply"); },
-      loadPatterns: async () => [],
-      loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
-      loadContext: async () => [],
-      loadRelationshipContext: async () => "relationship context",
-      extractRelationshipAnswers: async (input) => {
-        events.push("extract");
-        assert.equal(input.userText, "first part\nsecond part");
-        assert.equal(input.assistantText, "assistant reply");
-        assert.equal(input.turnId, "turn-a");
-        return [{ questionKey: "question-a", participant: "user", answer: "answer", clarificationNeeded: false }];
-      },
-    });
-    assert.deepEqual(events, ["chat", "extract"]);
-    assert.equal(result.reply, "assistant reply");
-    assert.equal(result.relationshipAnswers.length, 1);
-  });
 });
 
 describe("main reply output budget by base familiarity tier", () => {

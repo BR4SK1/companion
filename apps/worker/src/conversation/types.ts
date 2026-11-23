@@ -250,23 +250,23 @@ export type DecisionSelectionTrace =
   | { readonly kind: "selected-none" }
   | { readonly kind: "rejected"; readonly reason: string };
 
-/**
- * The chat request record, written before the provider call: the native typed
- * request as sent. `messageSources` is aligned index-by-index with the request
- * messages; a source is null for the synthetic guidance system message and the
- * conversation_message id for every other message.
- */
+/** One assembled prompt message with its chunk classification and source. */
+export interface AssembledChatMessage {
+  readonly role: "system" | "user" | "assistant";
+  readonly content: string;
+  readonly chunk: ChatChunkName;
+  /** The conversation_message id for conversation messages; null for synthetic chunks. */
+  readonly sourceMessageId: string | null;
+  /** The database module id for a prompt_module message; null otherwise. */
+  readonly promptModuleId: string | null;
+}
+
+export type TracedChatRequest = Omit<ChatRequest, "messages"> & {
+  readonly messages: readonly AssembledChatMessage[];
+};
+
 export interface ChatRequestTracePayload {
-  readonly request: ChatRequest;
-  readonly messageSources: readonly (string | null)[];
-  /**
-   * Chunk classification per request message, index-aligned with
-   * `messageSources`. Synthetic messages carry their chunk name; every
-   * conversation message is `conversation`.
-   */
-  readonly messageChunks: readonly ChatChunkName[];
-  /** Optional feature-owned attribution aligned with messages; null for non-module chunks. */
-  readonly messagePromptModuleIds?: readonly (string | null)[];
+  readonly request: TracedChatRequest;
   /** The `chat_identity` revision the request carried. */
   readonly identityRevision: number;
   /** Current local clock/season/occasion facts used by this exact request. */
@@ -302,11 +302,7 @@ export type ChatOutcomeTrace =
 
 /** The full chat boundary record after the call: request plus outcome. */
 export interface ChatOutcomeTracePayload {
-  readonly request: ChatRequest;
-  readonly messageSources: readonly (string | null)[];
-  readonly messageChunks: readonly ChatChunkName[];
-  /** Optional feature-owned attribution aligned with messages; null for non-module chunks. */
-  readonly messagePromptModuleIds?: readonly (string | null)[];
+  readonly request: TracedChatRequest;
   readonly identityRevision: number;
   readonly outcome: ChatOutcomeTrace;
 }

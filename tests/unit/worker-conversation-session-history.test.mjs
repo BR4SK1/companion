@@ -197,7 +197,32 @@ describe("processor propagation of session-scoped history", () => {
     await processTurnWork(work, {
       decisionModel: "decision-model",
       chatModel: "chat-model",
-      leaseOwner: "lease-1",
+      promptModules: {
+        leaseOwner: "lease-1",
+        loadPromptModules: async () => [
+          {
+            id: "mod-1",
+            key: "module_mod_1",
+            decisionDescription: "criterion",
+            functionDefinition: "() => 'thought'",
+            executionMode: "function",
+            httpConfig: null,
+            definitionHash: "a".repeat(64),
+            fallbackContent: null,
+            timeoutMs: 5000,
+            position: 0,
+            activationMode: "every_turn",
+            outputKind: "thoughts",
+          },
+        ],
+        executePromptModule: async ({ context }) => {
+          moduleContexts.push(context);
+          return { kind: "succeeded", content: "module thought", durationMs: 1 };
+        },
+        recordPromptModuleDefinitions: async () => {},
+        recordPromptModuleDecision: async () => {},
+        recordPromptModuleExecution: async () => {},
+      },
       callDecisions: async (request) => {
         decisionRequests.push(request);
         return {
@@ -227,30 +252,7 @@ describe("processor propagation of session-scoped history", () => {
       loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
       loadContext: async () => scopedHistory,
       loadPreviousPublishedAssistantReply: async () => null,
-      loadPromptModules: async () => [
-        {
-          id: "mod-1",
-          key: "module_mod_1",
-          decisionDescription: "criterion",
-          functionDefinition: "() => 'thought'",
-          executionMode: "function",
-          httpConfig: null,
-          definitionHash: "a".repeat(64),
-          fallbackContent: null,
-          timeoutMs: 5000,
-          position: 0,
-          activationMode: "every_turn",
-          outputKind: "thoughts",
-        },
-      ],
-      executePromptModule: async ({ context }) => {
-        moduleContexts.push(context);
-        return { kind: "succeeded", content: "module thought", durationMs: 1 };
-      },
       recordSnapshot: async (payload) => { snapshots.push(payload); },
-      recordPromptModuleDefinitions: async () => {},
-      recordPromptModuleDecision: async () => {},
-      recordPromptModuleExecution: async () => {},
       recordChatRequest: async () => {},
       recordChatOutcome: async () => {},
       recordDecisionRequest: async () => {},

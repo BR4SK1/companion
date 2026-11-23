@@ -41,6 +41,7 @@ import {
   loadRelationshipConfiguration,
   RelationshipConfigurationError,
 } from "./relationship/store.ts";
+import { startRelationshipLearning } from "./relationship/learning.ts";
 import { renderRelationshipContext } from "./relationship/runtime.ts";
 import { createRoutineStore } from "./routine/store.ts";
 import { renderRoutineContext } from "./routine/runtime.ts";
@@ -125,6 +126,7 @@ async function main(): Promise<void> {
 
   let api: ReturnType<typeof createApiServer> | undefined;
   let memoryRuntime: ReturnType<typeof startMemoryRuntime> | undefined;
+  let learning: Awaited<ReturnType<typeof startRelationshipLearning>> | undefined;
   let articleRuntime: ReturnType<typeof startArticleRuntime> | undefined;
   let routineRuntime: ReturnType<typeof startRoutineRuntime> | undefined;
   try {
@@ -546,7 +548,9 @@ async function main(): Promise<void> {
     // configuration's narrowing (a captured `let` would not stay narrowed).
     const provisionedMemoryConfiguration = memoryConfiguration;
     const provisionedRelationshipStore = relationshipStore;
-    const provisionedRelationshipCallLlm = relationshipCallLlm;
+    if (provisionedRelationshipStore && relationshipCallLlm) {
+      learning = await startRelationshipLearning(pool, provisionedRelationshipStore, relationshipCallLlm, relationshipExtractionPreset);
+    }
     const provisionedRoutineStore = routineStore;
     api = createApiServer({
       store,
@@ -651,7 +655,6 @@ async function main(): Promise<void> {
                     config.openrouter.chatReasoningEffort,
                 }
               : {}),
-            leaseOwner,
             temporalSettings,
             callDecisions: (request) =>
               postJson(config.openrouter.decisionsUrl, request, {
@@ -664,21 +667,24 @@ async function main(): Promise<void> {
                 timeoutMs: config.openrouter.chatTimeoutMs,
               }),
             loadPatterns: () => store.getEnabledResponsePatterns(),
-            loadPromptModules: () => promptModuleStore.loadEnabled(),
-            promptModuleCredentials: config.promptModuleCredentials,
-            executePromptModule,
-            recordPromptModuleDefinitions: (payload) =>
-              recordTraced("prompt-module definitions", work.turn.id, () =>
-                promptModuleStore.recordDefinitions(payload),
-              ),
-            recordPromptModuleDecision: (payload) =>
-              recordTraced("prompt-module decision", work.turn.id, () =>
-                promptModuleStore.recordDecision(payload),
-              ),
-            recordPromptModuleExecution: (payload) =>
-              recordTraced("prompt-module execution", work.turn.id, () =>
-                promptModuleStore.recordExecution(payload),
-              ),
+            promptModules: {
+              leaseOwner,
+              loadPromptModules: () => promptModuleStore.loadEnabled(),
+              promptModuleCredentials: config.promptModuleCredentials,
+              executePromptModule,
+              recordPromptModuleDefinitions: (payload) =>
+                recordTraced("prompt-module definitions", work.turn.id, () =>
+                  promptModuleStore.recordDefinitions(payload),
+                ),
+              recordPromptModuleDecision: (payload) =>
+                recordTraced("prompt-module decision", work.turn.id, () =>
+                  promptModuleStore.recordDecision(payload),
+                ),
+              recordPromptModuleExecution: (payload) =>
+                recordTraced("prompt-module execution", work.turn.id, () =>
+                  promptModuleStore.recordExecution(payload),
+                ),
+            },
             // Required, fail-closed configuration: a missing or empty
             // identity row is an IdentityConfigurationError that fails the
             // attempt before any snapshot, decision, or provider call — the
@@ -768,21 +774,6 @@ async function main(): Promise<void> {
                     }),
                 }
               : {}),
-            ...(provisionedRelationshipStore !== undefined &&
-                provisionedRelationshipCallLlm !== undefined
-              ? {
-                  extractRelationshipAnswers: (input: {
-                    readonly userText: string;
-                    readonly assistantText: string;
-                  }) =>
-                    provisionedRelationshipStore.extractAnswers({
-                      userText: input.userText,
-                      assistantText: input.assistantText,
-                      callLlm: provisionedRelationshipCallLlm,
-                      taskPreset: relationshipExtractionPreset,
-                    }),
-                }
-              : {}),
             loadRoutineContext: async (_turnId, referenceTime) => {
               const snapshot = await provisionedRoutineStore.getSnapshot(referenceTime);
               return snapshot === null ? null : renderRoutineContext(snapshot);
@@ -825,12 +816,6 @@ async function main(): Promise<void> {
         ownerLabel: "companion-worker",
         log: (message) => console.log(message),
         onTurnPublished: (turnId) => memoryRuntime?.onTurnPublished(turnId),
-        ...(provisionedRelationshipStore !== undefined
-          ? {
-              recordRelationshipAnswers: (client, answers) =>
-                provisionedRelationshipStore.recordAnswers(client, answers),
-            }
-          : {}),
       },
       { signal: shutdown.signal },
     );
@@ -868,6 +853,7 @@ async function main(): Promise<void> {
         );
       });
     }
+    await learning?.close();
     await closePostgresPool(pool);
   }
 }

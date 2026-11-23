@@ -358,12 +358,7 @@ export interface PublishReplyParams {
   readonly turnId: string;
   readonly leaseOwner: string;
   readonly content: string;
-  /**
-   * Optional domain-owned work committed atomically with the reply. The
-   * conversation store runs it behind a savepoint so optional-domain failure
-   * cannot block publication; the callback receives this transaction's client.
-   */
-  readonly onPublicationTransaction?: (client: PostgresPoolClient) => Promise<void>;
+
 }
 
 export interface FailTurnParams {
@@ -485,6 +480,7 @@ export interface ThreadStatus {
    * read) and sanitized — it never carries the underlying error text.
    */
   readonly hasRecentFailure: boolean;
+  readonly retryAttemptId: string | null;
 }
 
 export interface ThreadPageParams {
@@ -494,6 +490,7 @@ export interface ThreadPageParams {
    * page of the thread.
    */
   readonly before?: number;
+  readonly after?: number;
 }
 
 /** One bounded page of the thread in persisted `seq` order. */
@@ -501,7 +498,7 @@ export interface ThreadPage {
   readonly messages: readonly ConversationMessage[];
   /** Smallest `seq` in the page; null when the page is empty. */
   readonly oldestSeq: number | null;
-  /** True when committed messages exist below this page. */
+  /** More committed messages exist in the requested direction. */
   readonly hasMore: boolean;
 }
 
@@ -560,6 +557,7 @@ export interface ConversationStore {
   /** Previous published assistant turn reply, independent of bounded context history. */
   getPreviousPublishedAssistantReply(turnId: string): Promise<string | null>;
   /** Bounded page of the thread in `seq` order (see the notes below). */
+  retryFailedAttempt(attemptId: string): Promise<boolean>;
   getThreadPage(params: ThreadPageParams): Promise<ThreadPage>;
   getThreadStatus(): Promise<ThreadStatus>;
   getTurnTraceReport(params: TurnTraceParams): Promise<TurnTraceReport>;
@@ -1332,39 +1330,13 @@ export function createConversationStore(
     }
   }
 
-  function alignedPromptModuleIds(
-    payload: ChatRequestTracePayload | ChatOutcomeTracePayload,
-  ): readonly (string | null)[] {
-    const messageCount = payload.request.messages.length;
-    if (payload.messageSources.length !== messageCount) {
-      throw new Error("chat trace messageSources must align with the request messages");
-    }
-    if (payload.messageChunks.length !== messageCount) {
-      throw new Error("chat trace messageChunks must align with the request messages");
-    }
-    const promptModuleIds = payload.messagePromptModuleIds ?? Array.from(
-      { length: messageCount },
-      () => null,
-    );
-    if (promptModuleIds.length !== messageCount) {
-      throw new Error("chat trace messagePromptModuleIds must align with the request messages");
-    }
-    for (let position = 0; position < messageCount; position += 1) {
-      const isPromptModule = payload.messageChunks[position] === "prompt_module";
-      if (isPromptModule !== (promptModuleIds[position] !== null)) {
-        throw new Error("prompt_module chunks require exactly one aligned module id");
-      }
-    }
-    return promptModuleIds;
-  }
-
   async function insertChatMessageRows(
     client: PostgresPoolClient,
     attemptId: string,
     chatId: string,
     payload: ChatRequestTracePayload | ChatOutcomeTracePayload,
   ): Promise<void> {
-    const promptModuleIds = alignedPromptModuleIds(payload);
+    const messages = payload.request.messages;
     if (payload.request.messages.length > 0) {
       await client.query(
         `INSERT INTO trace_attempt_chat_message
@@ -1377,13 +1349,13 @@ export function createConversationStore(
           payload.request.messages.map((_, index) => index),
           payload.request.messages.map((message) => message.role),
           payload.request.messages.map((message) => message.content),
-          payload.messageSources,
-          payload.messageChunks,
+          messages.map(message => message.sourceMessageId),
+          messages.map(message => message.chunk),
         ],
       );
     }
-    const moduleMessages = promptModuleIds.flatMap((moduleId, position) =>
-      moduleId === null ? [] : [{ moduleId, position }],
+    const moduleMessages = messages.flatMap(({ promptModuleId }, position) =>
+      promptModuleId === null ? [] : [{ moduleId: promptModuleId, position }],
     );
     if (moduleMessages.length > 0) {
       if (options?.onPromptModuleChatMessagesRecorded === undefined) {
@@ -1481,7 +1453,6 @@ export function createConversationStore(
     attemptId: string,
     payload: ChatOutcomeTracePayload,
   ): Promise<void> {
-    alignedPromptModuleIds(payload);
     const outcome = payload.outcome;
     let state: string;
     let responseId: string | null = null;
@@ -1728,22 +1699,6 @@ export function createConversationStore(
            VALUES ('assistant', $1, $2, now(), 'server', 'absent', now())`,
           [params.content, params.turnId],
         );
-        if (params.onPublicationTransaction !== undefined) {
-          await client.query("SAVEPOINT optional_publication_hook");
-          try {
-            await params.onPublicationTransaction(client);
-            await client.query("RELEASE SAVEPOINT optional_publication_hook");
-          } catch {
-            // Optional domain writes must be atomic with themselves but cannot
-            // prevent a valid reply from publishing. Savepoint rollback keeps
-            // a partial set of answer updates from leaking into the commit.
-            await client.query("ROLLBACK TO SAVEPOINT optional_publication_hook");
-            await client.query("RELEASE SAVEPOINT optional_publication_hook");
-            console.warn(
-              "[CONVERSATION] optional publication transaction hook failed; reply published without optional updates",
-            );
-          }
-        }
         const attemptId = await findOpenAttemptAfterTransition(
           client,
           params.turnId,
@@ -1776,6 +1731,24 @@ export function createConversationStore(
         return reply.rows.length > 0 ? "already_published" : "fenced";
       }
       return "fenced";
+    });
+  }
+
+  /** Reopen only the latest failed attempt; the normal claim path starts a fresh attempt. */
+  async function retryFailedAttempt(attemptId: string): Promise<boolean> {
+    return withTransaction(pool, async client => {
+      await client.query("SELECT pg_advisory_xact_lock($1)", [CLAIM_ADVISORY_LOCK_KEY]);
+      const result = await client.query(
+        `UPDATE conversation_turn t
+         SET status = 'in_flight', lease_owner = 'retry-requested', lease_expires_at = now(),
+             error = NULL, selected_pattern_id = NULL
+         FROM trace_attempt a
+         WHERE a.id = $1 AND a.turn_id = t.id AND a.attempt = t.attempt
+           AND t.status = 'failed' AND a.outcome = 'failed'
+           AND t.id = (SELECT id FROM conversation_turn ORDER BY thread_order DESC LIMIT 1)`,
+        [attemptId],
+      );
+      return result.rowCount === 1;
     });
   }
 
@@ -2349,82 +2322,26 @@ export function createConversationStore(
     return selectSessionHistory(messages, states, currentIds);
   }
 
-  /**
-   * One bounded page of the whole thread, oldest first, in persisted `seq`
-   * order — the read model for client history loading and reconciliation.
-   *
-   * Why pages instead of an incremental `seq > watermark` read: a reply's
-   * `seq` is drawn at insert time inside the publication transaction, but
-   * the row only becomes visible at commit. A user message ingested between
-   * those moments commits first with a higher `seq`, so a poller that
-   * already observed that message and later polls with `seq > watermark`
-   * would never see the reply committed behind its watermark (its `seq` is
-   * lower). Pages read a bounded seq range and let the consumer reconcile
-   * by message `id`, which is immune to that ordering.
-   *
-   * Page selection: without `before`, the newest `limit` messages; with
-   * `before`, the `limit` messages with the highest `seq` strictly below
-   * that bound. Walking `before = oldestSeq` from the newest page therefore
-   * pages backwards through the whole history, and `hasMore` (false once a
-   * page reaches the bottom) terminates the walk.
-   *
-   * Concurrency: page rows and the `hasMore`/`oldestSeq` bounds are computed
-   * in ONE statement, so they come from one read-committed snapshot — the
-   * flag cannot disagree with the page it describes. A message whose
-   * transaction commits during the read is simply absent from both; a
-   * consumer that re-derives the gaps between its loaded seqs each cycle
-   * (see `ThreadStatus` for the allocation invariant) recovers it on a
-   * later read.
-   */
+  /** All three message writers serialize seq allocation through commit. */
   async function getThreadPage(params: ThreadPageParams): Promise<ThreadPage> {
-    if (!(Number.isInteger(params.limit) && params.limit > 0)) {
-      throw new Error("limit must be a positive integer");
+    const { limit, before, after } = params;
+    if (!Number.isSafeInteger(limit) || limit < 1 ||
+        (before !== undefined && after !== undefined) ||
+        (before !== undefined && (!Number.isSafeInteger(before) || before < 1)) ||
+        (after !== undefined && (!Number.isSafeInteger(after) || after < 0))) {
+      throw new Error("invalid thread page bounds");
     }
-    if (
-      params.before !== undefined &&
-      !(Number.isInteger(params.before) && params.before >= 1)
-    ) {
-      throw new Error("before must be a positive integer seq bound");
-    }
-    const result = await pool.query<
-      MessageRow & { page_oldest_seq: string | null; has_more: boolean }
-    >(
-      `WITH page AS (
-         SELECT id, seq, role, content, turn_id, client_key, created_at,
-                client_sent_at, effective_at, time_source, client_time_status,
-                server_received_at
-         FROM conversation_message
-         WHERE ($2::bigint IS NULL OR seq < $2::bigint)
-         ORDER BY seq DESC
-         LIMIT $1
-       ), bounds AS (
-         SELECT
-           (SELECT min(seq) FROM page) AS page_oldest_seq,
-           EXISTS (
-             SELECT 1 FROM conversation_message
-             WHERE seq < COALESCE(
-               (SELECT min(seq) FROM page), $2::bigint
-             )
-           ) AS has_more
-       )
-       SELECT p.id, p.seq, p.role, p.content, p.turn_id, p.client_key,
-              p.created_at, p.client_sent_at, p.effective_at, p.time_source,
-              p.client_time_status, p.server_received_at,
-              b.page_oldest_seq, b.has_more
-       FROM page p CROSS JOIN bounds b
-       ORDER BY p.seq ASC`,
-      [params.limit, params.before ?? null],
+    const forward = after !== undefined;
+    const cursor = after ?? before;
+    const result = await pool.query<MessageRow>(
+      `SELECT ${MESSAGE_COLUMNS} FROM conversation_message
+       ${cursor === undefined ? "" : forward ? "WHERE seq > $2" : "WHERE seq < $2"}
+       ORDER BY seq ${forward ? "ASC" : "DESC"} LIMIT $1`,
+      cursor === undefined ? [limit + 1] : [limit + 1, cursor],
     );
-    const firstRow = result.rows[0];
-    const oldestSeq =
-      firstRow !== undefined && firstRow.page_oldest_seq !== null
-        ? Number(firstRow.page_oldest_seq)
-        : null;
-    return {
-      messages: result.rows.map(mapMessage),
-      oldestSeq,
-      hasMore: firstRow !== undefined ? firstRow.has_more : false,
-    };
+    const messages = result.rows.slice(0, limit).map(mapMessage);
+    if (!forward) messages.reverse();
+    return { messages, oldestSeq: messages[0]?.seq ?? null, hasMore: result.rows.length > limit };
   }
 
   /**
@@ -2453,6 +2370,7 @@ export function createConversationStore(
       generating: boolean;
       allocated_high: string;
       has_recent_failure: boolean;
+      retry_attempt_id: string | null;
     }>(
       `SELECT
          (SELECT count(*) FROM conversation_message
@@ -2475,7 +2393,11 @@ export function createConversationStore(
                      GROUP BY ct.id
                    ) c
                  ), 0)
-         ) AS has_recent_failure`,
+         ) AS has_recent_failure,
+         (SELECT a.id FROM (SELECT id, attempt, status FROM conversation_turn
+           ORDER BY thread_order DESC LIMIT 1) latest
+          JOIN trace_attempt a ON a.turn_id = latest.id AND a.attempt = latest.attempt
+          WHERE latest.status = 'failed' AND a.outcome = 'failed') AS retry_attempt_id`,
     );
     const row = result.rows[0];
     if (row === undefined) {
@@ -2486,6 +2408,7 @@ export function createConversationStore(
       generating: row.generating,
       highestAllocatedSeq: Number(row.allocated_high),
       hasRecentFailure: row.has_recent_failure,
+      retryAttemptId: row.retry_attempt_id,
     };
   }
 
@@ -2507,6 +2430,7 @@ export function createConversationStore(
     getChatIdentity,
     getThreadContext,
     getPreviousPublishedAssistantReply,
+    retryFailedAttempt,
     getThreadPage,
     getThreadStatus,
     getTurnTraceReport,

@@ -24,6 +24,7 @@ test("worker startup and migration-only command share the complete ordered schem
       "0009_article_observation_claim",
       "0010_relationship_familiarity",
       "0011_relationship_chat_chunk",
+      "0030_relationship_learning_cursor",
       "0012_routine_schedule",
       "0013_routine_chat_chunk",
       "0014_routine_announcement",

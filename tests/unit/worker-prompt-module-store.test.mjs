@@ -149,14 +149,9 @@ describe("prompt module trace persistence", () => {
       payload: {
         request: {
           model: "chat-model",
-          messages: [
-            { role: "system", content: "identity" },
-            { role: "user", content: "hello" },
-          ],
+          messages: [{ role: "system", content: "identity", chunk: "identity", sourceMessageId: null, promptModuleId: null },
+            { role: "user", content: "hello", chunk: "conversation", sourceMessageId: "00000000-0000-4000-8000-000000000004", promptModuleId: null }],
         },
-        messageSources: [null, "00000000-0000-4000-8000-000000000004"],
-        messageChunks: ["identity", "conversation"],
-        messagePromptModuleIds: [null, null],
         identityRevision: 1,
       },
     });
@@ -232,15 +227,10 @@ describe("prompt module trace persistence", () => {
       payload: {
         request: {
           model: "chat-model",
-          messages: [
-            { role: "system", content: "identity" },
-            { role: "system", content: "authoritative context" },
-            { role: "user", content: "hello" },
-          ],
+          messages: [{ role: "system", content: "identity", chunk: "identity", sourceMessageId: null, promptModuleId: null },
+            { role: "system", content: "authoritative context", chunk: "prompt_module", sourceMessageId: null, promptModuleId: moduleId },
+            { role: "user", content: "hello", chunk: "conversation", sourceMessageId: "00000000-0000-4000-8000-000000000004", promptModuleId: null }],
         },
-        messageSources: [null, null, "00000000-0000-4000-8000-000000000004"],
-        messageChunks: ["identity", "prompt_module", "conversation"],
-        messagePromptModuleIds: [null, moduleId, null],
         identityRevision: 1,
       },
     });
@@ -309,16 +299,11 @@ describe("prompt module trace persistence", () => {
       payload: {
         request: {
           model: "chat-model",
-          messages: [
-            { role: "system", content: "identity" },
-            { role: "system", content: "module thought one" },
-            { role: "system", content: "module thought two" },
-            { role: "user", content: "hello" },
-          ],
+          messages: [{ role: "system", content: "identity", chunk: "identity", sourceMessageId: null, promptModuleId: null },
+            { role: "system", content: "module thought one", chunk: "prompt_module", sourceMessageId: null, promptModuleId: moduleId },
+            { role: "system", content: "module thought two", chunk: "prompt_module", sourceMessageId: null, promptModuleId: secondModuleId },
+            { role: "user", content: "hello", chunk: "conversation", sourceMessageId: "00000000-0000-4000-8000-000000000004", promptModuleId: null }],
         },
-        messageSources: [null, null, null, "00000000-0000-4000-8000-000000000004"],
-        messageChunks: ["identity", "prompt_module", "prompt_module", "conversation"],
-        messagePromptModuleIds: [null, moduleId, secondModuleId, null],
         identityRevision: 1,
       },
     });

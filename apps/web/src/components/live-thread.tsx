@@ -16,11 +16,8 @@ import type { Message, MessageImage } from "@/lib/messages";
 import {
   appendPending,
   createClientKey,
-  detectThreadGaps,
   dropConfirmedPending,
-  mayHaveEarlierHistory,
   mergeThreadMessages,
-  nextGapWalkStep,
   parseThreadSnapshotResponse,
   removePending,
   updatePending,
@@ -33,23 +30,6 @@ import {
 /** Snapshot poll cadence while the page is open. */
 const POLL_INTERVAL_MS = 2_000;
 
-/**
- * History bounds for a refresh: after the newest page, up to this many
- * pages are fetched back per cycle until the bottom of the history is
- * reached; older history stays reachable through the "load earlier"
- * control. An interrupted walk (a failed fetch) resumes from where it
- * stopped on a later cycle, still bounded per cycle.
- */
-const BACKFILL_MAX_PAGES = 5;
-
-/**
- * At most this many page fetches per poll cycle are spent reconciling gaps
- * in the loaded range. The budget is shared across gaps and spent
- * round-robin so no gap can starve another; walk cursors persist between
- * cycles, so progress through a wide gap is monotonic.
- */
-const MAX_RECONCILE_PAGES_PER_CYCLE = 3;
-
 function toUiMessage(message: ThreadMessage): Message {
   return {
     id: message.id,
@@ -59,29 +39,6 @@ function toUiMessage(message: ThreadMessage): Message {
   };
 }
 
-/**
- * The live, durable conversation.
- *
- * Data flow: this component reads the BFF's paged thread endpoint and
- * reconciles what it holds (see `thread-state.ts` for the correctness
- * rules). Per cycle it polls the newest page and merges it by message id;
- * it walks history backwards (up to `BACKFILL_MAX_PAGES` per cycle until
- * the bottom, interrupted walks resuming later; older pages behind a "load
- * earlier" control); and it re-derives the gaps between its loaded seqs
- * every cycle and spends a bounded page budget walking those gaps downward
- * — recovering late-committed messages buried under later traffic and
- * waiting out in-flight transactions for as long as they take, with no
- * timing assumption and no hole ever discarded. A seq burned by a
- * rolled-back insert never resolves; its cost is bounded probing, never a
- * missed message. Composed messages post with one stable idempotency key
- * each.
- *
- * States kept visible: first-load loading, connection errors with
- * automatic retry plus an explicit retry control, ended sessions,
- * per-message send failures with retry (same key) or discard, and a
- * sanitized notice when the trailing conversation includes a failed
- * generation.
- */
 export function LiveThread() {
   const router = useRouter();
   const [messages, setMessages] = useState<readonly ThreadMessage[]>([]);
@@ -101,33 +58,14 @@ export function LiveThread() {
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
 
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState(false);
+  const newestSeen = useRef<number | undefined>(undefined);
   const pollingRef = useRef(false);
   const mountedRef = useRef(true);
   const pendingRef = useRef<readonly PendingSend[]>([]);
   const messagesRef = useRef<readonly ThreadMessage[]>([]);
-  const statusRef = useRef<ThreadStatus>({
-    queued: 0,
-    generating: false,
-    highestAllocatedSeq: 0,
-    hasRecentFailure: false,
-  });
-  const oldestLoadedRef = useRef<number | null>(null);
-  const historyLoadedRef = useRef(false);
   const loadingEarlierRef = useRef(false);
-  /**
-   * Gap-walk cursors, keyed by the gap's upper neighbor seq: the `before`
-   * bound the walk will resume from. Persists between cycles so a walk
-   * interrupted by the per-cycle budget or by a fetch failure makes
-   * monotonic progress instead of restarting.
-   */
-  const gapWalkRef = useRef<Map<number, number>>(new Map());
-  /**
-   * Round-robin offset into the gap list: the index the next cycle starts
-   * spending the reconciliation budget at, so a wide gap cannot starve
-   * fresher ones.
-   */
-  const gapRoundRobinRef = useRef(0);
-
   useEffect(() => {
     pendingRef.current = pending;
   }, [pending]);
@@ -139,31 +77,30 @@ export function LiveThread() {
       page: ThreadPage;
       timezone: string | null;
     }) => {
-      const merged = mergeThreadMessages(messagesRef.current, parsed.messages);
-      messagesRef.current = merged;
-      oldestLoadedRef.current =
-        merged.length > 0 ? (merged[0]?.seq ?? null) : null;
-      statusRef.current = parsed.status;
-      setMessages(merged);
+      if (parsed.messages.length > 0) {
+        const merged = mergeThreadMessages(messagesRef.current, parsed.messages);
+        messagesRef.current = merged;
+        setMessages(merged);
+        setPending(previous => dropConfirmedPending(previous, merged));
+      }
       setTimezone(parsed.timezone);
       setStatus(parsed.status);
-      setPending((previous) => dropConfirmedPending(previous, parsed.messages));
     },
     [],
   );
 
   /**
    * One authenticated page read from the BFF. Reports outcomes as values so
-   * the callers (poll, backfill, gap walk, load-earlier) share the same
+   * the callers (poll and load-earlier) share the same
    * session/error handling.
    */
   const fetchPage = useCallback(
-    async (before?: number) => {
+    async (cursor?: { before: number } | { after: number }) => {
       try {
         const url =
-          before === undefined
+          cursor === undefined
             ? "/api/thread"
-            : `/api/thread?before=${String(before)}`;
+            : `/api/thread?${"before" in cursor ? "before=" + cursor.before : "after=" + cursor.after}`;
         const response = await fetch(url, { cache: "no-store" });
         if (!mountedRef.current) {
           return { kind: "stopped" } as const;
@@ -197,148 +134,27 @@ export function LiveThread() {
     [],
   );
 
-  /**
-   * Page backwards from `startCursor` (the oldest loaded seq) until the
-   * bottom of the history is reached or the per-cycle bound is hit. Returns
-   * whether the walk ran to a definite stop (bottom, or bound exhausted) —
-   * a failed fetch returns false so the caller retries on a later cycle
-   * from where this walk stopped, rather than stranding the progress. The
-   * remaining bound is kept in `historyHasMore` and surfaced as the "load
-   * earlier" control; `mayHaveEarlierHistory` keeps it visible while
-   * allocated-but-uncommitted seqs may still exist below, so committed
-   * history is never unreachable through the UI.
-   */
-  const backfillFrom = useCallback(
-    async (startCursor: number): Promise<boolean> => {
-      let cursor: number | null = startCursor;
-      let more = true;
-      for (
-        let pageIndex = 0;
-        more && cursor !== null && pageIndex < BACKFILL_MAX_PAGES;
-        pageIndex += 1
-      ) {
-        const requested = cursor;
-        const result = await fetchPage(requested);
-        if (result.kind !== "ok") {
-          // The walk stopped above history that may exist, so the control
-          // must stay available for the user rather than silently hiding
-          // older history.
-          setHistoryHasMore(true);
-          return false;
-        }
-        applySnapshot(result.parsed);
-        more = mayHaveEarlierHistory(
-          result.parsed.page,
-          statusRef.current.highestAllocatedSeq,
-          requested,
-        );
-        cursor = result.parsed.page.oldestSeq;
-      }
-      setHistoryHasMore(more);
-      return true;
-    },
-    [applySnapshot, fetchPage],
-  );
-
-  /**
-   * Reconcile the loaded range: re-derive the gaps between loaded seqs
-   * (cheap, O(loaded messages)) and spend a bounded page budget walking
-   * them downward, round-robin so no gap starves another. A gap is either
-   * committed-but-unfetched history (the walk recovers it), in flight (the
-   * walk recovers it whenever the transaction commits — minutes or hours,
-   * no deadline), or burned by a rollback (never resolves; its cost is a
-   * bounded share of probing each cycle, never a missed message). Walk
-   * cursors persist between cycles, so progress through a wide gap is
-   * monotonic across cycles.
-   */
-  const reconcileGaps = useCallback(async () => {
-    const gaps = detectThreadGaps(messagesRef.current);
-    // Drop walk cursors for gaps that no longer exist (filled or superseded).
-    if (gaps.length === 0) {
-      gapWalkRef.current.clear();
-      gapRoundRobinRef.current = 0;
-      return;
-    }
-    const liveBounds = new Set(gaps.map((gap) => gap.before));
-    for (const key of gapWalkRef.current.keys()) {
-      if (!liveBounds.has(key)) {
-        gapWalkRef.current.delete(key);
-      }
-    }
-    let budget = MAX_RECONCILE_PAGES_PER_CYCLE;
-    const start = gapRoundRobinRef.current % gaps.length;
-    // Rotate so each cycle begins where the last one stopped spending.
-    const ordered = [...gaps.slice(start), ...gaps.slice(0, start)];
-    let examined = 0;
-    for (const gap of ordered) {
-      if (budget <= 0) {
-        break;
-      }
-      examined += 1;
-      let cursor = gapWalkRef.current.get(gap.before) ?? gap.before;
-      while (budget > 0) {
-        const result = await fetchPage(cursor);
-        if (result.kind !== "ok") {
-          // Keep the cursor: the next cycle resumes this walk where it
-          // stopped, so progress stays monotonic.
-          return;
-        }
-        budget -= 1;
-        applySnapshot(result.parsed);
-        const step = nextGapWalkStep(result.parsed.page, gap);
-        if (step.kind === "continue") {
-          cursor = step.cursor;
-          gapWalkRef.current.set(gap.before, cursor);
-          continue;
-        }
-        // Stop case: the gap is fully loaded, or everything committed below
-        // the cursor is loaded and the remainder is in flight or burned.
-        // Either way the walk is done; detection re-derives the gap next
-        // cycle if a later commit re-opens it.
-        gapWalkRef.current.delete(gap.before);
-        break;
-      }
-    }
-    gapRoundRobinRef.current = (start + examined) % gaps.length;
-  }, [applySnapshot, fetchPage]);
-
   const poll = useCallback(async () => {
-    if (pollingRef.current) {
-      return;
-    }
+    if (pollingRef.current) return;
     pollingRef.current = true;
     try {
-      const result = await fetchPage();
-      if (result.kind !== "ok") {
-        return;
-      }
-      applySnapshot(result.parsed);
-      // Walk the history back (bounded per cycle) until the bottom is
-      // reached. An interrupted walk marks history not-yet-loaded and
-      // resumes from where it stopped on a later cycle.
-      if (!historyLoadedRef.current) {
-        const startCursor = oldestLoadedRef.current;
-        if (
-          startCursor === null ||
-          !mayHaveEarlierHistory(
-            result.parsed.page,
-            statusRef.current.highestAllocatedSeq,
-          )
-        ) {
-          // Empty thread, or the newest page demonstrably reaches the
-          // bottom (its oldest seq is 1 and nothing is committed below):
-          // nothing to walk back; later commits arrive through the
-          // newest-page poll.
-          historyLoadedRef.current = true;
-        } else if (await backfillFrom(startCursor)) {
-          historyLoadedRef.current = true;
+      let newest = newestSeen.current;
+      do {
+        const result = await fetchPage(newest === undefined ? undefined : { after: newest });
+        if (result.kind !== "ok") return;
+        applySnapshot(result.parsed);
+        newestSeen.current = result.parsed.messages.at(-1)?.seq ?? newest ?? 0;
+        if (newest === undefined) {
+          setHistoryHasMore(result.parsed.page.hasMore);
+          return;
         }
-      }
-      await reconcileGaps();
+        newest = result.parsed.messages.at(-1)?.seq;
+        if (!result.parsed.page.hasMore) return;
+      } while (newest !== undefined && mountedRef.current);
     } finally {
       pollingRef.current = false;
     }
-  }, [applySnapshot, backfillFrom, fetchPage, reconcileGaps]);
+  }, [applySnapshot, fetchPage]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -359,23 +175,17 @@ export function LiveThread() {
   }, [poll]);
 
   const handleLoadEarlier = useCallback(async () => {
-    const oldest = oldestLoadedRef.current;
-    if (loadingEarlierRef.current || oldest === null) {
+    const oldest = messagesRef.current[0]?.seq;
+    if (loadingEarlierRef.current || oldest === undefined) {
       return;
     }
     loadingEarlierRef.current = true;
     setLoadingEarlier(true);
     try {
-      const result = await fetchPage(oldest);
+      const result = await fetchPage({ before: oldest });
       if (result.kind === "ok") {
         applySnapshot(result.parsed);
-        setHistoryHasMore(
-          mayHaveEarlierHistory(
-            result.parsed.page,
-            statusRef.current.highestAllocatedSeq,
-            oldest,
-          ),
-        );
+        setHistoryHasMore(result.parsed.page.hasMore);
       }
     } finally {
       loadingEarlierRef.current = false;
@@ -384,6 +194,22 @@ export function LiveThread() {
       }
     }
   }, [applySnapshot, fetchPage]);
+
+  async function retryGeneration() {
+    if (!status.retryAttemptId || retrying) return;
+    setRetrying(true);
+    setRetryError(false);
+    try {
+      const response = await fetch(`/api/thread?attempt=${encodeURIComponent(status.retryAttemptId)}`, { method: "POST" });
+      if (response.status === 401) setSessionEnded(true);
+      else if (!response.ok && response.status !== 409) setRetryError(true);
+      await poll();
+    } catch {
+      setRetryError(true);
+    } finally {
+      setRetrying(false);
+    }
+  }
 
   const dispatchSend = useCallback(
     async (entry: PendingSend) => {
@@ -410,7 +236,6 @@ export function LiveThread() {
           }),
         });
         if (response.ok) {
-          failed = false;
           const raw: unknown = await response.json();
           const serverId =
             typeof raw === "object" && raw !== null
@@ -418,12 +243,17 @@ export function LiveThread() {
                   | Record<string, unknown>
                   | undefined)?.id
               : undefined;
-          const confirmedId = typeof serverId === "string" ? serverId : undefined;
+          if (typeof serverId !== "string" || !serverId) throw new Error("Missing message ID");
+          failed = false;
+          if (messagesRef.current.some(message => message.id === serverId)) {
+            setPending(previous => removePending(previous, entry.clientKey));
+            return;
+          }
           setPending((previous) =>
             updatePending(previous, entry.clientKey, (current) => ({
               ...current,
               kind: "confirmed",
-              ...(confirmedId !== undefined ? { serverId: confirmedId } : {}),
+              serverId,
             })),
           );
           void poll();
@@ -597,6 +427,12 @@ export function LiveThread() {
             Some recent messages could not get a reply. You can keep the
             conversation going.
           </Typography>
+          {status.retryAttemptId && (
+            <Button size="small" disabled={retrying} onClick={() => void retryGeneration()}>
+              Retry reply
+            </Button>
+          )}
+          {retryError && <Typography role="alert">Could not request a retry.</Typography>}
         </Box>
       )}
       {connection === "error" && (

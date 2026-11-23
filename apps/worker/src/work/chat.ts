@@ -45,21 +45,10 @@ import {
   type ChatRequest,
 } from "@companion/openrouter/chat";
 import type {
-  ChatChunkName,
+  AssembledChatMessage,
   ConversationMessage,
 } from "../conversation/types.ts";
 import type { PromptModulePromptOutput } from "../prompt-modules/types.ts";
-
-/** One assembled prompt message with its chunk classification and source. */
-export interface AssembledChatMessage {
-  readonly role: "system" | "user" | "assistant";
-  readonly content: string;
-  readonly chunk: ChatChunkName;
-  /** The conversation_message id for conversation messages; null for synthetic chunks. */
-  readonly sourceMessageId: string | null;
-  /** The database module id for a prompt_module message; null otherwise. */
-  readonly promptModuleId: string | null;
-}
 
 export interface BuildChatRequestParams {
   readonly model: string;

@@ -148,7 +148,7 @@ describe("processor: article-share selection trace semantics", () => {
     );
   });
 
-  it("records an unusable answer as a rejection with its reason, and fails the turn", async () => {
+  it("records an unusable answer as a rejection with its reason, and continues chat", async () => {
     const { deps: processorDeps, selections } = deps({
       callDecisions: async () => ({
         model: "decision-model-build",
@@ -158,15 +158,35 @@ describe("processor: article-share selection trace semantics", () => {
         usage: { input_tokens: 5, output_tokens: 2 },
       }),
     });
-    await assert.rejects(
-      () => processTurnWork(work(), processorDeps),
-      /not an offered option/,
-    );
+    assert.equal((await processTurnWork(work(), processorDeps)).reply, "reply");
     assert.equal(selections.length, 1);
     assert.equal(selections[0].questionId, ARTICLE_SHARE_QUESTION_ID);
     assert.equal(selections[0].selection.kind, "rejected");
     assert.match(selections[0].selection.reason, /not an offered option/);
   });
+
+  for (const articleAnswer of [undefined, { type: "score", score: 4 }, { type: "choice" }]) {
+    it(`preserves the required pattern when the optional answer is ${JSON.stringify(articleAnswer)}`, async () => {
+      const outcomes = [];
+      const fixture = deps({
+        loadPatterns: async () => [{ id: "plain", position: 0, selectionDescription: "plain", responseGuidance: "Use this pattern.", includeInitiativeContext: true }],
+        callDecisions: async () => ({
+          model: "decision-model",
+          usage: { input_tokens: 3, output_tokens: 1 },
+          answers: {
+            response_pattern: { type: "choice", choice: "plain" },
+            ...(articleAnswer === undefined ? {} : { [ARTICLE_SHARE_QUESTION_ID]: articleAnswer }),
+          },
+        }),
+        recordDecisionOutcome: async outcome => outcomes.push([outcome.trace.questionId, outcome.outcome.kind]),
+      });
+      const result = await processTurnWork(work(), fixture.deps);
+      assert.equal(result.selectedPatternId, "plain");
+      assert.equal(result.reply, "reply");
+      assert.deepEqual(fixture.inclusions, []);
+      assert.deepEqual(outcomes, [[ARTICLE_SHARE_QUESTION_ID, "invalid"], ["response_pattern", "responded"]]);
+    });
+  }
 
   it("asks only the article question when no patterns are enabled", async () => {
     const { deps: processorDeps, decisionRequests } = deps();
