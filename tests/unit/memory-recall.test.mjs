@@ -11,14 +11,23 @@ import {
   buildRecallQuery,
   buildTsQueryText,
   evidenceBoost,
+  normalizedLexicalScore,
+  normalizedSemanticScore,
   normalizeRecallInput,
   recallCanonicalDetailed,
   recencyBoost,
+  RECENT_RECALL_PENALTY,
   sanitizeTextQuery,
   selectRecallResults,
   DEFAULT_RECALL_LIMIT,
   DEFAULT_RECALL_MAX_ASSISTANT_SHARE,
 } from "../../apps/worker/src/memory/recall.ts";
+import {
+  EMBEDDING_DIMENSIONS,
+  EmbeddingRequestError,
+  embeddingContentHash,
+  renderEmbeddingInput,
+} from "../../apps/worker/src/memory/embeddings.ts";
 import { loadMemoryConfig } from "../../apps/worker/src/memory/config.ts";
 import {
   buildCanonicalMemoryContextForPrompt,
@@ -36,8 +45,14 @@ describe("recall query sanitization", () => {
     assert.equal(sanitizeTextQuery(""), "");
   });
 
-  it("OR-joins tokens and neutralizes dash operators", () => {
+  it("OR-joins substantive tokens, filters conversational filler, and neutralizes dash operators", () => {
     assert.equal(buildTsQueryText("coffee mornings"), "coffee OR mornings");
+    assert.equal(
+      buildTsQueryText("so we talk a lot about like music favorite band lol"),
+      "music OR favorite OR band",
+    );
+    // Pure filler queries fall back to their tokens instead of going empty.
+    assert.equal(buildTsQueryText("ok yeah lol"), "ok OR yeah OR lol");
     assert.equal(buildTsQueryText("-negated"), "negated");
     assert.equal(buildTsQueryText("trailing-"), "trailing-".replace(/^-+|-+$/g, "").replace(/-$/, "") || "");
     // An all-dash query degrades to the recency fallback shape.
@@ -94,13 +109,20 @@ describe("recall scoring pieces", () => {
     assert.ok(old > 0 && old < 0.01);
   });
 
-  it("boosts explicit facts and strong observations", () => {
-    assert.equal(evidenceBoost("fact", "explicit"), 0.2);
-    assert.equal(evidenceBoost("fact", "supported"), 0);
-    assert.equal(evidenceBoost("fact", "inferred"), 0.1);
-    assert.equal(evidenceBoost("observation", undefined, "strong"), 0.45);
-    assert.equal(evidenceBoost("observation", undefined, "supported"), 0.3);
-    assert.equal(evidenceBoost("observation", undefined, "tentative"), 0.15);
+  it("uses gentle tie-breaker boosts for explicit facts and strong observations", () => {
+    assert.equal(evidenceBoost("fact", "explicit"), 0.03);
+    assert.equal(evidenceBoost("fact", "supported"), 0.015);
+    assert.equal(evidenceBoost("fact", "inferred"), 0.005);
+    assert.equal(evidenceBoost("observation", undefined, "strong"), 0.07);
+    assert.equal(evidenceBoost("observation", undefined, "supported"), 0.05);
+    assert.equal(evidenceBoost("observation", undefined, "tentative"), 0.02);
+    assert.ok(
+      evidenceBoost("observation", undefined, "supported") > evidenceBoost("fact", "explicit"),
+    );
+    // Normalized relevance stays dominant over recency + evidence tie-breakers.
+    assert.ok(normalizedSemanticScore(0.75) > normalizedSemanticScore(0.55));
+    assert.equal(normalizedSemanticScore(0.45), 0);
+    assert.ok(normalizedLexicalScore(0.05) === 0.5);
   });
 });
 
@@ -388,41 +410,42 @@ describe("recall temporal expression detection", () => {
 });
 
 describe("chat recall query builder, dedupe, assistant cap, and exclusion filters", () => {
-  it("builds a 1-full-turn + current-message query without a 16-word cut", () => {
-    const longCurrent = Array.from({ length: 24 }, (_, i) => `word${String(i)}`).join(" ");
+  it("keeps substantive user messages focused without diluting them with prior-turn text", () => {
+    const topicSwitch =
+      "Before college. So we talk a lot about like anime and movies, what about music? What's your favorite band? And no LoFi is not a band lol";
     const query = buildRecallQuery({
-      currentUserText: longCurrent,
+      currentUserText: topicSwitch,
       history: [
         { role: "user", content: "old turn should not be included", turnId: "turn-old" },
         { role: "assistant", content: "old reply", turnId: "turn-old" },
-        { role: "user", content: "hiking in Colorado", turnId: "turn-prev" },
-        { role: "assistant", content: "sounds awesome near the mountains", turnId: "turn-prev" },
+        { role: "user", content: "Nah I took 2 years of French in high school", turnId: "turn-prev" },
+        { role: "assistant", content: "FRENCH?? two years of high school french is such a specific flavor", turnId: "turn-prev" },
       ],
     });
-    assert.ok(query.includes("word23"), "must not truncate at 16 words");
-    assert.ok(query.includes("hiking in Colorado"), "includes previous turn user text");
-    assert.ok(query.includes("mountains"), "includes previous turn assistant reply");
-    assert.ok(!query.includes("old turn"), "only includes the immediately preceding turn");
+    assert.equal(query, topicSwitch);
+    assert.ok(!query.includes("French"), "topic switch must not pull in prior French turn");
     assert.ok(query.length <= 512);
   });
 
-  it("preserves current user text first when the previous assistant reply is very long", () => {
+  it("borrows bounded prior-turn context for short follow-ups while keeping current text first", () => {
     const query = buildRecallQuery({
-      currentUserText: "what did we decide about dinner",
+      currentUserText: "what about dinner?",
       history: [
+        { role: "user", content: "old turn should not be included", turnId: "turn-old" },
         { role: "user", content: "pasta or tacos", turnId: "turn-prev" },
         { role: "assistant", content: Array.from({ length: 120 }, (_, i) => `extra${String(i)}`).join(" "), turnId: "turn-prev" },
       ],
     });
-    assert.ok(query.startsWith("what did we decide about dinner"));
+    assert.ok(query.startsWith("what about dinner?"));
     assert.ok(query.includes("pasta or tacos"));
-    assert.ok(query.length <= 512);
-    // Word-boundary snap: no chopped trailing token.
+    assert.ok(!query.includes("old turn"), "only includes the immediately preceding turn");
+    // Prior assistant text is tightly bounded (~160 chars) instead of filling 512 chars.
+    assert.ok(query.length <= 240);
     const lastToken = query.split(" ").at(-1);
     assert.match(lastToken, /^extra\d+$/);
   });
 
-  it("detects near-identical claims while keeping distinct claims separate", () => {
+  it("detects near-identical claims including slightly reworded observations while keeping distinct claims separate", () => {
     assert.equal(
       areClaimsNearDuplicate("Prefers tea in the morning.", "prefers tea in the morning"),
       true,
@@ -431,6 +454,13 @@ describe("chat recall query builder, dedupe, assistant cap, and exclusion filter
       areClaimsNearDuplicate(
         "The user is planning a summer hiking trip to Colorado",
         "User planning summer hiking trip to Colorado soon",
+      ),
+      true,
+    );
+    assert.equal(
+      areClaimsNearDuplicate(
+        "My favorite part of getting to know someone is when scattered facts start clicking into one person. I noted we've had a week of daily conversations producing shared lore.",
+        "My favorite part of getting to know someone is when scattered facts start clicking into one person. After a week of daily conversations, talking this much has become my favorite part.",
       ),
       true,
     );
@@ -510,5 +540,176 @@ describe("chat recall query builder, dedupe, assistant cap, and exclusion filter
     assert.deepEqual(factCall.params[3], ["turn-1", "turn-2"]);
     assert.match(obsCall.sql, /o\.last_observed_at <= \$\d+::timestamptz/);
     assert.equal(obsCall.params[2].toISOString(), "2026-06-15T12:15:00.000Z");
+  });
+
+  it("runs live pgvector hybrid recall so a 5-day-old relevant fact beats an irrelevant same-day strong observation and filters noise", async () => {
+    const config = loadMemoryConfig({});
+    assert.equal(config.canonicalRecencyWeight, 0.08);
+    assert.equal(config.semanticRecallEnabled, true);
+    const referenceTime = new Date("2026-11-23T20:53:07.000Z");
+    const qotsaClaim = "Kyle told me Queens of the Stone Age is his favorite band.";
+    const sleeperClaim = "Kyle told me he is a professional sleeper with an ADHD brain.";
+    const noiseClaim = "Unrelated low-similarity chatter.";
+
+    const qotsaHash = embeddingContentHash(renderEmbeddingInput({ claim: qotsaClaim }));
+    const sleeperHash = embeddingContentHash(renderEmbeddingInput({ claim: sleeperClaim }));
+    const noiseHash = embeddingContentHash(renderEmbeddingInput({ claim: noiseClaim }));
+
+    const embedCalls = [];
+    const embeddingClient = {
+      busy: false,
+      async embed(texts, inputType) {
+        embedCalls.push({ texts, inputType });
+        return [[1, ...Array(EMBEDDING_DIMENSIONS - 1).fill(0)]];
+      },
+    };
+
+    const pool = {
+      async query(sql) {
+        const text = String(sql);
+        if (text.includes("FROM memory_semantic_embedding e") && text.includes("JOIN memory_fact f")) {
+          return {
+            rows: [
+              {
+                fact_key: "fact-qotsa",
+                subject_id: "kyle",
+                subject_role: "user",
+                kind: "preference",
+                claim: qotsaClaim,
+                turn_id: "turn-old",
+                source_type: "conversation",
+                article_reaction_id: null,
+                condition: null,
+                consequence: null,
+                topics: ["music"],
+                observed_at: new Date("2026-11-18T13:32:00.000Z"),
+                explicitness: "explicit",
+                text_score: null,
+                similarity: 0.72,
+                embedding_content_hash: qotsaHash,
+              },
+              {
+                fact_key: "fact-noise",
+                subject_id: "kyle",
+                subject_role: "user",
+                kind: "fact",
+                claim: noiseClaim,
+                turn_id: "turn-old-2",
+                source_type: "conversation",
+                article_reaction_id: null,
+                condition: null,
+                consequence: null,
+                topics: [],
+                observed_at: new Date("2026-11-23T19:00:00.000Z"),
+                explicitness: "explicit",
+                text_score: null,
+                similarity: 0.51,
+                embedding_content_hash: noiseHash,
+              },
+            ],
+          };
+        }
+        if (text.includes("FROM memory_semantic_embedding e") && text.includes("JOIN memory_canonical_observation o")) {
+          return { rows: [] };
+        }
+        if (text.includes("FROM memory_canonical_observation o")) {
+          return {
+            rows: [
+              {
+                canonical_observation_id: "obs-sleeper",
+                subject_id: "kyle",
+                subject_role: "user",
+                article_sourced: false,
+                kind: "habit",
+                claim: sleeperClaim,
+                condition: null,
+                consequence: null,
+                topics: ["sleep"],
+                last_observed_at: new Date("2026-11-23T14:00:00.000Z"),
+                evidence_strength: "strong",
+                support_count: 5,
+                distinct_day_count: 3,
+                text_score: 0.004,
+                similarity: 0.52,
+                embedding_content_hash: sleeperHash,
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      },
+    };
+
+    const detailed = await recallCanonicalDetailed(pool, config, {
+      query: "what about music? What's your favorite band?",
+      referenceTime,
+      embeddingClient,
+    });
+    assert.equal(embedCalls.length, 1);
+    assert.equal(embedCalls[0].inputType, "query");
+    assert.equal(detailed.response.diagnostics.semanticUsed, true);
+    assert.equal(detailed.response.results.length, 1);
+    assert.equal(detailed.response.results[0].id, "fact-qotsa");
+    assert.equal(detailed.response.results[0].semanticSimilarity, 0.72);
+
+    // Recent-turn cooldown penalizes items already surfaced on previous turns.
+    const cooled = await recallCanonicalDetailed(pool, config, {
+      query: "what about music? What's your favorite band?",
+      referenceTime,
+      embeddingClient,
+      recentlyRecalledIds: new Set(["fact-qotsa"]),
+    });
+    assert.ok(
+      detailed.response.results[0].score - cooled.response.results[0].score >=
+        RECENT_RECALL_PENALTY - 1e-6,
+    );
+  });
+
+  it("degrades cleanly to lexical recall when live query embedding fails", async () => {
+    const config = loadMemoryConfig({});
+    const logs = [];
+    const pool = {
+      async query(sql) {
+        if (String(sql).includes("FROM memory_fact f")) {
+          return {
+            rows: [
+              {
+                fact_key: "fact-fallback",
+                subject_id: "kyle",
+                subject_role: "user",
+                kind: "preference",
+                claim: "Kyle likes coffee in the morning.",
+                turn_id: "turn-1",
+                source_type: "conversation",
+                article_reaction_id: null,
+                condition: null,
+                consequence: null,
+                topics: ["coffee"],
+                observed_at: new Date("2026-11-20T12:00:00.000Z"),
+                explicitness: "explicit",
+                text_score: 0.08,
+              },
+            ],
+          };
+        }
+        return { rows: [] };
+      },
+    };
+    const failingClient = {
+      busy: false,
+      async embed() {
+        throw new EmbeddingRequestError("embedding_timeout");
+      },
+    };
+    const detailed = await recallCanonicalDetailed(pool, config, {
+      query: "coffee",
+      referenceTime: new Date("2026-11-23T12:00:00.000Z"),
+      embeddingClient: failingClient,
+      log: (msg) => logs.push(msg),
+    });
+    assert.equal(detailed.response.diagnostics.semanticUsed, false);
+    assert.equal(detailed.response.results.length, 1);
+    assert.equal(detailed.response.results[0].id, "fact-fallback");
+    assert.ok(logs.some((line) => line.includes("falling back to lexical recall")));
   });
 });

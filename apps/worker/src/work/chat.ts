@@ -176,6 +176,24 @@ export function buildChatPrompt(
     });
   }
   for (const message of [...params.history, ...params.turnMessages]) {
+    const previous = messages[messages.length - 1];
+    // Coalesce consecutive assistant messages (for example an ordinary reply
+    // followed by a background routine/schedule message) so the chat request
+    // never presents back-to-back assistant turns that confuse speaker
+    // attribution in downstream chat templates. Grouped user turns stay
+    // separate to preserve per-message source linkage.
+    if (
+      message.role === "assistant" &&
+      previous !== undefined &&
+      previous.chunk === "conversation" &&
+      previous.role === "assistant"
+    ) {
+      messages[messages.length - 1] = {
+        ...previous,
+        content: `${previous.content}\n\n${message.content}`,
+      };
+      continue;
+    }
     messages.push({
       role: message.role,
       content: message.content,

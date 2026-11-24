@@ -80,6 +80,10 @@ export interface MemoryConfig {
    *  opted into; see the flag comment above. */
   readonly profileSummariesEnabled: boolean;
   readonly recallEnabled: boolean;
+  /** Live hybrid pgvector + lexical recall (degrades cleanly to lexical on outage). */
+  readonly semanticRecallEnabled: boolean;
+  /** Tight timeout for live query embedding so recall never stalls a chat turn. */
+  readonly semanticRecallTimeoutMs: number;
   readonly temporalContextEnabled: boolean;
   readonly temporalSummariesEnabled: boolean;
   /** Model id for every memory LLM task. */
@@ -142,9 +146,10 @@ const DEFAULTS = {
   observationRecencyWindowDays: 365,
   consolidationNewFactsThreshold: 40,
   consolidationIntervalMs: 24 * 60 * 60_000,
-  canonicalRecencyWeight: 0.5,
+  canonicalRecencyWeight: 0.08,
   canonicalRecencyHalfLifeDays: 21,
   canonicalCandidateLimit: 24,
+  semanticRecallTimeoutMs: 3_000,
   temporalReconciliationMs: 300_000,
   profilesGenerateHour: 4,
   profileMaxSourceChars: 24_000,
@@ -197,6 +202,13 @@ export function loadMemoryConfig(
     profilesEnabled: env["WORKER_MEMORY_PROFILES_ENABLED"] === "true",
     profileSummariesEnabled: env["WORKER_MEMORY_PROFILE_SUMMARIES_ENABLED"] === "true",
     recallEnabled: env["WORKER_MEMORY_RECALL_ENABLED"] !== "false",
+    semanticRecallEnabled: env["WORKER_MEMORY_SEMANTIC_RECALL_ENABLED"] !== "false",
+    semanticRecallTimeoutMs: optionalNumber(
+      env,
+      "WORKER_MEMORY_SEMANTIC_RECALL_TIMEOUT_MS",
+      DEFAULTS.semanticRecallTimeoutMs,
+      { integer: true, positive: true },
+    ),
     temporalContextEnabled: env["WORKER_MEMORY_TEMPORAL_CONTEXT_ENABLED"] !== "false",
     temporalSummariesEnabled: env["WORKER_MEMORY_TEMPORAL_SUMMARIES_ENABLED"] !== "false",
     model: optionalString(env, "WORKER_MEMORY_MODEL", DEFAULTS.model),

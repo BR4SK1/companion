@@ -82,6 +82,7 @@ import {
 import { getTemporalSummaryPromptContext } from "./memory/temporal/store.ts";
 import { getProfileDocument } from "./memory/profiles-v2.ts";
 import { memoryErrorCategory } from "./memory/errors.ts";
+import { createEmbeddingClient } from "./memory/embeddings.ts";
 import { loadTemporalSettings } from "./temporal/store.ts";
 import { createPromptModuleStore } from "./prompt-modules/store.ts";
 import { executePromptModule } from "./prompt-modules/executor.ts";
@@ -344,6 +345,14 @@ async function main(): Promise<void> {
     // (e.g. the database is unreachable) is still a startup failure.
     let loadMemoryContext: TurnProcessorDeps["loadMemoryContext"];
     let memoryConfiguration: Awaited<ReturnType<typeof loadMemoryConfiguration>> | undefined;
+    const liveRecallEmbeddingClient = memoryConfig.enabled && memoryConfig.semanticRecallEnabled
+      ? createEmbeddingClient({
+          baseUrl: memoryConfig.embeddingBaseUrl,
+          timeoutMs: memoryConfig.semanticRecallTimeoutMs,
+        })
+      : undefined;
+    const RECENT_RECALL_WINDOW_TURNS = 3;
+    const recentRecallHistory: Array<readonly string[]> = [];
     if (memoryConfig.enabled) {
       try {
         memoryConfiguration = await loadMemoryConfiguration(pool, {
@@ -410,6 +419,7 @@ async function main(): Promise<void> {
                   .filter((id): id is string => id !== null),
               ];
               const recallStartedAt = new Date();
+              const recentlyRecalledIds = new Set(recentRecallHistory.flat());
               const detailedRecall = await recallCanonicalDetailed(pool, memoryConfig, {
                 query: recallQuery,
                 referenceTime: now,
@@ -420,8 +430,19 @@ async function main(): Promise<void> {
                 minAgeMs: memoryConfig.recallMinAgeMs,
                 maxAssistantShare: DEFAULT_RECALL_MAX_ASSISTANT_SHARE,
                 deduplicateClaims: true,
+                ...(liveRecallEmbeddingClient !== undefined
+                  ? { embeddingClient: liveRecallEmbeddingClient }
+                  : {}),
+                ...(recentlyRecalledIds.size > 0 ? { recentlyRecalledIds } : {}),
+                log: (message) => console.log(message),
               });
               const recall = detailedRecall.response;
+              if (recall.results.length > 0) {
+                recentRecallHistory.push(recall.results.map((item) => item.id));
+                while (recentRecallHistory.length > RECENT_RECALL_WINDOW_TURNS) {
+                  recentRecallHistory.shift();
+                }
+              }
               memoryContext = buildCanonicalMemoryContextForPrompt({
                 items: recall.results,
                 now,
@@ -441,6 +462,8 @@ async function main(): Promise<void> {
                   ` queryChars=${String(recallQuery.length)} results=${String(recall.results.length)}` +
                   ` facts=${String(recall.diagnostics.factCandidates)}` +
                   ` observations=${String(recall.diagnostics.observationCandidates)}` +
+                  ` semantic=${String(recall.diagnostics.semanticUsed ?? false)}` +
+                  ` semCandidates=${String(recall.diagnostics.semanticCandidates ?? 0)}` +
                   ` truncated=${String(recall.diagnostics.truncatedForBudget)}` +
                   ` ms=${String(recall.diagnostics.totalMs)}`,
                 startedAt: recallStartedAt,
@@ -637,6 +660,10 @@ async function main(): Promise<void> {
                 ...(input.limit !== undefined ? { limit: input.limit } : {}),
                 maxChars: memoryConfig.recallMaxChars,
                 timezone: provisionedMemoryConfiguration.behavior.timezone,
+                ...(liveRecallEmbeddingClient !== undefined
+                  ? { embeddingClient: liveRecallEmbeddingClient }
+                  : {}),
+                log: (message) => console.log(message),
               });
               const result = detailedResult.response;
               // Metadata-only trace, never a content copy; a tracing failure

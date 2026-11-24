@@ -443,19 +443,30 @@ export function renderFactInput(
 export function buildObservationConsolidationPrompt(
   systemPrompt: string,
   source: string,
+  existingObservations?: string,
 ): PromptSpec {
+  const sections: string[] = [];
+  if (existingObservations !== undefined && existingObservations.trim().length > 0) {
+    sections.push(
+      "EXISTING ACTIVE OBSERVATIONS (reference only — do not invent facts from these; reuse stable wording when updating an existing observation, and do not create near-duplicate observations)",
+      existingObservations.trim(),
+      "END EXISTING ACTIVE OBSERVATIONS",
+      "",
+    );
+  }
+  sections.push(
+    "EXTRACTED FACTS",
+    source,
+    "END EXTRACTED FACTS",
+    "",
+    "Keep each observation focused on a single topic in 1–2 concise sentences (avoid bundling unrelated topics into one long paragraph). Consolidate only the observations supported by these facts now.",
+  );
   return {
     systemPrompt,
     messages: [
       {
         role: "user",
-        content: [
-          "EXTRACTED FACTS",
-          source,
-          "END EXTRACTED FACTS",
-          "",
-          "Consolidate only the observations supported by these facts now.",
-        ].join("\n"),
+        content: sections.join("\n"),
       },
     ],
   };

@@ -40,6 +40,7 @@ import {
 } from "./policy.ts";
 import { selectLastCompletedTurns, sourceFingerprint } from "./source.ts";
 import { getFactsByTurns, getIngestState, updateIngestState } from "./facts.ts";
+import { areClaimsNearDuplicate } from "./recall.ts";
 import { memoryErrorCategory, MemorySourceBudgetError } from "./errors.ts";
 import { behavioralDay, type BehaviorTime } from "./time.ts";
 import type {
@@ -52,6 +53,108 @@ import type {
 const MAX_CLAIM_CHARS = 1_000;
 const MAX_RELATION_CHARS = 500;
 export const MAX_OBSERVATION_SOURCE_CHARS = 100_000;
+const MAX_EXISTING_OBSERVATIONS_CHARS = 16_000;
+const EXISTING_FACT_OVERLAP_THRESHOLD = 0.5;
+
+export interface ExistingCanonicalReference {
+  readonly observationKey: string;
+  readonly subject: string;
+  readonly kind: string;
+  readonly claim: string;
+  readonly sourceFactIds: readonly string[];
+  readonly lastObservedAt: Date;
+}
+
+/**
+ * Match a consolidated observation candidate to an already-active canonical
+ * observation of the same `(subject, kind)` when either their claim text is a
+ * near-duplicate or at least half of the candidate's supporting facts already
+ * belong to that existing canonical observation. Reusing the existing
+ * `observationKey` lets promotion revise the canonical row in place instead of
+ * minting duplicate canonical identities on every consolidation window.
+ */
+export function matchExistingCanonicalObservationKey(
+  candidate: {
+    readonly subject: string;
+    readonly kind: string;
+    readonly claim: string;
+    readonly sourceFactIds: readonly string[];
+  },
+  existing: readonly ExistingCanonicalReference[],
+): string | null {
+  const candidateFactSet = new Set(candidate.sourceFactIds);
+  let bestKey: string | null = null;
+  let bestScore = 0;
+
+  for (const current of existing) {
+    if (current.subject !== candidate.subject || current.kind !== candidate.kind) {
+      continue;
+    }
+    let overlapCount = 0;
+    for (const factKey of current.sourceFactIds) {
+      if (candidateFactSet.has(factKey)) overlapCount += 1;
+    }
+    const overlapRatio =
+      candidateFactSet.size > 0 ? overlapCount / candidateFactSet.size : 0;
+    const textMatch = areClaimsNearDuplicate(candidate.claim, current.claim);
+    if (!textMatch && overlapRatio < EXISTING_FACT_OVERLAP_THRESHOLD) {
+      continue;
+    }
+    const matchScore = (textMatch ? 1 : 0) + overlapRatio;
+    if (matchScore > bestScore) {
+      bestScore = matchScore;
+      bestKey = current.observationKey;
+    }
+  }
+  return bestKey;
+}
+
+function renderExistingObservationsForPrompt(
+  existing: readonly ExistingCanonicalReference[],
+  maxChars: number = MAX_EXISTING_OBSERVATIONS_CHARS,
+): string {
+  if (existing.length === 0) return "";
+  const lines: string[] = [];
+  let used = 0;
+  for (const obs of existing) {
+    const line = `- [${obs.subject}/${obs.kind}] ${obs.claim.replace(/\s+/g, " ").trim()}`;
+    const nextUsed = used === 0 ? line.length : used + 1 + line.length;
+    if (nextUsed > maxChars) break;
+    lines.push(line);
+    used = nextUsed;
+  }
+  return lines.join("\n");
+}
+
+async function loadActiveCanonicalReferences(
+  pool: PostgresPool,
+  subjects: readonly string[],
+): Promise<ExistingCanonicalReference[]> {
+  if (subjects.length === 0) return [];
+  const result = await pool.query<{
+    observation_key: string;
+    subject_id: string;
+    kind: string;
+    claim: string;
+    source_fact_keys: string[];
+    last_observed_at: Date;
+  }>(
+    `SELECT observation_key, subject_id, kind, claim, source_fact_keys, last_observed_at
+     FROM memory_canonical_observation
+     WHERE status = 'active' AND subject_id = ANY($1::text[])
+     ORDER BY last_observed_at DESC, canonical_observation_id
+     LIMIT 200`,
+    [subjects],
+  );
+  return result.rows.map((row) => ({
+    observationKey: row.observation_key,
+    subject: row.subject_id,
+    kind: row.kind,
+    claim: row.claim,
+    sourceFactIds: row.source_fact_keys,
+    lastObservedAt: row.last_observed_at,
+  }));
+}
 
 export interface FittedConsolidationWindow {
   readonly turns: SourceTurn[];
@@ -534,7 +637,13 @@ async function consolidateObservations(
       `Observation source is ${source.length} characters; reduce the bounded selector (limit ${MAX_OBSERVATION_SOURCE_CHARS})`,
     );
   }
-  const prompt = buildObservationConsolidationPrompt(deps.systemPrompt, source);
+  const existingCanonical = await loadActiveCanonicalReferences(pool, deps.subjects);
+  const existingSummary = renderExistingObservationsForPrompt(existingCanonical);
+  const prompt = buildObservationConsolidationPrompt(
+    deps.systemPrompt,
+    source,
+    existingSummary || undefined,
+  );
   const result = await deps.callLlm({
     systemPrompt: prompt.systemPrompt,
     userMessage: prompt.messages[0]!.content,
@@ -605,9 +714,31 @@ async function consolidateObservations(
     }
   }
 
-  const uniqueObservations = [
-    ...new Map(accepted.map((observation) => [observation.observationKey, observation])).values(),
-  ];
+  // Reconcile accepted observations against already-active canonical
+  // observations so reworded summaries of the same memory revise in place
+  // instead of creating duplicate canonical rows. When multiple candidates in
+  // one run map to the same canonical identity, retain the stronger/more
+  // supported artifact so promotion never sees duplicate identities.
+  const deduplicatedByKey = new Map<
+    string,
+    ReturnType<typeof buildObservationDocument>["observation"]
+  >();
+  for (const observation of accepted) {
+    const matchedKey = matchExistingCanonicalObservationKey(observation, existingCanonical);
+    const resolved = matchedKey !== null
+      ? { ...observation, observationKey: matchedKey }
+      : observation;
+    const prior = deduplicatedByKey.get(resolved.observationKey);
+    if (
+      prior === undefined ||
+      resolved.supportCount > prior.supportCount ||
+      (resolved.supportCount === prior.supportCount &&
+        resolved.lastObservedAt.getTime() > prior.lastObservedAt.getTime())
+    ) {
+      deduplicatedByKey.set(resolved.observationKey, resolved);
+    }
+  }
+  const uniqueObservations = [...deduplicatedByKey.values()];
 
   for (const observation of uniqueObservations) {
     // One transaction per artifact: the artifact row and its evidence links

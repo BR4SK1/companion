@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   fitTurnsToConsolidationBudget,
+  matchExistingCanonicalObservationKey,
   MAX_OBSERVATION_SOURCE_CHARS,
 } from "../../apps/worker/src/memory/consolidation.ts";
 import {
@@ -22,7 +23,10 @@ import {
   MemoryLlmTruncatedError,
   MemorySourceBudgetError,
 } from "../../apps/worker/src/memory/errors.ts";
-import { renderFactInput } from "../../apps/worker/src/memory/prompts.ts";
+import {
+  buildObservationConsolidationPrompt,
+  renderFactInput,
+} from "../../apps/worker/src/memory/prompts.ts";
 
 function makeTurn(index) {
   const start = new Date(Date.UTC(2026, 10, 1, 12, index, 0));
@@ -239,5 +243,91 @@ describe("assertCompleteResponse truncation classification", () => {
     assert.equal(memoryErrorCategory(caught), "llm_output_truncated");
     assert.equal(isRetryableFactExtractionError(caught), true);
     assert.equal(isSplittableFactExtractionError(caught), true);
+  });
+});
+
+describe("canonical observation identity reconciliation during consolidation", () => {
+  const existing = [
+    {
+      observationKey: "obs-key-college",
+      subject: "user",
+      kind: "fact",
+      claim: "User read Lord of the Rings during his one year of college and had a bad time after a breakup.",
+      sourceFactIds: ["fk-1", "fk-2", "fk-3"],
+      lastObservedAt: new Date("2026-11-23T20:00:00.000Z"),
+    },
+    {
+      observationKey: "obs-key-couch",
+      subject: "user",
+      kind: "preference",
+      claim: "User lives alone and likes the end of the couch lined up with the TV for watching movies.",
+      sourceFactIds: ["fk-10", "fk-11"],
+      lastObservedAt: new Date("2026-11-23T19:00:00.000Z"),
+    },
+  ];
+
+  it("reuses an existing canonical observation key on near-duplicate rewording or >=50% fact overlap", () => {
+    assert.equal(
+      matchExistingCanonicalObservationKey(
+        {
+          subject: "user",
+          kind: "fact",
+          claim: "User went to college for one year, read Lord of the Rings, and had a bad time after a breakup.",
+          sourceFactIds: ["fk-99"],
+        },
+        existing,
+      ),
+      "obs-key-college",
+    );
+    assert.equal(
+      matchExistingCanonicalObservationKey(
+        {
+          subject: "user",
+          kind: "preference",
+          claim: "Completely rewritten summary about his favorite living room spot.",
+          sourceFactIds: ["fk-10", "fk-12"],
+        },
+        existing,
+      ),
+      "obs-key-couch",
+    );
+  });
+
+  it("never matches across subject or kind boundaries or unrelated observations", () => {
+    assert.equal(
+      matchExistingCanonicalObservationKey(
+        {
+          subject: "assistant",
+          kind: "fact",
+          claim: "User read Lord of the Rings during his one year of college and had a bad time after a breakup.",
+          sourceFactIds: ["fk-1", "fk-2"],
+        },
+        existing,
+      ),
+      null,
+    );
+    assert.equal(
+      matchExistingCanonicalObservationKey(
+        {
+          subject: "user",
+          kind: "preference",
+          claim: "User builds modular synthesizers in his spare time.",
+          sourceFactIds: ["fk-50", "fk-51"],
+        },
+        existing,
+      ),
+      null,
+    );
+  });
+
+  it("includes existing active observations in the consolidation prompt when supplied", () => {
+    const prompt = buildObservationConsolidationPrompt(
+      "SYSTEM",
+      "FACT BLOCK",
+      "- [user/fact] Existing claim",
+    );
+    assert.match(prompt.messages[0].content, /EXISTING ACTIVE OBSERVATIONS/);
+    assert.match(prompt.messages[0].content, /Existing claim/);
+    assert.match(prompt.messages[0].content, /single topic in 1–2 concise sentences/);
   });
 });
