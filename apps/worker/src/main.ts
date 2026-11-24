@@ -87,6 +87,7 @@ import { loadTemporalSettings } from "./temporal/store.ts";
 import { createPromptModuleStore } from "./prompt-modules/store.ts";
 import { executePromptModule } from "./prompt-modules/executor.ts";
 import { loadImageConfig } from "./image/config.ts";
+import { renderRecentImagesContext } from "./image/context.ts";
 import { createImageStore } from "./image/store.ts";
 import { createImageServiceClients } from "./image/client.ts";
 import { startImageRuntime } from "./image/runtime.ts";
@@ -873,6 +874,36 @@ async function main(): Promise<void> {
               const snapshot = await provisionedRoutineStore.getSnapshot(referenceTime);
               return snapshot === null ? null : renderRoutineContext(snapshot);
             },
+            ...(imageStore !== undefined
+              ? {
+                  loadImageContext: async ({ turnId, history, referenceTime }) => {
+                    const firstHistory = history[0];
+                    const lastHistory = history[history.length - 1];
+                    if (firstHistory === undefined || lastHistory === undefined) {
+                      return null;
+                    }
+                    const recentImages = await imageStore.getRecentSentImagesForTurn({
+                      turnId,
+                      sinceMessageId: firstHistory.id,
+                      lastHistoryMessageId: lastHistory.id,
+                      limit: 3,
+                    });
+                    let lastAssistantTurnId: string | null = null;
+                    for (let i = history.length - 1; i >= 0; i -= 1) {
+                      const msg = history[i]!;
+                      if (msg.role === "assistant" && msg.turnId !== null) {
+                        lastAssistantTurnId = msg.turnId;
+                        break;
+                      }
+                    }
+                    return renderRecentImagesContext({
+                      images: recentImages,
+                      now: referenceTime,
+                      lastAssistantTurnId,
+                    });
+                  },
+                }
+              : {}),
             ...(engagementStore !== undefined
               ? {
                   loadEngagementState: (referenceTime) =>

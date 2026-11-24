@@ -96,9 +96,21 @@ export interface ImageJob {
   readonly localDateTime: string;
   readonly promptId: string | null;
   readonly plan: ImagePlanSummary;
+  readonly sceneDescription: string | null;
   readonly errorCategory: string | null;
   readonly messageId: string | null;
   readonly createdAt: string;
+}
+
+/** One published photo in the current session, for LLM prompt awareness. */
+export interface RecentSentImage {
+  readonly jobId: string;
+  readonly turnId: string;
+  readonly messageId: string;
+  readonly publishedAt: string;
+  readonly threadOrder: number;
+  readonly afterLastHistory: boolean;
+  readonly sceneDescription: string;
 }
 
 /** One stored image asset, as attached to a thread message for reads. */

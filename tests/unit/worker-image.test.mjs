@@ -12,6 +12,10 @@ import {
   createImageServiceClients,
   ImageClientError,
 } from "../../apps/worker/src/image/client.ts";
+import {
+  fallbackSceneDescription,
+  renderRecentImagesContext,
+} from "../../apps/worker/src/image/context.ts";
 import { imageMigrations } from "../../apps/worker/src/image/migrations.ts";
 
 function webpVp8x(width, height) {
@@ -166,6 +170,8 @@ describe("image service clients", () => {
           success: true,
           promptId: "prompt-1",
           durationMs: 42,
+          sceneDescription:
+            "You were sitting on the bed in a grey hoodie, smiling at the camera.",
           plan: { location: "bedroom", timePeriod: "evening", poseCategory: "sitting", poseVariantId: "couch-1", expressionKey: "smile", handGesture: "wave", cameraAngle: "front", intimacy: "casual", clothingSummary: "grey hoodie" },
           images: [{ filename: "a.webp", subfolder: "", mimeType: "image/webp", sizeBytes: webp.byteLength, dataBase64: webp.toString("base64") }],
         }),
@@ -185,6 +191,10 @@ describe("image service clients", () => {
     });
     assert.equal(result.promptId, "prompt-1");
     assert.equal(result.plan.poseVariantId, "couch-1");
+    assert.equal(
+      result.sceneDescription,
+      "You were sitting on the bed in a grey hoodie, smiling at the camera.",
+    );
     assert.equal(result.images[0].width, 768);
     assert.equal(result.images[0].height, 1344);
   });
@@ -217,11 +227,99 @@ describe("image service clients", () => {
 
 describe("image migrations", () => {
   it("creates typed relational job and asset tables without a JSONB payload", () => {
-    assert.equal(imageMigrations.length, 1);
+    assert.equal(imageMigrations.length, 2);
     assert.equal(imageMigrations[0].id, "0032_image_generation");
     assert.match(imageMigrations[0].sql, /CREATE TABLE image_job/);
     assert.match(imageMigrations[0].sql, /CREATE TABLE image_asset/);
     assert.match(imageMigrations[0].sql, /data bytea NOT NULL/);
     assert.doesNotMatch(imageMigrations[0].sql, /jsonb/i);
+
+    assert.equal(imageMigrations[1].id, "0033_image_scene_description");
+    assert.match(imageMigrations[1].sql, /ADD COLUMN scene_description text/);
+    assert.match(imageMigrations[1].sql, /'image'/);
+    assert.doesNotMatch(imageMigrations[1].sql, /jsonb/i);
+  });
+});
+
+describe("recent image prompt context", () => {
+  it("returns null when no photos were sent in the current session", () => {
+    assert.equal(
+      renderRecentImagesContext({
+        images: [],
+        now: new Date("2026-11-24T18:00:00.000Z"),
+        lastAssistantTurnId: "turn-1",
+      }),
+      null,
+    );
+  });
+
+  it("renders session photos chronologically and marks a photo delivered after the last reply", () => {
+    const rendered = renderRecentImagesContext({
+      images: [
+        {
+          jobId: "job-1",
+          turnId: "turn-1",
+          messageId: "msg-img-1",
+          publishedAt: "2026-11-24T17:48:00.000Z",
+          threadOrder: 10,
+          afterLastHistory: false,
+          sceneDescription: "You were sitting back on the couch in the living room.",
+        },
+        {
+          jobId: "job-2",
+          turnId: "turn-3",
+          messageId: "msg-img-2",
+          publishedAt: "2026-11-24T17:59:00.000Z",
+          threadOrder: 15,
+          afterLastHistory: true,
+          sceneDescription:
+            "You were reclining back on the bed wearing a grey hoodie, looking at the camera with an affectionate smile.",
+        },
+      ],
+      now: new Date("2026-11-24T18:00:00.000Z"),
+      lastAssistantTurnId: "turn-3",
+    });
+
+    assert.ok(rendered !== null);
+    assert.match(rendered, /Authoritative record of photos already sent/);
+    assert.match(
+      rendered,
+      /- Earlier photo \(sent 12 minutes ago\): You were sitting back on the couch/,
+    );
+    assert.match(
+      rendered,
+      /- Most recent photo \(sent right after your last reply, 1 minute ago\): You were reclining back on the bed/,
+    );
+  });
+
+  it("builds a fallback description from persisted plan columns when scene_description is absent", () => {
+    assert.equal(
+      fallbackSceneDescription({
+        location: "bedroom",
+        timePeriod: "evening",
+        poseCategory: "lying",
+        poseVariantId: "bed_lying_on_side",
+        expression: "affectionate",
+        handGesture: "none",
+        cameraAngle: "from_above",
+        intimacy: "casual",
+        clothingSummary: "grey hoodie (on), sweatpants (on)",
+      }),
+      "You were lying in the bedroom during evening. Outfit: grey hoodie (on), sweatpants (on). Expression: affectionate.",
+    );
+    assert.equal(
+      fallbackSceneDescription({
+        location: null,
+        timePeriod: null,
+        poseCategory: null,
+        poseVariantId: null,
+        expression: null,
+        handGesture: null,
+        cameraAngle: null,
+        intimacy: null,
+        clothingSummary: null,
+      }),
+      null,
+    );
   });
 });
