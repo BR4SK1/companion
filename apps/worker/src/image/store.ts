@@ -8,11 +8,13 @@
 
 import { withTransaction, type PostgresPool, type PostgresPoolClient } from "@companion/postgres";
 
+import { fallbackSceneDescription } from "./context.ts";
 import type {
   ImageJob,
   ImagePlanSummary,
   MessageImageRef,
   PriorPose,
+  RecentSentImage,
   RenderedImage,
 } from "./types.ts";
 
@@ -35,6 +37,7 @@ interface JobRow {
   plan_camera_angle: string | null;
   plan_intimacy: string | null;
   plan_clothing_summary: string | null;
+  scene_description: string | null;
   error_category: string | null;
   message_id: string | null;
   created_at: Date;
@@ -45,7 +48,7 @@ const JOB_COLUMNS =
   "local_date_time, prompt_id, plan_location, plan_time_period, " +
   "plan_pose_category, plan_pose_variant_id, plan_expression, " +
   "plan_hand_gesture, plan_camera_angle, plan_intimacy, " +
-  "plan_clothing_summary, error_category, message_id, created_at";
+  "plan_clothing_summary, scene_description, error_category, message_id, created_at";
 
 function mapJob(row: JobRow): ImageJob {
   return {
@@ -69,6 +72,7 @@ function mapJob(row: JobRow): ImageJob {
       intimacy: row.plan_intimacy,
       clothingSummary: row.plan_clothing_summary,
     },
+    sceneDescription: row.scene_description,
     errorCategory: row.error_category,
     messageId: row.message_id,
     createdAt: row.created_at.toISOString(),
@@ -92,6 +96,7 @@ export interface ImageStore {
     input: {
       readonly promptId: string;
       readonly plan: ImagePlanSummary;
+      readonly sceneDescription?: string | null;
       readonly images: readonly RenderedImage[];
     },
   ) => Promise<void>;
@@ -117,6 +122,17 @@ export interface ImageStore {
   readonly getImagesForMessages: (
     messageIds: readonly string[],
   ) => Promise<ReadonlyMap<string, readonly MessageImageRef[]>>;
+  /**
+   * Recently published photos inside the current session window for a claimed
+   * turn (oldest first, bounded by `limit`), so the chat prompt can report
+   * what images were already sent without adding synthetic assistant turns.
+   */
+  readonly getRecentSentImagesForTurn: (input: {
+    readonly turnId: string;
+    readonly sinceMessageId: string;
+    readonly lastHistoryMessageId: string;
+    readonly limit: number;
+  }) => Promise<readonly RecentSentImage[]>;
 }
 
 export function createImageStore(pool: PostgresPool): ImageStore {
@@ -203,7 +219,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
                plan_pose_category = $5, plan_pose_variant_id = $6,
                plan_expression = $7, plan_hand_gesture = $8,
                plan_camera_angle = $9, plan_intimacy = $10,
-               plan_clothing_summary = $11,
+               plan_clothing_summary = $11, scene_description = $12,
                error_category = NULL, updated_at = now()
            WHERE id = $1 AND status = 'running'`,
           [
@@ -218,6 +234,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
             input.plan.cameraAngle,
             input.plan.intimacy,
             input.plan.clothingSummary,
+            input.sceneDescription ?? null,
           ],
         );
       });
@@ -347,6 +364,94 @@ export function createImageStore(pool: PostgresPool): ImageStore {
         else existing.push(entry);
       }
       return map;
+    },
+
+    getRecentSentImagesForTurn: async (input) => {
+      if (input.limit < 1) return [];
+      const result = await pool.query<{
+        id: string;
+        turn_id: string;
+        message_id: string;
+        scene_description: string | null;
+        plan_location: string | null;
+        plan_time_period: string | null;
+        plan_pose_category: string | null;
+        plan_pose_variant_id: string | null;
+        plan_expression: string | null;
+        plan_hand_gesture: string | null;
+        plan_camera_angle: string | null;
+        plan_intimacy: string | null;
+        plan_clothing_summary: string | null;
+        published_at: Date;
+        thread_order: string;
+        after_last_history: boolean;
+      }>(
+        `WITH bounds AS (
+           SELECT
+             (SELECT t.thread_order FROM conversation_turn AS t WHERE t.id = $1) AS current_order,
+             (
+               SELECT COALESCE(t.thread_order, m.thread_order)
+               FROM conversation_message AS m
+               LEFT JOIN conversation_turn AS t ON t.id = m.turn_id
+               WHERE m.id = $2
+             ) AS since_order,
+             (
+               SELECT COALESCE(t.thread_order, m.thread_order)
+               FROM conversation_message AS m
+               LEFT JOIN conversation_turn AS t ON t.id = m.turn_id
+               WHERE m.id = $3
+             ) AS last_history_order
+         )
+         SELECT j.id, j.turn_id, j.message_id, j.scene_description,
+                j.plan_location, j.plan_time_period, j.plan_pose_category,
+                j.plan_pose_variant_id, j.plan_expression, j.plan_hand_gesture,
+                j.plan_camera_angle, j.plan_intimacy, j.plan_clothing_summary,
+                m.created_at AS published_at,
+                m.thread_order,
+                (bounds.last_history_order IS NOT NULL AND m.thread_order > bounds.last_history_order)
+                  AS after_last_history
+         FROM image_job AS j
+         JOIN conversation_message AS m ON m.id = j.message_id
+         CROSS JOIN bounds
+         WHERE j.status = 'succeeded'
+           AND j.message_id IS NOT NULL
+           AND bounds.current_order IS NOT NULL
+           AND bounds.since_order IS NOT NULL
+           AND m.thread_order >= bounds.since_order
+           AND m.thread_order < bounds.current_order
+         ORDER BY m.thread_order DESC, m.seq DESC
+         LIMIT $4`,
+        [input.turnId, input.sinceMessageId, input.lastHistoryMessageId, input.limit],
+      );
+      const images: RecentSentImage[] = [];
+      for (const row of [...result.rows].reverse()) {
+        const stored = row.scene_description?.trim() ?? "";
+        const description =
+          stored.length > 0
+            ? stored
+            : fallbackSceneDescription({
+                location: row.plan_location,
+                timePeriod: row.plan_time_period,
+                poseCategory: row.plan_pose_category,
+                poseVariantId: row.plan_pose_variant_id,
+                expression: row.plan_expression,
+                handGesture: row.plan_hand_gesture,
+                cameraAngle: row.plan_camera_angle,
+                intimacy: row.plan_intimacy,
+                clothingSummary: row.plan_clothing_summary,
+              });
+        if (description === null) continue;
+        images.push({
+          jobId: row.id,
+          turnId: row.turn_id,
+          messageId: row.message_id,
+          publishedAt: row.published_at.toISOString(),
+          threadOrder: Number(row.thread_order),
+          afterLastHistory: row.after_last_history,
+          sceneDescription: description,
+        });
+      }
+      return images;
     },
   };
 }

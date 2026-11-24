@@ -54,6 +54,7 @@ export interface ImageServiceClients {
   }) => Promise<{
     readonly promptId: string;
     readonly plan: ImagePlanSummary;
+    readonly sceneDescription: string | null;
     readonly images: readonly RenderedImage[];
   }>;
 }
@@ -297,6 +298,13 @@ export function createImageServiceClients(deps: {
         intimacy: stringOrNull(planRaw.intimacy),
         clothingSummary: stringOrNull(planRaw.clothingSummary),
       };
+      const rawSceneDescription =
+        stringOrNull(raw.sceneDescription) ??
+        stringOrNull(planRaw.sceneDescription);
+      const sceneDescription =
+        rawSceneDescription !== null && rawSceneDescription.trim().length > 0
+          ? rawSceneDescription.trim()
+          : null;
 
       const images: RenderedImage[] = [];
       for (const entry of raw.images) {
@@ -331,7 +339,7 @@ export function createImageServiceClients(deps: {
           data,
         });
       }
-      return { promptId, plan, images };
+      return { promptId, plan, sceneDescription, images };
     },
   };
 }

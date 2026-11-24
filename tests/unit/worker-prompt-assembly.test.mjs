@@ -631,8 +631,8 @@ describe("processor: modular assembly with memory, patterns, and trace metadata"
     );
   });
 
-  it("orders all sections as identity -> profiles -> relationship -> temporal -> recall -> guidance -> time -> routine -> prompt_module -> conversation", () => {
-    const { messages } = buildChatPrompt({
+  it("orders all sections as identity -> profiles -> relationship -> temporal -> recall -> guidance -> time -> routine -> prompt_module -> image -> conversation", () => {
+    const { request, messages } = buildChatPrompt({
       model: "chat-model",
       identity: "IDENTITY",
       profiles: "PROFILES",
@@ -645,6 +645,7 @@ describe("processor: modular assembly with memory, patterns, and trace metadata"
       promptModules: [
         { moduleId: "mod-outfit", content: "OUTFIT STATE", outputKind: "authoritative_context" },
       ],
+      image: "RECENTLY SENT PHOTOS",
       history: [message(1, "user", "q1"), message(2, "assistant", "a1")],
       turnMessages: [message(3, "user", "q2")],
     });
@@ -660,10 +661,98 @@ describe("processor: modular assembly with memory, patterns, and trace metadata"
         "time",
         "routine",
         "prompt_module",
+        "image",
         "conversation",
         "conversation",
         "conversation",
       ],
+    );
+    assert.equal(request.messages[9].role, "system");
+    assert.equal(request.messages[9].content, "RECENTLY SENT PHOTOS");
+  });
+
+  it("injects recent image context via loadImageContext and degrades cleanly on loader failure", async () => {
+    let capturedRequest;
+    await processTurnWork(
+      {
+        turn: {
+          id: "turn-image-context",
+          status: "in_flight",
+          attempt: 1,
+          leaseOwner: "o",
+          leaseExpiresAt: new Date().toISOString(),
+          selectedPatternId: null,
+          decision: null,
+          error: null,
+          createdAt: new Date().toISOString(),
+          completedAt: null,
+        },
+        messages: [message(3, "user", "you look great!")],
+      },
+      {
+        decisionModel: "decision-model",
+        chatModel: "chat-model",
+        callDecisions: async () => decisionResponse("concise"),
+        callChat: async (req) => {
+          capturedRequest = req;
+          return chatResponse("aw thank you!!");
+        },
+        loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
+        loadPatterns: async () => [],
+        loadContext: async () => [
+          message(1, "user", "hey"),
+          message(2, "assistant", "hey there!"),
+        ],
+        loadPreviousPublishedAssistantReply: async () => "hey there!",
+        loadImageContext: async () =>
+          "Authoritative record of photos already sent: You were reclining on the bed.",
+      },
+    );
+    assert.deepEqual(
+      capturedRequest.messages.map((m) => m.role),
+      ["system", "system", "user", "assistant", "user"],
+    );
+    assert.match(capturedRequest.messages[1].content, /reclining on the bed/);
+
+    // Failure in loadImageContext degrades cleanly without failing the turn.
+    let degradedRequest;
+    const outcome = await processTurnWork(
+      {
+        turn: {
+          id: "turn-image-context-fail",
+          status: "in_flight",
+          attempt: 1,
+          leaseOwner: "o",
+          leaseExpiresAt: new Date().toISOString(),
+          selectedPatternId: null,
+          decision: null,
+          error: null,
+          createdAt: new Date().toISOString(),
+          completedAt: null,
+        },
+        messages: [message(3, "user", "hi")],
+      },
+      {
+        decisionModel: "decision-model",
+        chatModel: "chat-model",
+        callDecisions: async () => decisionResponse("concise"),
+        callChat: async (req) => {
+          degradedRequest = req;
+          return chatResponse("hey!");
+        },
+        loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
+        loadPatterns: async () => [],
+        loadContext: async () => [],
+        loadPreviousPublishedAssistantReply: async () => null,
+        loadImageContext: async () => {
+          throw new Error("db unavailable");
+        },
+      },
+    );
+    assert.equal(outcome.reply, "hey!");
+    assert.deepEqual(
+      degradedRequest.messages.map((m) => m.role),
+      ["system", "user"],
     );
   });
 

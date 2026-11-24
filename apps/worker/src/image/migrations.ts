@@ -58,6 +58,25 @@ CREATE INDEX image_asset_message_idx ON image_asset (message_id)
 CREATE INDEX image_asset_job_idx ON image_asset (job_id);
 `;
 
+const ADD_IMAGE_SCENE_DESCRIPTION_AND_CHAT_CHUNK = `
+ALTER TABLE image_job
+  ADD COLUMN scene_description text;
+
+ALTER TABLE trace_attempt_chat_message
+  DROP CONSTRAINT trace_attempt_chat_message_chunk_check;
+ALTER TABLE trace_attempt_chat_message
+  ADD CONSTRAINT trace_attempt_chat_message_chunk_check
+  CHECK (chunk IN (
+    'identity', 'profiles', 'temporal', 'time', 'recall', 'article',
+    'relationship', 'routine', 'guidance', 'prompt_module', 'image',
+    'conversation'
+  ));
+`;
+
 export const imageMigrations: readonly Migration[] = [
   { id: "0032_image_generation", sql: CREATE_IMAGE_GENERATION },
+  {
+    id: "0033_image_scene_description",
+    sql: ADD_IMAGE_SCENE_DESCRIPTION_AND_CHAT_CHUNK,
+  },
 ];

@@ -43,6 +43,7 @@ test("worker startup and migration-only command share the complete ordered schem
       "0031_prompt_module_pattern_id",
       "0025_time_chat_chunk",
       "0032_image_generation",
+      "0033_image_scene_description",
     ],
   );
   assert.equal(new Set(workerMigrations.map(({ id }) => id)).size, workerMigrations.length);

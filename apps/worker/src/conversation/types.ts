@@ -37,6 +37,7 @@ export type ChatChunkName =
   | "relationship"
   | "routine"
   | "prompt_module"
+  | "image"
   | "guidance"
   | "conversation";
 

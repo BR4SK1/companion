@@ -27,7 +27,11 @@
  * 10. `prompt_module` — optional independently selected authoritative live
  *                      context (e.g., outfit state) or additive thoughts from
  *                      database-configured modules.
- * 11. `conversation` — the prior-turn history (oldest first, bounded to the
+ * 11. `image`         — optional authoritative record of photos already sent
+ *                      to the user in the current session, kept out of
+ *                      assistant turns to preserve strict speaker alternation
+ *                      and avoid marker imitation.
+ * 12. `conversation` — the prior-turn history (oldest first, bounded to the
  *                      most recent window by `getThreadContext`) followed by
  *                      the exact user messages grouped into the turn.
  *
@@ -88,6 +92,8 @@ export interface BuildChatRequestParams {
   readonly routine?: string | null;
   /** Independently selected module outputs with stable database identity/order. */
   readonly promptModules?: readonly PromptModulePromptOutput[];
+  /** Optional authoritative record of photos already sent in the current session. */
+  readonly image?: string | null;
   readonly temperature?: number;
   readonly maxTokens?: number;
   /**
@@ -174,6 +180,15 @@ export function buildChatPrompt(
       chunk: "prompt_module",
       sourceMessageId: null,
       promptModuleId: thought.moduleId,
+    });
+  }
+  if (hasContent(params.image)) {
+    messages.push({
+      role: "system",
+      content: params.image as string,
+      chunk: "image",
+      sourceMessageId: null,
+      promptModuleId: null,
     });
   }
   for (const message of [...params.history, ...params.turnMessages]) {

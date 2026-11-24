@@ -305,6 +305,16 @@ export interface TurnProcessorDeps {
   >;
   /** Optional configured scheduled/applied routine state; failures degrade to no context. */
   readonly loadRoutineContext?: (turnId: string, referenceTime: Date) => Promise<string | null>;
+  /**
+   * Optional record of photos already sent to the user in the current session,
+   * injected as its own `image` system chunk right before conversation history.
+   * Failures degrade to no image context; never fails a chat turn.
+   */
+  readonly loadImageContext?: (input: {
+    readonly turnId: string;
+    readonly history: readonly ConversationMessage[];
+    readonly referenceTime: Date;
+  }) => Promise<string | null>;
   /** Optional current engagement band from the worker's engagement domain. */
   readonly loadEngagementState?: (referenceTime: Date) => Promise<EngagementState | null>;
   readonly loadPublishedRoutineMessageKey?: (turnId: string) => Promise<string | null>;
@@ -880,6 +890,21 @@ export async function processTurnWork(
     }
   }
 
+  let imageChunk: string | null = null;
+  if (deps.loadImageContext !== undefined) {
+    try {
+      imageChunk = await deps.loadImageContext({
+        turnId: work.turn.id,
+        history,
+        referenceTime: attemptReferenceTime,
+      });
+    } catch {
+      console.warn(
+        `[IMAGE] context load failed for turn ${work.turn.id}; continuing without image context`,
+      );
+    }
+  }
+
   let promptModuleChunks: readonly PromptModulePromptOutput[] = [];
   const moduleServices = deps.promptModules;
   if (moduleServices !== undefined) {
@@ -1041,6 +1066,7 @@ export async function processTurnWork(
       ...(relationshipChunk !== null ? { relationship: relationshipChunk } : {}),
       ...(routineChunk !== null ? { routine: routineChunk } : {}),
       ...(modules.length > 0 ? { promptModules: modules } : {}),
+      ...(imageChunk !== null ? { image: imageChunk } : {}),
       ...(deps.temperature !== undefined ? { temperature: deps.temperature } : {}),
       ...(resolvedMaxTokens !== undefined ? { maxTokens: resolvedMaxTokens } : {}),
     });
