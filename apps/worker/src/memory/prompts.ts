@@ -569,6 +569,7 @@ export function buildTemporalSummaryPrompt(
     `Memory window: [${period.startAt.toISOString()}, ${period.endAt.toISOString()})`,
     `Target memory length: approximately ${Math.round(maxMemoryChars / 4)} visible tokens, with a hard limit of ${maxMemoryChars} characters.`,
     "Treat the supplied window as the complete memory period and do not repeat its opening in the diary prose.",
+    "Write in first person ('I', 'me', 'my', 'we', 'us') and refer to the other person by their name in the source material, never as second-person 'you'. Paraphrase things they said to you in indirect first-person speech rather than raw second-person quotes.",
   ].join("\n");
   return {
     systemPrompt,
@@ -635,8 +636,11 @@ export function renderTemporalSummary(
   const prefix = getTemporalPrefix(period.kind);
   const repeatedPrefix =
     /^(last night|this morning|this afternoon|yesterday|last week|last month)\s*,?\s*/i;
-  const normalizeSecondPerson = (text: string): string =>
-    text
+  const escapedUserLabel = userLabel.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const userLabelPattern = new RegExp(`\\b${escapedUserLabel}\\b`, "i");
+  const quotedSpanPattern = /"[^"]*"|(?<![A-Za-z])'[^']*'(?![A-Za-z])/g;
+  const replaceUnquotedSecondPerson = (clause: string): string =>
+    clause
       .replace(/\byou're\b/gi, `${userLabel} is`)
       .replace(/\byou've\b/gi, `${userLabel} has`)
       .replace(/\byou'll\b/gi, `${userLabel} will`)
@@ -647,9 +651,29 @@ export function renderTemporalSummary(
       .replace(/\byou had\b/gi, `${userLabel} had`)
       .replace(/\byou will\b/gi, `${userLabel} will`)
       .replace(/\byou would\b/gi, `${userLabel} would`)
-      .replace(/\byours\b/gi, `${userLabel}'s`)
+      .replace(/(?<!\ball\s)\byours\b/gi, `${userLabel}'s`)
       .replace(/\byour\b/gi, `${userLabel}'s`)
       .replace(/\byou\b/gi, userLabel);
+  const normalizeSentenceSecondPerson = (sentence: string): string => {
+    // When a sentence already refers to `userLabel` in third person, any "you"
+    // in that sentence is quoted or reported speech directed at the narrator.
+    if (userLabelPattern.test(sentence)) return sentence;
+    let cursor = 0;
+    let out = "";
+    for (const match of sentence.matchAll(quotedSpanPattern)) {
+      const index = match.index ?? 0;
+      out += replaceUnquotedSecondPerson(sentence.slice(cursor, index));
+      out += match[0];
+      cursor = index + match[0].length;
+    }
+    out += replaceUnquotedSecondPerson(sentence.slice(cursor));
+    return out;
+  };
+  const normalizeSecondPerson = (text: string): string =>
+    text
+      .split(/(?<=[.!?])\s+/)
+      .map(normalizeSentenceSecondPerson)
+      .join(" ");
   const normalize = (text: string): string =>
     normalizeSecondPerson(text).replace(repeatedPrefix, "").replace(/\s+/g, " ").trim();
   const eventText = normalize(output.eventsAndFeelings);

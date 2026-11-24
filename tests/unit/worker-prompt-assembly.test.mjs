@@ -191,6 +191,65 @@ describe("prompt assembly: optional memory chunks", () => {
       request.messages.map((m) => m.content),
     );
   });
+
+  it("strips standalone and inline image-action markers from assistant history and generated replies", async () => {
+    const { request, messages } = buildChatPrompt({
+      model: "chat-model",
+      identity: "IDENTITY",
+      history: [
+        message(1, "user", "good morning"),
+        message(2, "assistant", "*stretches*\n\nWait for me? *sends a picture*\n\n*sends a picture*"),
+        message(3, "assistant", "*sends a picture*"),
+        message(4, "assistant", "*takes picture*"),
+      ],
+      turnMessages: [message(5, "user", "looking good!")],
+      guidance: null,
+    });
+    assert.deepEqual(
+      request.messages.map((m) => `${m.role}:${m.content}`),
+      [
+        "system:IDENTITY",
+        "user:good morning",
+        "assistant:*stretches*\n\nWait for me?",
+        "user:looking good!",
+      ],
+    );
+    assert.equal(messages.length, 4);
+
+    let outcomeTrace;
+    const outcome = await processTurnWork(
+      {
+        turn: {
+          id: "turn-strip-image-marker",
+          status: "in_flight",
+          attempt: 1,
+          leaseOwner: "o",
+          leaseExpiresAt: new Date().toISOString(),
+          selectedPatternId: null,
+          decision: null,
+          error: null,
+          createdAt: new Date().toISOString(),
+          completedAt: null,
+        },
+        messages: [message(5, "user", "hi")],
+      },
+      {
+        decisionModel: "decision-model",
+        chatModel: "chat-model",
+        callDecisions: async () => decisionResponse("concise"),
+        callChat: async () =>
+          chatResponse("Here is my actual reply!\n\n*sends a picture*\n\n*takes a picture*"),
+        loadIdentity: async () => ({ content: "IDENTITY", revision: 1 }),
+        loadPatterns: async () => [],
+        loadContext: async () => [],
+        recordChatOutcome: async (payload) => {
+          outcomeTrace = payload;
+        },
+      },
+    );
+    assert.equal(outcome.reply, "Here is my actual reply!");
+    assert.equal(outcomeTrace.outcome.replyContent, "Here is my actual reply!");
+  });
 });
 
 describe("prompt assembly: selected and unselected pattern guidance", () => {

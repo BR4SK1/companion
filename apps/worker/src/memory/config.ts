@@ -142,7 +142,7 @@ const DEFAULTS = {
   factBatchMaxChars: 30_000,
   observationMaxTurns: 50,
   observationMaxFacts: 160,
-  observationMaxOutputTokens: 12_000,
+  observationMaxOutputTokens: 16_000,
   observationRecencyWindowDays: 365,
   consolidationNewFactsThreshold: 40,
   consolidationIntervalMs: 24 * 60 * 60_000,

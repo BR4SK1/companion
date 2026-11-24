@@ -13,6 +13,7 @@
 
 import type { PostgresPool } from "@companion/postgres";
 
+import { stripImageActionMarkers } from "../image/types.ts";
 import { hashPayload } from "./hashing.ts";
 import type { SourceTurn } from "./types.ts";
 
@@ -81,7 +82,7 @@ function buildSourceTurns(
       .join("\n");
     const assistantText = messages
       .filter((message) => message.role === "assistant")
-      .map((message) => message.content.trim())
+      .map((message) => stripImageActionMarkers(message.content).trim())
       .filter(Boolean)
       .join("\n");
     if (!userText || !assistantText || messages.length === 0) continue;

@@ -433,6 +433,9 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
           startedAt,
           finishedAt: new Date(),
         });
+        if (recovered.created > 0 || recovered.revised > 0 || recovered.superseded > 0) {
+          profileRuntime.trigger("promotion");
+        }
         return;
       }
       const plan = await buildPromotionPlan(pool, { runId, skipTentative: true, behavior });
@@ -476,6 +479,9 @@ export function startMemoryRuntime(deps: MemoryRuntimeDeps): MemoryRuntime {
         startedAt,
         finishedAt: new Date(),
       });
+      if (result.created > 0 || result.revised > 0 || result.superseded > 0) {
+        profileRuntime.trigger("promotion");
+      }
     } catch (error) {
       const category = memoryErrorCategory(error);
       log(`[MEMORY] auto-promotion for run ${runId} failed: ${category}`);

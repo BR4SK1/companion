@@ -26,6 +26,7 @@ import {
   generateProfileIfNeeded,
   renderProfileSource,
 } from "../../apps/worker/src/memory/profiles-v2.ts";
+import { startProfileRuntime } from "../../apps/worker/src/memory/profile-runtime.ts";
 
 describe("memory configuration", () => {
   it("defaults ingest/profiles/autopromote off and recall/temporal on", () => {
@@ -39,6 +40,7 @@ describe("memory configuration", () => {
     assert.equal(config.temporalSummariesEnabled, true);
     assert.equal(config.model, "z-ai/glm-5.3-flash");
     assert.equal(config.reasoningEffort, undefined);
+    assert.equal(config.observationMaxOutputTokens, 16_000);
     assert.equal(config.recallLimit, 8);
     assert.equal(config.recallMaxChars, 12_000);
     assert.equal(config.embeddingBaseUrl, "http://127.0.0.1:5113");
@@ -634,5 +636,41 @@ describe("observation profile v2 schema, handles, and parser hardening", () => {
           memoryOutputErrorReason(error) === expectedReason,
       );
     }
+  });
+
+  it("regenerates profiles immediately when triggered after promotion", async () => {
+    const triggers = [];
+    const runQuery = async (sql) => {
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] };
+      if (sql.includes("FROM memory_canonical_observation")) return { rows: [] };
+      if (sql.includes("FROM memory_observation_profile WHERE subject_id")) return { rows: [] };
+      if (sql.includes("INSERT INTO memory_observation_profile")) return { rows: [] };
+      if (sql.includes("DELETE FROM memory_observation_profile_claim")) return { rows: [] };
+      if (sql.includes("DELETE FROM memory_observation_profile_source")) return { rows: [] };
+      throw new Error(`Unexpected SQL: ${sql}`);
+    };
+    const pool = {
+      query: runQuery,
+      connect: async () => ({ query: runQuery, release: () => undefined }),
+    };
+    const runtime = startProfileRuntime({
+      pool,
+      config: loadMemoryConfig({ WORKER_MEMORY_PROFILES_ENABLED: "true" }),
+      behavior: { timezone: "America/New_York", dayStartHour: 4 },
+      profileSubjects: [{ id: "user", sourceLabel: "User", profileEnabled: true }],
+      observationProfilePrompt: { kind: "observation_profile", version: "v2-1", systemPrompt: "Write profile." },
+      callLlm: async () => {
+        throw new Error("should not call LLM on empty sources");
+      },
+      log: () => undefined,
+      onResult: async (result) => {
+        triggers.push(result.trigger);
+      },
+    });
+    // Trigger a post-promotion pass while startup is running or right after:
+    // it must serialize cleanly and complete before close() resolves.
+    runtime.trigger("promotion");
+    await runtime.close();
+    assert.deepEqual(triggers, ["startup", "promotion"]);
   });
 });

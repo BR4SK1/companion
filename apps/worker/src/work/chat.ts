@@ -48,6 +48,7 @@ import type {
   AssembledChatMessage,
   ConversationMessage,
 } from "../conversation/types.ts";
+import { stripImageActionMarkers } from "../image/types.ts";
 import type { PromptModulePromptOutput } from "../prompt-modules/types.ts";
 
 export interface BuildChatRequestParams {
@@ -176,6 +177,13 @@ export function buildChatPrompt(
     });
   }
   for (const message of [...params.history, ...params.turnMessages]) {
+    const content =
+      message.role === "assistant"
+        ? stripImageActionMarkers(message.content)
+        : message.content;
+    if (message.role === "assistant" && content.length === 0) {
+      continue;
+    }
     const previous = messages[messages.length - 1];
     // Coalesce consecutive assistant messages (for example an ordinary reply
     // followed by a background routine/schedule message) so the chat request
@@ -190,13 +198,13 @@ export function buildChatPrompt(
     ) {
       messages[messages.length - 1] = {
         ...previous,
-        content: `${previous.content}\n\n${message.content}`,
+        content: `${previous.content}\n\n${content}`,
       };
       continue;
     }
     messages.push({
       role: message.role,
-      content: message.content,
+      content,
       chunk: "conversation",
       sourceMessageId: message.id,
       promptModuleId: null,

@@ -112,3 +112,30 @@ export interface MessageImageRef {
 
 /** Content marker of the standalone assistant message carrying an image. */
 export const IMAGE_MESSAGE_MARKER = "*sends a picture*";
+
+const IMAGE_ACTION_MARKER_PATTERN =
+  /\*\s*(?:sends|takes|snaps)\s+(?:a\s+)?(?:picture|photo|selfie)\s*\*/gi;
+
+/**
+ * Strip standalone or inline `*sends a picture*` / `*takes picture*` action
+ * markers from assistant message text while preserving surrounding paragraph
+ * structure and normal roleplay actions.
+ */
+export function stripImageActionMarkers(text: string): string {
+  if (!text.includes("*")) return text;
+  const cleanedLines = text
+    .split("\n")
+    .map((line) => {
+      const hadMarker = IMAGE_ACTION_MARKER_PATTERN.test(line);
+      IMAGE_ACTION_MARKER_PATTERN.lastIndex = 0;
+      if (!hadMarker) return line;
+      return line
+        .replace(IMAGE_ACTION_MARKER_PATTERN, "")
+        .replace(/[ \t]{2,}/g, " ")
+        .trim();
+    });
+  return cleanedLines
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}

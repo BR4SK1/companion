@@ -50,6 +50,8 @@ export interface ProfileRuntimeDeps {
 }
 
 export interface ProfileRuntime {
+  /** Trigger an immediate serialized profile regeneration pass (e.g. after promotion). */
+  trigger(reason?: string): void;
   close(): Promise<void>;
 }
 
@@ -124,49 +126,73 @@ async function runAllProfiles(
 
 export function startProfileRuntime(deps: ProfileRuntimeDeps): ProfileRuntime {
   if (!deps.config.profilesEnabled || deps.profileSubjects.length === 0) {
-    return { close: async () => undefined };
+    return {
+      trigger: () => undefined,
+      close: async () => undefined,
+    };
   }
 
   let timer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
-  // Serializing flag: a startup run may still be in flight when the first
-  // scheduled run fires; never run two passes concurrently.
+  // Serializing state: a startup run may still be in flight when a scheduled or
+  // post-promotion trigger fires; never run two passes concurrently, and coalesce
+  // multiple triggers arriving while a pass is already running into one follow-up
+  // pass on the same durable promise chain so close() awaits all triggered work.
   let running = false;
-  // The pass actually in flight, so close() can await it instead of leaving
-  // an LLM-backed write running past shutdown.
+  let pendingTrigger: string | null = null;
   let inFlight: Promise<void> = Promise.resolve();
+
+  const drainPasses = async (initialTrigger: string): Promise<void> => {
+    let nextTrigger: string | null = initialTrigger;
+    while (nextTrigger !== null) {
+      const trigger = nextTrigger;
+      nextTrigger = null;
+      try {
+        await runAllProfiles(deps, trigger);
+      } catch (error) {
+        console.error(
+          `[MEMORY] profile ${trigger} run failed: ${memoryErrorCategory(error)}`,
+        );
+      }
+      if (pendingTrigger !== null) {
+        nextTrigger = pendingTrigger;
+        pendingTrigger = null;
+      }
+    }
+  };
+
+  const launchPass = (trigger: string): void => {
+    if (closed) return;
+    if (running) {
+      pendingTrigger = trigger;
+      return;
+    }
+    running = true;
+    inFlight = inFlight
+      .then(() => drainPasses(trigger))
+      .finally(() => {
+        running = false;
+      });
+  };
 
   const scheduleNext = (): void => {
     if (closed) return;
+    if (timer !== undefined) clearTimeout(timer);
     const delay = computeNextProfileRunDelay(new Date(), deps.config.profilesGenerateHour, deps.behavior.timezone);
     timer = setTimeout(() => {
-      if (closed || running) {
-        scheduleNext();
-        return;
-      }
-      running = true;
-      inFlight = runAllProfiles(deps, "scheduled")
-        .catch((error) => {
-          console.error(
-            `[MEMORY] profile scheduled run failed: ${memoryErrorCategory(error)}`,
-          );
-        })
-        .finally(() => {
-          running = false;
-          scheduleNext();
-        });
+      timer = undefined;
+      launchPass("scheduled");
+      scheduleNext();
     }, delay);
   };
 
-  inFlight = runAllProfiles(deps, "startup")
-    .catch((error) => {
-      console.error(
-        `[MEMORY] profile startup run failed: ${memoryErrorCategory(error)}`,
-      );
-    })
-    .finally(scheduleNext);
+  launchPass("startup");
+  scheduleNext();
 
   return {
+    trigger: (reason = "promotion"): void => {
+      launchPass(reason);
+    },
     close: async () => {
       closed = true;
       if (timer !== undefined) clearTimeout(timer);
