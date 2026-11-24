@@ -64,8 +64,8 @@ export function relationshipDayStreaks(input: {
 
 /**
  * Main reply output budget by configured base familiarity tier ordinal:
- * 500 tokens at the first tier (ordinal 0, also the value when relationship
- * is disabled) plus 100 tokens per successive tier. The ordinal is the tier's
+ * 250 tokens at the first tier (ordinal 0, also the value when relationship
+ * is disabled) plus 50 tokens per successive tier. The ordinal is the tier's
  * index in the configured ordered tier list — not the transient effective
  * tier, which can move one tier up or down on streak/missed-day signals — so
  * the budget tracks familiarity specifically.
@@ -78,8 +78,8 @@ export function relationshipDayStreaks(input: {
  * Other LLM tasks (memory, articles, decisions) keep their own presets and
  * are unaffected.
  */
-export const MAIN_REPLY_MAX_TOKENS_BASE = 500;
-export const MAIN_REPLY_MAX_TOKENS_PER_TIER = 100;
+export const MAIN_REPLY_MAX_TOKENS_BASE = 250;
+export const MAIN_REPLY_MAX_TOKENS_PER_TIER = 50;
 
 export const MAIN_REPLY_REASONING_HEADROOM_TOKENS: Readonly<
   Record<ChatReasoningEffort, number>
@@ -550,7 +550,7 @@ export function renderRelationshipContext(summary: RelationshipSummary): string 
     `Stage: ${summary.effectiveTier.label} (base: ${summary.baseTier.label}, movement: ${summary.tierMovement}; familiarity ${(summary.familiarity * 100).toFixed(1)}%).`,
     summary.effectiveTier.prompt,
     summary.effectiveTier.behavioralGuidance,
-    `Reply length: keep this reply concise, aiming for at most about ${String(mainReplyMaxTokensForSummary(summary))} output tokens.`,
+    `Reply length: before replying, think carefully through who said or did what in the recent conversation and how it connects to your memories and live state; keep this reply concise and natural for texting (1–2 short paragraphs unless the topic genuinely calls for more, aiming for at most about ${String(mainReplyMaxTokensForSummary(summary))} output tokens).`,
   ];
   return lines.join("\n");
 }

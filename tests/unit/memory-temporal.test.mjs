@@ -103,6 +103,25 @@ describe("temporal summary prompts", () => {
     assert.ok(rendered.includes("Preferences I noticed:"));
   });
 
+  it("preserves second-person pronouns inside quoted dialogue, sentences already naming the user, and fixed idioms", () => {
+    const rendered = renderTemporalSummary(
+      period,
+      output({
+        eventsAndFeelings:
+          "When Sam said, 'Haha yeah you get me,' that landed warmly for me. Sam kissed my forehead and began, yeah honestly with you, and trailed off. I teased that all yours was a dangerous thing to say to me.",
+        learnedFacts: "you are left-handed.",
+        discoveredPreferences: "You prefer winter.",
+      }),
+      2000,
+      "Sam",
+    );
+    assert.ok(rendered.includes("When Sam said, 'Haha yeah you get me,' that landed warmly for me."));
+    assert.ok(rendered.includes("Sam kissed my forehead and began, yeah honestly with you, and trailed off."));
+    assert.ok(rendered.includes("I teased that all yours was a dangerous thing to say to me."));
+    assert.ok(rendered.includes("What I learned: Sam is left-handed."));
+    assert.ok(rendered.includes("Preferences I noticed: Sam prefer winter."));
+  });
+
   it("strips a model-added repeated opener", () => {
     const rendered = renderTemporalSummary(
       period,

@@ -80,6 +80,7 @@ import {
   type DecisionModelPool,
 } from "./decision-pool.ts";
 import { buildChatPrompt } from "./chat.ts";
+import { stripImageActionMarkers } from "../image/types.ts";
 import { buildDynamicInitiativePrompt } from "./initiative.ts";
 import { buildRecallQuery } from "../memory/recall.ts";
 import type { MemoryChatContext } from "../memory/types.ts";
@@ -325,16 +326,31 @@ export interface TurnOutcome {
 
 }
 
+function sanitizeConversationMessages(
+  messages: readonly ConversationMessage[],
+): { role: ConversationMessage["role"]; content: string }[] {
+  const sanitized: { role: ConversationMessage["role"]; content: string }[] = [];
+  for (const message of messages) {
+    const content =
+      message.role === "assistant"
+        ? stripImageActionMarkers(message.content)
+        : message.content;
+    if (message.role === "assistant" && content.length === 0) continue;
+    sanitized.push({
+      role: message.role,
+      content,
+    });
+  }
+  return sanitized;
+}
+
 /** Conversation state presented to the decision model: the visible thread so far. */
 function decisionState(
   history: readonly ConversationMessage[],
   turnMessages: readonly ConversationMessage[],
 ): { conversation: { role: string; content: string }[] } {
   return {
-    conversation: [...history, ...turnMessages].map((message) => ({
-      role: message.role,
-      content: message.content,
-    })),
+    conversation: sanitizeConversationMessages([...history, ...turnMessages]),
   };
 }
 
@@ -870,8 +886,9 @@ export async function processTurnWork(
     try {
       const modules = await moduleServices.loadPromptModules();
       if (modules.length > 0) {
-        const previousAssistantResponse =
+        const rawPreviousAssistantResponse =
           await deps.loadPreviousPublishedAssistantReply(work.turn.id) ?? "";
+        const previousAssistantResponse = stripImageActionMarkers(rawPreviousAssistantResponse);
         let engagementState: EngagementState | null = null;
         if (deps.loadEngagementState !== undefined) {
           try {
@@ -896,14 +913,8 @@ export async function processTurnWork(
           modules,
           context: {
             credentials: moduleServices.promptModuleCredentials ?? {},
-            conversation: [...history, ...work.messages].map((message) => ({
-              role: message.role,
-              content: message.content,
-            })),
-            priorConversation: history.slice(-40).map((message) => ({
-              role: message.role,
-              content: message.content,
-            })),
+            conversation: sanitizeConversationMessages([...history, ...work.messages]),
+            priorConversation: sanitizeConversationMessages(history.slice(-40)),
             userMessages: work.messages
               .filter((message) => message.role === "user")
               .map((message) => message.content),
@@ -1129,7 +1140,7 @@ export async function processTurnWork(
     throw error;
   }
   const choice = chatResponse.choices[0]!; // The provider contract enforces at least one choice.
-  const reply = choice.message.content;
+  const reply = stripImageActionMarkers(choice.message.content);
   const applicationRejection =
     reply.trim().length === 0 ? "chat response contains a blank reply" : null;
 
@@ -1168,7 +1179,7 @@ export async function processTurnWork(
   if (applicationRejection !== null) throw new Error(applicationRejection);
 
   return {
-    reply: choice.message.content,
+    reply,
     selectedPatternId: selected !== undefined ? selected.id : null,
   };
 }

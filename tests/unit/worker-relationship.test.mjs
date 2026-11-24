@@ -720,11 +720,11 @@ describe("relationship conversation integration", () => {
 });
 
 describe("main reply output budget by base familiarity tier", () => {
-  it("is 500 at the first tier and adds 100 per successive tier", () => {
-    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(0), 500);
-    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(1), 600);
-    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(2), 700);
-    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(5), 1000);
+  it("is 250 at the first tier and adds 50 per successive tier", () => {
+    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(0), 250);
+    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(1), 300);
+    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(2), 350);
+    assert.equal(mainReplyMaxTokensForBaseTierOrdinal(5), 500);
     assert.throws(() => mainReplyMaxTokensForBaseTierOrdinal(-1), RangeError);
     assert.throws(() => mainReplyMaxTokensForBaseTierOrdinal(0.5), RangeError);
   });
@@ -732,7 +732,7 @@ describe("main reply output budget by base familiarity tier", () => {
   it("tracks the base tier ordinal, not the transient effective tier", () => {
     // Familiarity 3/4 -> base tier-b (ordinal 1) with an active streak
     // moving the effective tier up to tier-c; the budget must stay at
-    // the base-derived 600, not the effective-tier 700.
+    // the base-derived 300, not the effective-tier 350.
     const summary = summarizeRelationship({
       configuration,
       firstConversationAt: new Date("2026-01-07T12:00:00.000Z"),
@@ -751,8 +751,8 @@ describe("main reply output budget by base familiarity tier", () => {
     assert.equal(summary.baseTier.key, "tier-b");
     assert.equal(summary.baseTierOrdinal, 1);
     assert.equal(summary.effectiveTier.key, "tier-c");
-    assert.equal(mainReplyMaxTokensForSummary(summary), 600);
-    assert.match(renderRelationshipContext(summary), /at most about 600 output tokens/);
+    assert.equal(mainReplyMaxTokensForSummary(summary), 300);
+    assert.match(renderRelationshipContext(summary), /at most about 300 output tokens/);
     assert.match(renderRelationshipContext(summary), /keep this reply concise/);
   });
 
@@ -776,10 +776,10 @@ describe("main reply output budget by base familiarity tier", () => {
     });
     assert.equal(result.reply, "short reply");
     assert.equal(requests.length, 1);
-    assert.equal(requests[0].max_tokens, 700);
+    assert.equal(requests[0].max_tokens, 350);
   });
 
-  it("uses 500 when relationship is disabled (first tier) and keeps an explicit static override when no ordinal is supplied", async () => {
+  it("uses 250 when relationship is disabled (first tier) and keeps an explicit static override when no ordinal is supplied", async () => {
     const work = {
       turn: { id: "turn-budget-disabled", status: "in_flight", attempt: 1 },
       messages: [message("1", "user", "hello")],
@@ -798,7 +798,7 @@ describe("main reply output budget by base familiarity tier", () => {
       callChat: async (request) => { disabledRequest = request; return chatResponse("reply"); },
       loadRelationshipContext: async () => ({ context: null, baseTierOrdinal: 0 }),
     });
-    assert.equal(disabledRequest.max_tokens, 500);
+    assert.equal(disabledRequest.max_tokens, 250);
 
     let overrideRequest;
     await processTurnWork(work, {
@@ -820,10 +820,10 @@ describe("main reply output budget by base familiarity tier", () => {
     assert.equal(mainReplyReasoningHeadroomTokens("xhigh"), 5000);
     assert.equal(mainReplyReasoningHeadroomTokens("max"), 8000);
 
-    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(1, undefined), 600);
-    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(1, "none"), 600);
-    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(1, "high"), 4100);
-    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(0, "high"), 4000);
+    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(1, undefined), 300);
+    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(1, "none"), 300);
+    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(1, "high"), 3800);
+    assert.equal(mainReplyProviderMaxTokensForBaseTierOrdinal(0, "high"), 3750);
 
     const work = {
       turn: { id: "turn-reasoning-headroom", status: "in_flight", attempt: 1 },
@@ -845,7 +845,7 @@ describe("main reply output budget by base familiarity tier", () => {
       callChat: async (request) => { highRequest = request; return chatResponse("reply"); },
       loadRelationshipContext: async () => ({ context: "RELATIONSHIP", baseTierOrdinal: 1 }),
     });
-    assert.equal(highRequest.max_tokens, 4100);
+    assert.equal(highRequest.max_tokens, 3800);
     assert.deepEqual(highRequest.reasoning, { effort: "high", exclude: true });
 
     let noneRequest;
@@ -855,7 +855,7 @@ describe("main reply output budget by base familiarity tier", () => {
       callChat: async (request) => { noneRequest = request; return chatResponse("reply"); },
       loadRelationshipContext: async () => ({ context: "RELATIONSHIP", baseTierOrdinal: 1 }),
     });
-    assert.equal(noneRequest.max_tokens, 600);
+    assert.equal(noneRequest.max_tokens, 300);
 
     // Explicit static maxTokens override without a tier ordinal stays verbatim.
     let staticRequest;

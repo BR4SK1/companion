@@ -19,10 +19,31 @@ import type { WorkerMessage } from "./worker-client";
 
 /**
  * Content marker of the worker's standalone image message. In the browser
- * the image itself renders; the marker is context for the chat model, not
- * prose for the owner, so it is dropped when images are present.
+ * the image itself renders; the marker and any model-imitated `*sends a picture*`
+ * or `*takes picture*` action tags are stripped from assistant message text.
  */
 const IMAGE_MESSAGE_MARKER = "*sends a picture*";
+const IMAGE_ACTION_MARKER_PATTERN =
+  /\*\s*(?:sends|takes|snaps)\s+(?:a\s+)?(?:picture|photo|selfie)\s*\*/gi;
+
+function stripAssistantImageActionMarkers(text: string): string {
+  if (!text.includes("*")) return text;
+  const cleanedLines = text
+    .split("\n")
+    .map((line) => {
+      const hadMarker = IMAGE_ACTION_MARKER_PATTERN.test(line);
+      IMAGE_ACTION_MARKER_PATTERN.lastIndex = 0;
+      if (!hadMarker) return line;
+      return line
+        .replace(IMAGE_ACTION_MARKER_PATTERN, "")
+        .replace(/[ \t]{2,}/g, " ")
+        .trim();
+    });
+  return cleanedLines
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 /** Reduce one validated worker message to the client-facing shape. */
 export function toClientMessage(message: WorkerMessage): ThreadMessage {
@@ -35,14 +56,17 @@ export function toClientMessage(message: WorkerMessage): ThreadMessage {
           height: image.height,
         }))
       : undefined;
+  const text =
+    images !== undefined && message.content === IMAGE_MESSAGE_MARKER
+      ? ""
+      : message.role === "assistant"
+      ? stripAssistantImageActionMarkers(message.content)
+      : message.content;
   return {
     id: message.id,
     seq: message.seq,
     role: message.role,
-    text:
-      images !== undefined && message.content === IMAGE_MESSAGE_MARKER
-        ? ""
-        : message.content,
+    text,
     sentAt: message.createdAt,
     ...(images !== undefined ? { images } : {}),
   };

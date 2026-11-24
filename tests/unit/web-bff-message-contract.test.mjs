@@ -302,4 +302,13 @@ describe("BFF message contract: send acceptance through the client shape", () =>
     assert.equal(message.seq, original.seq);
     assert.equal(message.role, original.role);
   });
+
+  it("strips model-imitated image action markers from assistant text replies", () => {
+    const polluted = workerMessage({
+      role: "assistant",
+      content: "*laughs*\n\nWait for me? *sends a picture*\n\n*sends a picture*\n\n*takes picture*",
+    });
+    const message = toClientMessage(polluted);
+    assert.equal(message.text, "*laughs*\n\nWait for me?");
+  });
 });

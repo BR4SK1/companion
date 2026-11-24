@@ -2353,6 +2353,7 @@ export function createConversationStore(
                 m.client_time_status, m.server_received_at, m.thread_order
          FROM conversation_message AS m
          WHERE m.turn_id IS NULL AND m.role = 'assistant'
+           AND m.content <> '*sends a picture*'
            AND m.thread_order < (SELECT thread_order FROM current_turn)
        )
        SELECT id, seq, role, content, turn_id, client_key, created_at,

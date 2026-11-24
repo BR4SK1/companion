@@ -15,6 +15,7 @@
 
 import type { PostgresPool } from "@companion/postgres";
 
+import { IMAGE_MESSAGE_MARKER, stripImageActionMarkers } from "../../image/types.ts";
 import type { MemoryConfig } from "../config.ts";
 import {
   taskPresets,
@@ -271,17 +272,23 @@ async function loadMessageSource(
      LEFT JOIN conversation_turn t ON t.id = m.turn_id
      WHERE m.created_at >= $1 AND m.created_at < $2
        AND m.role IN ('user', 'assistant')
+       AND NOT (m.turn_id IS NULL AND m.content = $3)
      ORDER BY m.created_at, m.id`,
-    [period.startAt, period.endAt],
+    [period.startAt, period.endAt, IMAGE_MESSAGE_MARKER],
   );
-  const messages: CoverageMessage[] = result.rows.map((row) => ({
-    id: row.id,
-    turnId: row.turn_id,
-    role: row.role,
-    content: row.content,
-    createdAt: row.created_at,
-    turnCompleted: row.turn_completed === true,
-  }));
+  const messages: CoverageMessage[] = result.rows
+    .map((row) => ({
+      id: row.id,
+      turnId: row.turn_id,
+      role: row.role,
+      content:
+        row.role === "assistant"
+          ? stripImageActionMarkers(row.content)
+          : row.content,
+      createdAt: row.created_at,
+      turnCompleted: row.turn_completed === true,
+    }))
+    .filter((message) => message.role !== "assistant" || message.content.length > 0);
 
   if (messages.length === 0) {
     return {
