@@ -162,6 +162,35 @@ describe("prompt assembly: optional memory chunks", () => {
       ["identity", "profiles", "conversation"],
     );
   });
+
+  it("coalesces consecutive assistant messages so scheduled notices never break speaker alternation while keeping grouped user messages separate", () => {
+    const { request, messages } = buildChatPrompt({
+      model: "chat-model",
+      identity: "IDENTITY",
+      history: [
+        message(1, "user", "what is your favorite album?"),
+        message(2, "assistant", "spirited away soundtrack! your turn!"),
+        message(3, "assistant", "mind if i put my phone down for like 10 mins to shower?"),
+      ],
+      turnMessages: [
+        message(4, "user", "Songs for the Deaf"),
+        message(5, "user", "and yes go shower"),
+      ],
+      guidance: null,
+    });
+    assert.deepEqual(
+      request.messages.map((m) => m.role),
+      ["system", "user", "assistant", "user", "user"],
+    );
+    assert.equal(
+      request.messages[2].content,
+      "spirited away soundtrack! your turn!\n\nmind if i put my phone down for like 10 mins to shower?",
+    );
+    assert.deepEqual(
+      messages.map((m) => m.content),
+      request.messages.map((m) => m.content),
+    );
+  });
 });
 
 describe("prompt assembly: selected and unselected pattern guidance", () => {

@@ -503,6 +503,7 @@ export interface CanonicalRecallItem {
   readonly supportCount?: number;
   readonly distinctDayCount?: number;
   readonly textScore: number;
+  readonly semanticSimilarity?: number;
   readonly recencyBoost: number;
   readonly evidenceBoost: number;
   readonly score: number;
@@ -525,6 +526,8 @@ export interface CanonicalRecallResponse {
   readonly diagnostics: {
     readonly factCandidates: number;
     readonly observationCandidates: number;
+    readonly semanticUsed?: boolean;
+    readonly semanticCandidates?: number;
     readonly truncatedForBudget: number;
     readonly maxChars: number;
     readonly totalMs: number;
