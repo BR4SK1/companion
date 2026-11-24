@@ -60,6 +60,14 @@ existing Kubernetes Secrets — never chart defaults, never committed values.
   equal the web deployment's `WEB_WORKER_TOKEN`. The example must be copied
   to a local version-control-excluded location and filled in before
   enabling the deployables.
+  Image generation is likewise enabled with plain non-secret `worker.env`
+  values (no dedicated chart values, no rebuild): set
+  `WORKER_IMPLEMENTATION_SERVICE_URL`, `WORKER_IMAGE_SERVICE_URL`, and
+  `WORKER_IMAGE_USER_ID` together to the cluster-internal module endpoints
+  and the module-scope user id (it must match the prompt-module
+  registration's scope value); leaving all three unset disables image
+  generation, and a partial set fails worker startup. See the worker's
+  [image generation notes](../../../apps/worker/README.md#image-generation).
   Six model/reasoning knobs are plain non-secret `worker.env` values (no
   dedicated chart values are needed, and no image rebuild is required to
   change them — a Helm upgrade rolls the worker): `WORKER_CHAT_MODEL` +

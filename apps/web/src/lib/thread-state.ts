@@ -2,6 +2,14 @@
 import type { MessageRole } from "./messages";
 import { isValidInstant } from "./time.ts";
 
+/** One inline image as delivered by the BFF (served from `/api/images/<id>`). */
+export interface ThreadMessageImage {
+  readonly src: string;
+  readonly alt: string;
+  readonly width: number;
+  readonly height: number;
+}
+
 /** One live message as delivered by the BFF thread pages. */
 export interface ThreadMessage {
   readonly id: string;
@@ -9,6 +17,7 @@ export interface ThreadMessage {
   readonly role: MessageRole;
   readonly text: string;
   readonly sentAt: string;
+  readonly images?: readonly ThreadMessageImage[];
 }
 
 /** Generic thread work status delivered alongside each page. */
@@ -167,7 +176,38 @@ export function parseThreadSnapshotResponse(
     ) {
       return null;
     }
-    messages.push({ id, seq, role, text, sentAt });
+    let images: ThreadMessageImage[] | undefined;
+    if (message.images !== undefined) {
+      if (!Array.isArray(message.images)) return null;
+      images = [];
+      for (const imageEntry of message.images) {
+        if (typeof imageEntry !== "object" || imageEntry === null) return null;
+        const image = imageEntry as Record<string, unknown>;
+        const { src, alt, width, height } = image;
+        if (
+          typeof src !== "string" ||
+          !src.startsWith("/api/images/") ||
+          typeof alt !== "string" ||
+          typeof width !== "number" ||
+          !Number.isInteger(width) ||
+          width < 1 ||
+          typeof height !== "number" ||
+          !Number.isInteger(height) ||
+          height < 1
+        ) {
+          return null;
+        }
+        images.push({ src, alt, width, height });
+      }
+    }
+    messages.push({
+      id,
+      seq,
+      role,
+      text,
+      sentAt,
+      ...(images !== undefined && images.length > 0 ? { images } : {}),
+    });
   }
   return {
     messages,

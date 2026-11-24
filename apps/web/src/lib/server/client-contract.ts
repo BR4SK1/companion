@@ -17,13 +17,33 @@ import type { ThreadMessage } from "@/lib/thread-state";
 
 import type { WorkerMessage } from "./worker-client";
 
+/**
+ * Content marker of the worker's standalone image message. In the browser
+ * the image itself renders; the marker is context for the chat model, not
+ * prose for the owner, so it is dropped when images are present.
+ */
+const IMAGE_MESSAGE_MARKER = "*sends a picture*";
+
 /** Reduce one validated worker message to the client-facing shape. */
 export function toClientMessage(message: WorkerMessage): ThreadMessage {
+  const images =
+    message.images !== undefined && message.images.length > 0
+      ? message.images.map((image) => ({
+          src: `/api/images/${image.id}`,
+          alt: image.alt,
+          width: image.width,
+          height: image.height,
+        }))
+      : undefined;
   return {
     id: message.id,
     seq: message.seq,
     role: message.role,
-    text: message.content,
+    text:
+      images !== undefined && message.content === IMAGE_MESSAGE_MARKER
+        ? ""
+        : message.content,
     sentAt: message.createdAt,
+    ...(images !== undefined ? { images } : {}),
   };
 }

@@ -71,6 +71,7 @@ import type {
   ChatRequestTracePayload,
   ChatIdentity,
   ConversationMessage,
+  ConversationMessageImage,
   ConversationTurn,
   DecisionOutcomeTracePayload,
   DecisionRequestTracePayload,
@@ -314,6 +315,16 @@ export interface ConversationStoreOptions {
     client: PostgresPoolClient,
     attemptId: string,
   ) => Promise<readonly PromptModuleTraceRecord[]>;
+  /**
+   * Optional image-domain read: images attached to thread messages, loaded
+   * by the composition edge so the conversation domain never queries image
+   * tables. When absent, thread reads carry no images.
+   */
+  readonly threadImageLoader?: {
+    getImagesForMessages(
+      messageIds: readonly string[],
+    ): Promise<ReadonlyMap<string, readonly ConversationMessageImage[]>>;
+  };
 }
 
 /**
@@ -556,6 +567,17 @@ export interface ConversationStore {
   >;
   /** Previous published assistant turn reply, independent of bounded context history. */
   getPreviousPublishedAssistantReply(turnId: string): Promise<string | null>;
+  /**
+   * The published turn's image-generation input: its grouped user text, its
+   * published reply, and its selected pattern. Null when the turn has no
+   * published reply. Used by the image domain's post-publish enqueue.
+   */
+  getPublishedTurnImageInput(turnId: string): Promise<{
+    readonly userText: string;
+    readonly reply: string;
+    readonly replyCreatedAt: string;
+    readonly selectedPatternId: string | null;
+  } | null>;
   /** Bounded page of the thread in `seq` order (see the notes below). */
   retryFailedAttempt(attemptId: string): Promise<boolean>;
   getThreadPage(params: ThreadPageParams): Promise<ThreadPage>;
@@ -2268,6 +2290,42 @@ export function createConversationStore(
     return row.content;
   }
 
+  async function getPublishedTurnImageInput(turnId: string) {
+    const turn = await pool.query<{
+      selected_pattern_id: string | null;
+      status: string;
+    }>(
+      `SELECT selected_pattern_id, status FROM conversation_turn WHERE id = $1`,
+      [turnId],
+    );
+    const turnRow = turn.rows[0];
+    if (turnRow === undefined || turnRow.status !== "completed") return null;
+    const messages = await pool.query<{
+      role: string;
+      content: string;
+      created_at: Date;
+    }>(
+      `SELECT role, content, created_at FROM conversation_message
+       WHERE turn_id = $1
+       ORDER BY seq ASC`,
+      [turnId],
+    );
+    const replyRow = messages.rows.find((row) => row.role === "assistant");
+    if (replyRow === undefined) return null;
+    const userText = messages.rows
+      .filter((row) => row.role === "user")
+      .map((row) => row.content.trim())
+      .filter((content) => content.length > 0)
+      .join("\n");
+    if (userText.length === 0) return null;
+    return {
+      userText,
+      reply: replyRow.content,
+      replyCreatedAt: replyRow.created_at.toISOString(),
+      selectedPatternId: turnRow.selected_pattern_id,
+    };
+  }
+
   async function getThreadContext(params: ThreadContextParams): Promise<
     readonly ConversationMessage[]
   > {
@@ -2339,8 +2397,20 @@ export function createConversationStore(
        ORDER BY seq ${forward ? "ASC" : "DESC"} LIMIT $1`,
       cursor === undefined ? [limit + 1] : [limit + 1, cursor],
     );
-    const messages = result.rows.slice(0, limit).map(mapMessage);
-    if (!forward) messages.reverse();
+    const mapped = result.rows.slice(0, limit).map(mapMessage);
+    if (!forward) mapped.reverse();
+    let messages: ConversationMessage[] = mapped;
+    if (options?.threadImageLoader !== undefined && mapped.length > 0) {
+      const imagesByMessage = await options.threadImageLoader.getImagesForMessages(
+        mapped.map((message) => message.id),
+      );
+      messages = mapped.map((message) => {
+        const images = imagesByMessage.get(message.id);
+        return images === undefined || images.length === 0
+          ? message
+          : { ...message, images };
+      });
+    }
     return { messages, oldestSeq: messages[0]?.seq ?? null, hasMore: result.rows.length > limit };
   }
 
@@ -2430,6 +2500,7 @@ export function createConversationStore(
     getChatIdentity,
     getThreadContext,
     getPreviousPublishedAssistantReply,
+    getPublishedTurnImageInput,
     retryFailedAttempt,
     getThreadPage,
     getThreadStatus,

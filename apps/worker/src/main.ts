@@ -85,6 +85,12 @@ import { memoryErrorCategory } from "./memory/errors.ts";
 import { loadTemporalSettings } from "./temporal/store.ts";
 import { createPromptModuleStore } from "./prompt-modules/store.ts";
 import { executePromptModule } from "./prompt-modules/executor.ts";
+import { loadImageConfig } from "./image/config.ts";
+import { createImageStore } from "./image/store.ts";
+import { createImageServiceClients } from "./image/client.ts";
+import { startImageRuntime } from "./image/runtime.ts";
+import { IMAGE_MESSAGE_MARKER } from "./image/types.ts";
+import { DateTime } from "luxon";
 import { createDecisionModelPool } from "./work/decision-pool.ts";
 
 /**
@@ -130,6 +136,7 @@ async function main(): Promise<void> {
   let learning: Awaited<ReturnType<typeof startRelationshipLearning>> | undefined;
   let articleRuntime: ReturnType<typeof startArticleRuntime> | undefined;
   let routineRuntime: ReturnType<typeof startRoutineRuntime> | undefined;
+  let imageRuntime: ReturnType<typeof startImageRuntime> | undefined;
   try {
     const migrations = await applyWorkerMigrations(pool);
     if (migrations.applied.length > 0) {
@@ -212,9 +219,28 @@ async function main(): Promise<void> {
     const routineStore = createRoutineStore({ pool, timezone: temporalSettings.timezone });
     await routineStore.reconcile();
 
+    // Image generation (post-turn media domain). Disabled unless the
+    // operator supplies the module endpoints and the module-scope user id;
+    // a partial configuration fails startup naming the missing variables.
+    const imageConfig = loadImageConfig(process.env);
+    const imageStore = imageConfig.enabled ? createImageStore(pool) : undefined;
+    if (imageStore === undefined) {
+      console.log(
+        "[IMAGE] image generation disabled (module endpoints not configured); ordinary chat is unchanged",
+      );
+    }
+
     const promptModuleStore = createPromptModuleStore(pool);
     const store = createConversationStore(pool, {
       clientTimeMaxAheadMs: config.clientTimeMaxAheadMs,
+      ...(imageStore !== undefined
+        ? {
+            threadImageLoader: {
+              getImagesForMessages: (messageIds) =>
+                imageStore.getImagesForMessages(messageIds),
+            },
+          }
+        : {}),
       ...(engagementStore !== undefined
         ? {
             onUserMessageInserted: (tx, inserted) =>
@@ -545,6 +571,36 @@ async function main(): Promise<void> {
       log: (message) => console.log(message),
     });
 
+    if (imageStore !== undefined) {
+      const provisionedImageStore = imageStore;
+      imageRuntime = startImageRuntime({
+        store: provisionedImageStore,
+        clients: createImageServiceClients({
+          implementationUrl: imageConfig.implementationUrl,
+          imageServiceUrl: imageConfig.imageServiceUrl,
+          userId: imageConfig.userId,
+          timeoutMs: imageConfig.timeoutMs,
+        }),
+        patternIds: imageConfig.patternIds,
+        maxAttempts: imageConfig.maxAttempts,
+        pollMs: imageConfig.pollMs,
+        publishImageMessage: (job) =>
+          store.publishScheduledAssistantMessage({
+            prepare: async () => ({
+              content: IMAGE_MESSAGE_MARKER,
+              validUntil: null,
+              cancel: async () => {},
+              recordPublication: (client, messageId) =>
+                provisionedImageStore.linkMessage(client, job.id, messageId),
+            }),
+          }),
+        log: (message) => console.log(message),
+      });
+      console.log(
+        `[IMAGE] image generation enabled (implementation=${imageConfig.implementationUrl}, image=${imageConfig.imageServiceUrl}, patterns=${String(imageConfig.patternIds.length)})`,
+      );
+    }
+
     // Const alias so the recall closure can rely on the provisioned
     // configuration's narrowing (a captured `let` would not stay narrowed).
     const provisionedMemoryConfiguration = memoryConfiguration;
@@ -630,6 +686,9 @@ async function main(): Promise<void> {
       // (embedding without the article domain), never because memory is off.
       articleMemories: (input: { limit?: number }) =>
         getRecentArticleMemories(pool, input),
+      ...(imageStore !== undefined
+        ? { image: (id: string) => imageStore.getImage(id) }
+        : {}),
       ready: async () => {
         try {
           await pool.query("SELECT 1");
@@ -824,7 +883,34 @@ async function main(): Promise<void> {
         pollSeconds: config.pollSeconds,
         ownerLabel: "companion-worker",
         log: (message) => console.log(message),
-        onTurnPublished: (turnId) => memoryRuntime?.onTurnPublished(turnId),
+        onTurnPublished: (turnId) => {
+          memoryRuntime?.onTurnPublished(turnId);
+          if (imageStore !== undefined) {
+            const provisionedImageStore = imageStore;
+            void (async () => {
+              const input = await store.getPublishedTurnImageInput(turnId);
+              if (input === null) return;
+              const local = DateTime.fromISO(input.replyCreatedAt, {
+                zone: temporalSettings.timezone ?? "UTC",
+              });
+              const localDateTime = local.isValid
+                ? local.toFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZZ")
+                : input.replyCreatedAt;
+              await provisionedImageStore.enqueueTurn({
+                turnId,
+                patternId: input.selectedPatternId,
+                userText: input.userText,
+                companionResponse: input.reply,
+                localDateTime,
+              });
+              imageRuntime?.notify();
+            })().catch(() => {
+              console.log(
+                `[IMAGE] enqueue failed for turn ${turnId}; no image job was recorded`,
+              );
+            });
+          }
+        },
       },
       { signal: shutdown.signal },
     );
@@ -859,6 +945,13 @@ async function main(): Promise<void> {
       await routineRuntime.close().catch((error: unknown) => {
         console.error(
           `routine runtime shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      });
+    }
+    if (imageRuntime !== undefined) {
+      await imageRuntime.close().catch((error: unknown) => {
+        console.error(
+          `image runtime shutdown failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       });
     }
