@@ -18,12 +18,21 @@
 
 import { isValidInstant, isValidTimezone } from "../time.ts";
 
+export interface WorkerMessageImage {
+  readonly id: string;
+  readonly mimeType: string;
+  readonly width: number;
+  readonly height: number;
+  readonly alt: string;
+}
+
 export interface WorkerMessage {
   readonly id: string;
   readonly seq: number;
   readonly role: "user" | "assistant";
   readonly content: string;
   readonly createdAt: string;
+  readonly images?: readonly WorkerMessageImage[];
 }
 
 export interface ThreadSnapshot {
@@ -74,6 +83,13 @@ export interface WorkerClient {
     before?: number,
     after?: number,
   ) => Promise<GetThreadResult>;
+  /** Rendered image bytes by asset id; null when unknown or unavailable. */
+  readonly getImage: (
+    id: string,
+  ) => Promise<
+    | { readonly ok: true; readonly mimeType: string; readonly data: ArrayBuffer }
+    | { readonly ok: false; readonly kind: "not_found" | "unavailable" }
+  >;
 }
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -89,6 +105,14 @@ export interface WorkerClientDeps {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
+
+const WORKER_IMAGE_ID_PATTERN =
+  /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+const WORKER_IMAGE_MIME_TYPES = new Set([
+  "image/webp",
+  "image/png",
+  "image/jpeg",
+]);
 
 function parseWorkerMessage(value: unknown): WorkerMessage | null {
   if (!isRecord(value)) {
@@ -108,7 +132,39 @@ function parseWorkerMessage(value: unknown): WorkerMessage | null {
   ) {
     return null;
   }
-  return { id, seq, role, content, createdAt };
+  let images: WorkerMessageImage[] | undefined;
+  if (value.images !== undefined) {
+    if (!Array.isArray(value.images)) return null;
+    images = [];
+    for (const entry of value.images) {
+      if (!isRecord(entry)) return null;
+      const { id: imageId, mimeType, width, height, alt } = entry;
+      if (
+        typeof imageId !== "string" ||
+        !WORKER_IMAGE_ID_PATTERN.test(imageId) ||
+        typeof mimeType !== "string" ||
+        !WORKER_IMAGE_MIME_TYPES.has(mimeType) ||
+        typeof width !== "number" ||
+        !Number.isInteger(width) ||
+        width < 1 ||
+        typeof height !== "number" ||
+        !Number.isInteger(height) ||
+        height < 1 ||
+        typeof alt !== "string"
+      ) {
+        return null;
+      }
+      images.push({ id: imageId, mimeType, width, height, alt });
+    }
+  }
+  return {
+    id,
+    seq,
+    role,
+    content,
+    createdAt,
+    ...(images !== undefined && images.length > 0 ? { images } : {}),
+  };
 }
 
 function parseThreadSnapshot(value: unknown): ThreadSnapshot | null {
@@ -272,6 +328,29 @@ export function createWorkerClient(deps: WorkerClientDeps): WorkerClient {
         return { ok: false, kind: "unavailable" };
       }
       return { ok: true, snapshot };
+    },
+
+    getImage: async (id) => {
+      if (!WORKER_IMAGE_ID_PATTERN.test(id)) {
+        return { ok: false, kind: "not_found" };
+      }
+      const response = await request(`/v1/images/${encodeURIComponent(id)}`, {
+        method: "GET",
+      });
+      if (response === null) return { ok: false, kind: "unavailable" };
+      if (response.status === 404) return { ok: false, kind: "not_found" };
+      if (!response.ok) return { ok: false, kind: "unavailable" };
+      const mimeType = response.headers.get("content-type") ?? "";
+      if (!WORKER_IMAGE_MIME_TYPES.has(mimeType)) {
+        return { ok: false, kind: "unavailable" };
+      }
+      try {
+        const data = await response.arrayBuffer();
+        if (data.byteLength === 0) return { ok: false, kind: "unavailable" };
+        return { ok: true, mimeType, data };
+      } catch {
+        return { ok: false, kind: "unavailable" };
+      }
     },
   };
 }

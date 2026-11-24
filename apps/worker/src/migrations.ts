@@ -9,6 +9,7 @@ import { relationshipMigrations } from "./relationship/migrations.ts";
 import { routineMigrations } from "./routine/migrations.ts";
 import { temporalMigrations } from "./temporal/migrations.ts";
 import { promptModuleMigrations } from "./prompt-modules/migrations.ts";
+import { imageMigrations } from "./image/migrations.ts";
 
 /**
  * Decouples wall-clock `time` from recent `temporal` memory summaries in the
@@ -43,6 +44,7 @@ export const workerMigrations = [
   ...temporalMigrations,
   ...promptModuleMigrations,
   TIME_CHAT_CHUNK_MIGRATION,
+  ...imageMigrations,
 ] as const;
 
 /** Apply the complete worker schema without starting runtime services. */

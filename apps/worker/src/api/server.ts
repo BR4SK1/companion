@@ -112,6 +112,14 @@ export interface ApiServerDeps {
   readonly articleMemories?: (input: {
     readonly limit?: number;
   }) => Promise<ArticleMemoriesResponse>;
+  /**
+   * Rendered image bytes by asset id (image domain). Absent when image
+   * generation is not provisioned: the route then reports unavailable
+   * rather than serving an empty imitation.
+   */
+  readonly image?: (
+    id: string,
+  ) => Promise<{ readonly mimeType: string; readonly data: Buffer } | null>;
 }
 
 export interface ApiServer {
@@ -392,13 +400,17 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
       return;
     }
 
+    const imageMatch = /^\/v1\/images\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i.exec(
+      url.pathname,
+    );
     if (
       url.pathname !== "/v1/messages" &&
       url.pathname !== "/v1/thread" &&
       url.pathname !== "/v1/thread/retry" &&
       url.pathname !== "/v1/memory/recall" &&
       url.pathname !== "/v1/articles/memories" &&
-      url.pathname !== "/v1/engagement"
+      url.pathname !== "/v1/engagement" &&
+      imageMatch === null
     ) {
       writeGenericError(response, 404, "not_found");
       request.resume();
@@ -520,6 +532,30 @@ export function createApiServer(deps: ApiServerDeps): ApiServer {
           hasMore: page.hasMore,
         },
       });
+      return;
+    }
+
+    if (imageMatch !== null) {
+      if (request.method !== "GET") {
+        writeJson(response, 405, { error: "method_not_allowed" }, { allow: "GET" });
+        request.resume();
+        return;
+      }
+      if (deps.image === undefined) {
+        writeGenericError(response, 503, "unavailable");
+        return;
+      }
+      const image = await deps.image(imageMatch[1]!);
+      if (image === null) {
+        writeGenericError(response, 404, "not_found");
+        return;
+      }
+      response.writeHead(200, {
+        "content-type": image.mimeType,
+        "content-length": String(image.data.byteLength),
+        "cache-control": "private, max-age=31536000, immutable",
+      });
+      response.end(image.data);
       return;
     }
 

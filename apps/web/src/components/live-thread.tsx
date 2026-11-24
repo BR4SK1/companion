@@ -36,6 +36,9 @@ function toUiMessage(message: ThreadMessage): Message {
     role: message.role,
     text: message.text,
     sentAt: message.sentAt,
+    ...(message.images !== undefined && message.images.length > 0
+      ? { images: message.images }
+      : {}),
   };
 }
 

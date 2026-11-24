@@ -198,6 +198,92 @@ describe("BFF message contract: send acceptance through the client shape", () =>
     assert.notEqual(message.id, "");
   });
 
+  it("carries rendered images through the contract and drops the image marker text", async () => {
+    const imageId = "0b9e6c1e-0000-4000-8000-0000000000aa";
+    const body = workerSnapshotBody([
+      workerMessage({
+        role: "assistant",
+        content: "*sends a picture*",
+        images: [
+          {
+            id: imageId,
+            mimeType: "image/webp",
+            width: 768,
+            height: 1344,
+            alt: "Photo of the companion",
+          },
+        ],
+      }),
+    ]);
+    const client = clientResponding(200, body);
+    const result = await client.getThread(100);
+    assert.equal(result.ok, true);
+    if (!result.ok) return;
+
+    const message = toClientMessage(result.snapshot.messages[0]);
+    assert.equal(message.text, "");
+    assert.deepEqual(message.images, [
+      {
+        src: `/api/images/${imageId}`,
+        alt: "Photo of the companion",
+        width: 768,
+        height: 1344,
+      },
+    ]);
+
+    const parsed = parseThreadSnapshotResponse({
+      timezone: "America/New_York",
+      messages: [message],
+      status: { queued: 0, generating: false, highestAllocatedSeq: 1, hasRecentFailure: false },
+      page: { oldestSeq: 1, hasMore: false },
+    });
+    assert.notEqual(parsed, null);
+    assert.deepEqual(parsed.messages[0].images, message.images);
+  });
+
+  it("rejects a worker snapshot carrying a malformed image ref", async () => {
+    const body = workerSnapshotBody([
+      workerMessage({
+        role: "assistant",
+        content: "*sends a picture*",
+        images: [{ id: "not-a-uuid", mimeType: "image/webp", width: 1, height: 1, alt: "x" }],
+      }),
+    ]);
+    const result = await clientResponding(200, body).getThread(100);
+    assert.deepEqual(result, { ok: false, kind: "unavailable" });
+  });
+
+  it("fetches image bytes and distinguishes not-found from unavailable", async () => {
+    const imageId = "0b9e6c1e-0000-4000-8000-0000000000aa";
+    const bytes = new Uint8Array([1, 2, 3]);
+    const client = createWorkerClient({
+      baseUrl: BASE,
+      token: TOKEN,
+      timeoutMs: 1_000,
+      fetchImpl: async (url, init) => {
+        assert.match(url, new RegExp(`/v1/images/${imageId}$`));
+        assert.equal(init.headers.authorization, `Bearer ${TOKEN}`);
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: (name) => (name === "content-type" ? "image/webp" : null) },
+          arrayBuffer: async () => bytes.buffer,
+        };
+      },
+    });
+    const found = await client.getImage(imageId);
+    assert.equal(found.ok, true);
+    if (found.ok) assert.equal(found.mimeType, "image/webp");
+
+    const missing = createWorkerClient({
+      baseUrl: BASE,
+      token: TOKEN,
+      timeoutMs: 1_000,
+      fetchImpl: async () => ({ ok: false, status: 404, headers: { get: () => null } }),
+    });
+    assert.deepEqual(await missing.getImage(imageId), { ok: false, kind: "not_found" });
+  });
+
   it("reducing a worker message preserves values exactly (no coercion)", () => {
     const original = workerMessage({
       content: "emoji 🎉 <html> & quotes \"'",

@@ -64,9 +64,20 @@ export class IdentityConfigurationError extends Error {
   }
 }
 
+/** One rendered image attached to a thread message (image domain read model). */
+export interface ConversationMessageImage {
+  readonly id: string;
+  readonly mimeType: string;
+  readonly width: number;
+  readonly height: number;
+  readonly alt: string;
+}
+
 /** One message of the single continuous visible thread, in `seq` order. */
 export interface ConversationMessage {
   readonly id: string;
+  /** Images attached to this message, when an image loader is wired. */
+  readonly images?: readonly ConversationMessageImage[];
   /** Thread position; strictly increasing in insertion order. */
   readonly seq: number;
   readonly role: MessageRole;
