@@ -1,3 +1,4 @@
+import type { OfflineShot } from "./offline-plan.ts";
 /**
  * HTTP clients for the two module services the image domain consumes:
  * the implementation service's post-reply reconciliation and the image
@@ -51,12 +52,16 @@ export interface ImageServiceClients {
     readonly localDateTime: string;
     readonly snapshot: ReconciledSnapshot;
     readonly priorPose: PriorPose | null;
-  }) => Promise<{
-    readonly promptId: string;
-    readonly plan: ImagePlanSummary;
-    readonly sceneDescription: string | null;
-    readonly images: readonly RenderedImage[];
-  }>;
+    readonly outfitOnly?: boolean;
+  }) => Promise<ImageRenderResult>;
+  readonly renderOfflineShot: (eventId: string, shot: OfflineShot) => Promise<ImageRenderResult>;
+}
+
+export interface ImageRenderResult {
+  readonly promptId: string;
+  readonly plan: ImagePlanSummary;
+  readonly sceneDescription: string | null;
+  readonly images: readonly RenderedImage[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -230,6 +235,81 @@ export function createImageServiceClients(deps: {
 }): ImageServiceClients {
   const fetchImpl: FetchLike = deps.fetchImpl ?? fetch;
 
+  const renderRequest = async (request: object): Promise<ImageRenderResult> => {
+    const raw = await postJson(
+      fetchImpl,
+      `${deps.imageServiceUrl}/v1/render`,
+      { ...request, userId: deps.userId },
+      deps.timeoutMs,
+      {
+        http: "render_http_error",
+        unavailable: "render_unavailable",
+        invalid: "render_invalid_response",
+      },
+    );
+    if (!isRecord(raw) || raw.success !== true || !isRecord(raw.plan)) {
+      throw new ImageClientError("render_invalid_response");
+    }
+    const promptId = stringOrNull(raw.promptId);
+    if (promptId === null || !Array.isArray(raw.images) || raw.images.length === 0) {
+      throw new ImageClientError("render_invalid_response");
+    }
+    const planRaw = raw.plan;
+    const plan: ImagePlanSummary = {
+      location: stringOrNull(planRaw.location),
+      timePeriod: stringOrNull(planRaw.timePeriod),
+      poseCategory: stringOrNull(planRaw.poseCategory),
+      poseVariantId: stringOrNull(planRaw.poseVariantId),
+      expression: stringOrNull(planRaw.expressionKey),
+      handGesture: stringOrNull(planRaw.handGesture),
+      cameraAngle: stringOrNull(planRaw.cameraAngle),
+      intimacy: stringOrNull(planRaw.intimacy),
+      clothingSummary: stringOrNull(planRaw.clothingSummary),
+    };
+    const rawSceneDescription =
+      stringOrNull(raw.sceneDescription) ??
+      stringOrNull(planRaw.sceneDescription);
+    const sceneDescription =
+      rawSceneDescription !== null && rawSceneDescription.trim().length > 0
+        ? rawSceneDescription.trim()
+        : null;
+
+    const images: RenderedImage[] = [];
+    for (const entry of raw.images) {
+      if (
+        !isRecord(entry) ||
+        typeof entry.filename !== "string" ||
+        typeof entry.mimeType !== "string" ||
+        !ALLOWED_MIME_TYPES.has(entry.mimeType) ||
+        typeof entry.dataBase64 !== "string"
+      ) {
+        throw new ImageClientError("render_invalid_response");
+      }
+      const data = Buffer.from(entry.dataBase64, "base64");
+      if (data.byteLength === 0 || data.byteLength > MAX_IMAGE_BYTES) {
+        throw new ImageClientError("render_invalid_response");
+      }
+      if (
+        typeof entry.sizeBytes === "number" &&
+        entry.sizeBytes !== data.byteLength
+      ) {
+        throw new ImageClientError("render_invalid_response");
+      }
+      const dimensions = parseImageDimensions(entry.mimeType, data);
+      if (dimensions === null) {
+        throw new ImageClientError("render_invalid_response");
+      }
+      images.push({
+        filename: entry.filename,
+        mimeType: entry.mimeType,
+        width: dimensions.width,
+        height: dimensions.height,
+        data,
+      });
+    }
+    return { promptId, plan, sceneDescription, images };
+  };
+
   return {
     reconcile: async (input) => {
       const raw = await postJson(
@@ -257,89 +337,43 @@ export function createImageServiceClients(deps: {
       return snapshot;
     },
 
-    render: async (input) => {
-      const raw = await postJson(
-        fetchImpl,
-        `${deps.imageServiceUrl}/v1/render`,
-        {
+    render: (input) => {
+      const { schedule, clothing, roleplay } = input.snapshot;
+      if (input.outfitOnly) {
+        const isBedroom = schedule.location === "bedroom";
+        return renderRequest({
           turnId: input.turnId,
-          userId: deps.userId,
           localDateTime: input.localDateTime,
-          userMessage: input.userText,
-          companionResponse: input.companionResponse,
-          schedule: input.snapshot.schedule,
-          clothing: input.snapshot.clothing,
-          roleplay: input.snapshot.roleplay,
-          ...(input.priorPose !== null ? { priorPose: input.priorPose } : {}),
-        },
-        deps.timeoutMs,
-        {
-          http: "render_http_error",
-          unavailable: "render_unavailable",
-          invalid: "render_invalid_response",
-        },
-      );
-      if (!isRecord(raw) || raw.success !== true || !isRecord(raw.plan)) {
-        throw new ImageClientError("render_invalid_response");
-      }
-      const promptId = stringOrNull(raw.promptId);
-      if (promptId === null || !Array.isArray(raw.images) || raw.images.length === 0) {
-        throw new ImageClientError("render_invalid_response");
-      }
-      const planRaw = raw.plan;
-      const plan: ImagePlanSummary = {
-        location: stringOrNull(planRaw.location),
-        timePeriod: stringOrNull(planRaw.timePeriod),
-        poseCategory: stringOrNull(planRaw.poseCategory),
-        poseVariantId: stringOrNull(planRaw.poseVariantId),
-        expression: stringOrNull(planRaw.expressionKey),
-        handGesture: stringOrNull(planRaw.handGesture),
-        cameraAngle: stringOrNull(planRaw.cameraAngle),
-        intimacy: stringOrNull(planRaw.intimacy),
-        clothingSummary: stringOrNull(planRaw.clothingSummary),
-      };
-      const rawSceneDescription =
-        stringOrNull(raw.sceneDescription) ??
-        stringOrNull(planRaw.sceneDescription);
-      const sceneDescription =
-        rawSceneDescription !== null && rawSceneDescription.trim().length > 0
-          ? rawSceneDescription.trim()
-          : null;
-
-      const images: RenderedImage[] = [];
-      for (const entry of raw.images) {
-        if (
-          !isRecord(entry) ||
-          typeof entry.filename !== "string" ||
-          typeof entry.mimeType !== "string" ||
-          !ALLOWED_MIME_TYPES.has(entry.mimeType) ||
-          typeof entry.dataBase64 !== "string"
-        ) {
-          throw new ImageClientError("render_invalid_response");
-        }
-        const data = Buffer.from(entry.dataBase64, "base64");
-        if (data.byteLength === 0 || data.byteLength > MAX_IMAGE_BYTES) {
-          throw new ImageClientError("render_invalid_response");
-        }
-        if (
-          typeof entry.sizeBytes === "number" &&
-          entry.sizeBytes !== data.byteLength
-        ) {
-          throw new ImageClientError("render_invalid_response");
-        }
-        const dimensions = parseImageDimensions(entry.mimeType, data);
-        if (dimensions === null) {
-          throw new ImageClientError("render_invalid_response");
-        }
-        images.push({
-          filename: entry.filename,
-          mimeType: entry.mimeType,
-          width: dimensions.width,
-          height: dimensions.height,
-          data,
+          schedule,
+          clothing,
+          hints: {
+            poseVariantId: isBedroom ? "bed_standing_neutral" : "couch_standing_neutral",
+            poseCategory: "standing",
+            expression: "relaxed",
+            handGesture: "none",
+            cameraAngle: "straight_on",
+            includeSelfieFraming: false,
+          },
         });
       }
-      return { promptId, plan, sceneDescription, images };
+      return renderRequest({
+        turnId: input.turnId,
+        localDateTime: input.localDateTime,
+        userMessage: input.userText,
+        companionResponse: input.companionResponse,
+        schedule,
+        clothing,
+        roleplay,
+        ...(input.priorPose !== null ? { priorPose: input.priorPose } : {}),
+      });
     },
+    renderOfflineShot: (eventId, shot) => renderRequest({
+      turnId: `${eventId}:${String(shot.position)}`,
+      localDateTime: shot.localDateTime,
+      schedule: shot.schedule,
+      clothing: shot.clothing,
+      hints: shot.hints,
+      seed: shot.seed,
+    }),
   };
 }

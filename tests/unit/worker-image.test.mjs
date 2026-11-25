@@ -7,6 +7,8 @@ import {
   DEFAULT_IMAGE_PATTERN_IDS,
 } from "../../apps/worker/src/image/config.ts";
 import { isPhotoWorthy } from "../../apps/worker/src/image/gate.ts";
+import { isFullyDressed, photoAccessForTier } from "../../apps/worker/src/image/photo-access.ts";
+import { createOfflinePhotoRuntime } from "../../apps/worker/src/image/offline-runtime.ts";
 import { parseImageDimensions } from "../../apps/worker/src/image/webp.ts";
 import {
   createImageServiceClients,
@@ -63,6 +65,52 @@ describe("image configuration", () => {
       WORKER_IMAGE_PATTERN_IDS: "a, b",
     });
     assert.deepEqual(overridden.patternIds, ["a", "b"]);
+  });
+});
+
+describe("image familiarity and return", () => {
+  it("maps base tiers by configured key, defaults to no photos, and requires a higher sequence tier", () => {
+    const tiers = ["new", "acquaintance", "comfortable", "relationship"].map((key, position) => ({ key, position }));
+    const access = (tier, outfit = "comfortable", sequence = "relationship") =>
+      photoAccessForTier(tiers[tier], tiers, outfit, sequence);
+    assert.equal(access(0), 0);
+    assert.equal(access(1), 0);
+    assert.equal(access(2), 1);
+    assert.equal(access(3), 3);
+    assert.equal(access(3, null), 0);
+    assert.equal(access(3, "new"), 0);
+    assert.equal(access(3, "comfortable", "acquaintance"), 1);
+  });
+
+  it("allows fully dressed outfit snapshots with both visible layers", () => {
+    const top = { slot: "top", state: "on" };
+    const bottom = { slot: "bottom", state: "on" };
+    assert.equal(isFullyDressed({ occasion: "daytime", items: [top, bottom] }), true);
+    assert.equal(isFullyDressed({ occasion: "daytime", items: [top] }), false);
+    assert.equal(isFullyDressed({ occasion: "daytime", items: [{ ...top, state: "open" }, bottom] }), false);
+    assert.equal(isFullyDressed({ occasion: "swimsuit", items: [top, bottom] }), false);
+  });
+
+  it("attempts ready-album delivery directly when the routine reports return", async () => {
+    const calls = [];
+    const id = "morning-change:2026-11-25";
+    const runtime = createOfflinePhotoRuntime({
+      store: {
+        markReturned: async (event) => calls.push(event.id),
+        expireAlbums: async () => {},
+        nextAlbum: async () => id,
+      },
+      publishAlbum: async (eventId) => calls.push(eventId),
+    });
+    assert.equal(await runtime.observeTick({ offlinePhotoEvent: {
+      id,
+      startedAt: "2026-11-25T15:00:00.000Z",
+      returnAt: "2026-11-25T15:05:00.000Z",
+      completedAt: "2026-11-25T15:05:00.000Z",
+      publishBy: "2026-11-25T15:10:00.000Z",
+      shots: [],
+    }}), true);
+    assert.deepEqual(calls, [id, id]);
   });
 });
 
@@ -227,7 +275,7 @@ describe("image service clients", () => {
 
 describe("image migrations", () => {
   it("creates typed relational job and asset tables without a JSONB payload", () => {
-    assert.equal(imageMigrations.length, 2);
+    assert.equal(imageMigrations.length, 3);
     assert.equal(imageMigrations[0].id, "0032_image_generation");
     assert.match(imageMigrations[0].sql, /CREATE TABLE image_job/);
     assert.match(imageMigrations[0].sql, /CREATE TABLE image_asset/);

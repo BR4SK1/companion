@@ -24,6 +24,7 @@ import process from "node:process";
 import {
   closePostgresPool,
   createPostgresPool,
+  type PostgresPoolClient,
 } from "@companion/postgres";
 import { postJson } from "@companion/openrouter/transport";
 
@@ -89,6 +90,9 @@ import { executePromptModule } from "./prompt-modules/executor.ts";
 import { loadImageConfig } from "./image/config.ts";
 import { renderRecentImagesContext } from "./image/context.ts";
 import { createImageStore } from "./image/store.ts";
+import { createOfflineImageStore } from "./image/offline-store.ts";
+import { createOfflinePhotoRuntime } from "./image/offline-runtime.ts";
+import { photoAccessForTier, type PhotoAccess } from "./image/photo-access.ts";
 import { createImageServiceClients } from "./image/client.ts";
 import { startImageRuntime } from "./image/runtime.ts";
 import { IMAGE_MESSAGE_MARKER } from "./image/types.ts";
@@ -181,8 +185,9 @@ async function main(): Promise<void> {
     // invalid configuration disables only this optional context/learning
     // feature; no type, tier, day boundary, or question content is invented.
     let relationshipStore: ReturnType<typeof createRelationshipStore> | undefined;
+    let relationshipConfiguration: Awaited<ReturnType<typeof loadRelationshipConfiguration>> = null;
     try {
-      const relationshipConfiguration = await loadRelationshipConfiguration(
+      relationshipConfiguration = await loadRelationshipConfiguration(
         pool,
         temporalSettings.timezone,
       );
@@ -325,6 +330,9 @@ async function main(): Promise<void> {
                 };
               },
             }),
+          observeResponse: async (response, scope) => {
+            if (scope === imageConfig.userId) await imageRuntime?.observeRoutineTick(response);
+          },
           log: (message) => console.log(message),
         });
         if (outcome.status === "failed") {
@@ -596,27 +604,74 @@ async function main(): Promise<void> {
     });
 
     if (imageStore !== undefined) {
-      const provisionedImageStore = imageStore;
+      const images = imageStore;
+      const related = relationshipStore;
+      const tiers = relationshipConfiguration?.tiers ?? [];
+      const loadPhotoAccess = async (client?: PostgresPoolClient): Promise<PhotoAccess> => {
+        if (related === undefined || imageConfig.outfitTierKey === null) return 0;
+        const baseTier = await related.getBaseTier(client).catch(() => null);
+        return baseTier === null
+          ? 0
+          : photoAccessForTier(baseTier, tiers, imageConfig.outfitTierKey, imageConfig.sequenceTierKey);
+      };
+
+      const clients = createImageServiceClients({
+        implementationUrl: imageConfig.implementationUrl,
+        imageServiceUrl: imageConfig.imageServiceUrl,
+        userId: imageConfig.userId,
+        timeoutMs: imageConfig.timeoutMs,
+      });
+      const offlineImages = createOfflineImageStore(pool, images);
+      const offline = createOfflinePhotoRuntime({
+        store: offlineImages,
+        images,
+        clients,
+        timeoutMs: imageConfig.timeoutMs,
+        maxAttempts: imageConfig.maxAttempts,
+        loadAccess: loadPhotoAccess,
+        publishAlbum: (eventId) =>
+          store.publishScheduledAssistantMessage({
+            skipIfUserMessagesQueued: true,
+            prepare: async (client) => {
+              const album = await offlineImages.prepareAlbum(client, eventId, await loadPhotoAccess(client));
+              if (album === null) return null;
+              return {
+                content: IMAGE_MESSAGE_MARKER,
+                validUntil: album.publishBy,
+                cancel: (transaction) => offlineImages.cancelAlbum(transaction, eventId),
+                recordPublication: (transaction, messageId) =>
+                  offlineImages.publishAlbum(transaction, album, messageId),
+              };
+            },
+          }),
+        log: (message) => console.log(message),
+      });
+
       imageRuntime = startImageRuntime({
-        store: provisionedImageStore,
-        clients: createImageServiceClients({
-          implementationUrl: imageConfig.implementationUrl,
-          imageServiceUrl: imageConfig.imageServiceUrl,
-          userId: imageConfig.userId,
-          timeoutMs: imageConfig.timeoutMs,
-        }),
+        store: images,
+        clients,
         patternIds: imageConfig.patternIds,
         maxAttempts: imageConfig.maxAttempts,
         pollMs: imageConfig.pollMs,
+        loadPhotoAccess,
+        offline,
         publishImageMessage: (job) =>
           store.publishScheduledAssistantMessage({
-            prepare: async () => ({
-              content: IMAGE_MESSAGE_MARKER,
-              validUntil: null,
-              cancel: async () => {},
-              recordPublication: (client, messageId) =>
-                provisionedImageStore.linkMessage(client, job.id, messageId),
-            }),
+            prepare: async (client) => {
+              if (!(await images.isRendered(client, job.id))) return null;
+              // Rendered jobs from before the gate were unrestricted.
+              if (await loadPhotoAccess(client) < (job.photoAccess ?? 3)) {
+                await images.discardRendered(client, job.id);
+                return null;
+              }
+              return {
+                content: IMAGE_MESSAGE_MARKER,
+                validUntil: null,
+                cancel: async () => {},
+                recordPublication: (transaction, messageId) =>
+                  images.linkMessage(transaction, job.id, messageId),
+              };
+            },
           }),
         log: (message) => console.log(message),
       });

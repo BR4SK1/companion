@@ -22,6 +22,7 @@ interface JobRow {
   id: string;
   turn_id: string;
   status: string;
+  photo_access: ImageJob["photoAccess"];
   attempts: number;
   pattern_id: string | null;
   user_text: string;
@@ -44,7 +45,7 @@ interface JobRow {
 }
 
 const JOB_COLUMNS =
-  "id, turn_id, status, attempts, pattern_id, user_text, companion_response, " +
+  "id, turn_id, status, attempts, photo_access, pattern_id, user_text, companion_response, " +
   "local_date_time, prompt_id, plan_location, plan_time_period, " +
   "plan_pose_category, plan_pose_variant_id, plan_expression, " +
   "plan_hand_gesture, plan_camera_angle, plan_intimacy, " +
@@ -56,6 +57,7 @@ function mapJob(row: JobRow): ImageJob {
     turnId: row.turn_id,
     status: row.status as ImageJob["status"],
     attempts: row.attempts,
+    photoAccess: row.photo_access,
     patternId: row.pattern_id,
     userText: row.user_text,
     companionResponse: row.companion_response,
@@ -98,6 +100,8 @@ export interface ImageStore {
       readonly plan: ImagePlanSummary;
       readonly sceneDescription?: string | null;
       readonly images: readonly RenderedImage[];
+      readonly photoAccess?: Exclude<ImageJob["photoAccess"], null>;
+      readonly offlineLease?: { readonly eventId: string; readonly token: string };
     },
   ) => Promise<void>;
   readonly failJob: (input: {
@@ -114,6 +118,8 @@ export interface ImageStore {
     messageId: string,
   ) => Promise<void>;
   /** Release a rendered job whose publication was refused (e.g. a turn is in flight). */
+  readonly isRendered: (client: PostgresPoolClient, jobId: string) => Promise<boolean>;
+  readonly discardRendered: (client: PostgresPoolClient, jobId: string) => Promise<void>;
   readonly releaseRendered: (jobId: string) => Promise<void>;
   readonly loadPriorPose: () => Promise<PriorPose | null>;
   readonly getImage: (
@@ -158,7 +164,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
       const result = await pool.query(
         `UPDATE image_job
          SET status = 'pending', next_attempt_at = now(), updated_at = now()
-         WHERE status = 'running'`,
+         WHERE status = 'running' AND turn_id IS NOT NULL`,
       );
       return result.rowCount ?? 0;
     },
@@ -167,7 +173,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
       withTransaction(pool, async (client) => {
         const result = await client.query<JobRow>(
           `SELECT ${JOB_COLUMNS} FROM image_job
-           WHERE status = 'pending' AND next_attempt_at <= now()
+           WHERE turn_id IS NOT NULL AND status = 'pending' AND next_attempt_at <= now()
            ORDER BY created_at ASC
            LIMIT 1
            FOR UPDATE SKIP LOCKED`,
@@ -196,6 +202,49 @@ export function createImageStore(pool: PostgresPool): ImageStore {
 
     saveRendered: async (jobId, input) => {
       await withTransaction(pool, async (client) => {
+        if (input.offlineLease !== undefined) {
+          const active = await client.query(
+            `SELECT id FROM image_offline_event
+             WHERE id = $1 AND closed_at IS NULL AND publish_by > clock_timestamp()
+             FOR UPDATE`,
+            [input.offlineLease.eventId],
+          );
+          if (active.rows.length === 0) return;
+        }
+        const updated = await client.query(
+          `UPDATE image_job
+           SET status = 'rendered', prompt_id = $2,
+               plan_location = $3, plan_time_period = $4,
+               plan_pose_category = $5, plan_pose_variant_id = $6,
+               plan_expression = $7, plan_hand_gesture = $8,
+               plan_camera_angle = $9, plan_intimacy = $10,
+               plan_clothing_summary = $11, scene_description = $12,
+               error_category = NULL, updated_at = now(),
+               photo_access = COALESCE($13, photo_access),
+               offline_lease_token = NULL, offline_lease_until = NULL
+           WHERE id = $1 AND status = 'running'
+             AND ((turn_id IS NOT NULL AND $14::uuid IS NULL)
+               OR (offline_event_id = $15 AND offline_lease_token = $14
+                 AND offline_lease_until > clock_timestamp()))`,
+          [
+            jobId,
+            input.promptId,
+            input.plan.location,
+            input.plan.timePeriod,
+            input.plan.poseCategory,
+            input.plan.poseVariantId,
+            input.plan.expression,
+            input.plan.handGesture,
+            input.plan.cameraAngle,
+            input.plan.intimacy,
+            input.plan.clothingSummary,
+            input.sceneDescription ?? null,
+            input.photoAccess ?? null,
+            input.offlineLease?.token ?? null,
+            input.offlineLease?.eventId ?? null,
+          ],
+        );
+        if (updated.rowCount !== 1) return;
         for (const image of input.images) {
           await client.query(
             `INSERT INTO image_asset
@@ -212,31 +261,6 @@ export function createImageStore(pool: PostgresPool): ImageStore {
             ],
           );
         }
-        await client.query(
-          `UPDATE image_job
-           SET status = 'rendered', prompt_id = $2,
-               plan_location = $3, plan_time_period = $4,
-               plan_pose_category = $5, plan_pose_variant_id = $6,
-               plan_expression = $7, plan_hand_gesture = $8,
-               plan_camera_angle = $9, plan_intimacy = $10,
-               plan_clothing_summary = $11, scene_description = $12,
-               error_category = NULL, updated_at = now()
-           WHERE id = $1 AND status = 'running'`,
-          [
-            jobId,
-            input.promptId,
-            input.plan.location,
-            input.plan.timePeriod,
-            input.plan.poseCategory,
-            input.plan.poseVariantId,
-            input.plan.expression,
-            input.plan.handGesture,
-            input.plan.cameraAngle,
-            input.plan.intimacy,
-            input.plan.clothingSummary,
-            input.sceneDescription ?? null,
-          ],
-        );
       });
     },
 
@@ -256,7 +280,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
     nextRendered: async () => {
       const result = await pool.query<JobRow>(
         `SELECT ${JOB_COLUMNS} FROM image_job
-         WHERE status = 'rendered'
+         WHERE status = 'rendered' AND turn_id IS NOT NULL
          ORDER BY created_at ASC
          LIMIT 1`,
       );
@@ -277,6 +301,26 @@ export function createImageStore(pool: PostgresPool): ImageStore {
       );
     },
 
+    isRendered: async (client, jobId) => {
+      const result = await client.query(
+        `SELECT id FROM image_job WHERE id = $1 AND status = 'rendered' FOR UPDATE`,
+        [jobId],
+      );
+      return result.rows.length === 1;
+    },
+
+    discardRendered: async (client, jobId) => {
+      await client.query(
+        `DELETE FROM image_asset WHERE job_id = $1 AND message_id IS NULL`,
+        [jobId],
+      );
+      await client.query(
+        `UPDATE image_job SET status = 'skipped', skip_reason = 'familiarity', finished_at = now(), updated_at = now()
+         WHERE id = $1 AND status = 'rendered'`,
+        [jobId],
+      );
+    },
+
     releaseRendered: async (jobId) => {
       await pool.query(
         `UPDATE image_job SET updated_at = now()
@@ -289,7 +333,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
       const result = await pool.query<JobRow>(
         `SELECT ${JOB_COLUMNS} FROM image_job
          WHERE status = 'succeeded'
-         ORDER BY finished_at DESC NULLS LAST, created_at DESC
+         ORDER BY finished_at DESC NULLS LAST, created_at DESC, offline_position DESC NULLS LAST
          LIMIT 1`,
       );
       const row = result.rows[0];
@@ -316,7 +360,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
 
     getImage: async (id) => {
       const result = await pool.query<{ mime_type: string; data: Buffer }>(
-        `SELECT mime_type, data FROM image_asset WHERE id = $1`,
+        `SELECT mime_type, data FROM image_asset WHERE id = $1 AND message_id IS NOT NULL`,
         [id],
       );
       const row = result.rows[0];
@@ -342,7 +386,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
          FROM image_asset AS a
          JOIN image_job AS j ON j.id = a.job_id
          WHERE a.message_id = ANY($1)
-         ORDER BY a.created_at ASC`,
+         ORDER BY j.offline_position ASC NULLS LAST, a.created_at ASC, a.id ASC`,
         [messageIds],
       );
       for (const row of result.rows) {
@@ -370,7 +414,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
       if (input.limit < 1) return [];
       const result = await pool.query<{
         id: string;
-        turn_id: string;
+        turn_id: string | null;
         message_id: string;
         scene_description: string | null;
         plan_location: string | null;
@@ -419,7 +463,7 @@ export function createImageStore(pool: PostgresPool): ImageStore {
            AND bounds.since_order IS NOT NULL
            AND m.thread_order >= bounds.since_order
            AND m.thread_order < bounds.current_order
-         ORDER BY m.thread_order DESC, m.seq DESC
+         ORDER BY m.thread_order DESC, m.seq DESC, j.offline_position DESC NULLS LAST
          LIMIT $4`,
         [input.turnId, input.sinceMessageId, input.lastHistoryMessageId, input.limit],
       );

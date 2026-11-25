@@ -7,6 +7,8 @@
  */
 
 import { ImageClientError } from "./client.ts";
+import type { createOfflinePhotoRuntime } from "./offline-runtime.ts";
+import { isFullyDressed, type PhotoAccess } from "./photo-access.ts";
 import { isPhotoWorthy } from "./gate.ts";
 import { IMAGE_MESSAGE_MARKER, type ImageJob } from "./types.ts";
 import type { ImageServiceClients } from "./client.ts";
@@ -16,6 +18,7 @@ export interface ImageRuntime {
   readonly close: () => Promise<void>;
   /** Nudge the loop after a job is enqueued; the poll timer also covers it. */
   readonly notify: () => void;
+  readonly observeRoutineTick: (response: unknown) => Promise<void>;
 }
 
 const RENDER_BACKOFF_MS = 30_000;
@@ -26,6 +29,8 @@ export function startImageRuntime(input: {
   readonly patternIds: readonly string[];
   readonly maxAttempts: number;
   readonly pollMs: number;
+  readonly loadPhotoAccess: () => Promise<PhotoAccess>;
+  readonly offline?: ReturnType<typeof createOfflinePhotoRuntime>;
   /**
    * Publish one rendered job as a standalone assistant message through the
    * conversation domain's scheduled-message transaction. Resolves false
@@ -65,6 +70,10 @@ export function startImageRuntime(input: {
     }
 
     try {
+      if (await input.loadPhotoAccess() === 0) {
+        await input.store.markSkipped(job.id, "familiarity");
+        return;
+      }
       const snapshot = await input.clients.reconcile({
         turnId: job.turnId,
         userText: job.userText,
@@ -84,7 +93,12 @@ export function startImageRuntime(input: {
         return;
       }
 
-      const priorPose = await input.store.loadPriorPose();
+      const photoAccess = await input.loadPhotoAccess();
+      if (photoAccess === 0 || (photoAccess === 1 && !isFullyDressed(snapshot.clothing))) {
+        await input.store.markSkipped(job.id, "familiarity");
+        return;
+      }
+      const priorPose = photoAccess === 3 ? await input.store.loadPriorPose() : null;
       const rendered = await input.clients.render({
         turnId: job.turnId,
         userText: job.userText,
@@ -92,8 +106,9 @@ export function startImageRuntime(input: {
         localDateTime: job.localDateTime,
         snapshot,
         priorPose,
+        outfitOnly: photoAccess === 1,
       });
-      await input.store.saveRendered(job.id, rendered);
+      await input.store.saveRendered(job.id, { ...rendered, photoAccess });
       log(
         `[IMAGE] rendered turn ${job.turnId} prompt=${rendered.promptId} images=${String(rendered.images.length)}`,
       );
@@ -113,6 +128,17 @@ export function startImageRuntime(input: {
   };
 
   const pass = async (): Promise<void> => {
+    if (input.offline !== undefined) {
+      try {
+        await input.offline.publishReady();
+        if (await input.offline.renderNext()) {
+          await input.offline.publishReady();
+          return;
+        }
+      } catch {
+        log("[IMAGE] offline pass failed; the next pass will retry");
+      }
+    }
     await publishRendered();
     const job = await input.store.claimNextDue();
     if (job !== null) {
@@ -154,6 +180,9 @@ export function startImageRuntime(input: {
   return {
     notify: () => {
       void enqueue();
+    },
+    observeRoutineTick: async (response) => {
+      if (await input.offline?.observeTick(response)) void enqueue();
     },
     close: async () => {
       closed = true;

@@ -116,6 +116,7 @@ export interface ExternalRoutineTickDeps {
     message: RoutineExternalAssistantMessage,
     revision?: number,
   ) => Promise<boolean>;
+  readonly observeResponse?: (response: unknown, scope: string | null) => Promise<void>;
   readonly fetchImpl?: typeof fetch;
   readonly log?: (message: string) => void;
 }
@@ -184,6 +185,7 @@ export async function runExternalRoutineTick(
   }, provider.timeoutMs);
 
   let parsedResponse: RoutineExternalTickResponse | null = null;
+  let responseBody: unknown;
   try {
     const response = await (deps.fetchImpl ?? fetch)(endpoint, {
       method: "POST",
@@ -231,16 +233,15 @@ export async function runExternalRoutineTick(
       }
       chunks.push(Buffer.from(part.value));
     }
-    let json: unknown;
     try {
       const text = new TextDecoder("utf-8", { fatal: true }).decode(
         Buffer.concat(chunks, receivedBytes),
       );
-      json = JSON.parse(text);
+      responseBody = JSON.parse(text);
     } catch {
       return { status: "failed", reason: "invalid_json" };
     }
-    parsedResponse = parseTickResponse(json);
+    parsedResponse = parseTickResponse(responseBody);
     if (parsedResponse === null) {
       return { status: "failed", reason: "invalid_response_shape" };
     }
@@ -260,5 +261,8 @@ export async function runExternalRoutineTick(
       parsedResponse.availabilityRevision,
     );
   }
+  await deps.observeResponse?.(responseBody, scope).catch(() =>
+    deps.log?.("[ROUTINE] external tick extension could not be processed"),
+  );
   return { status: "ok", publishedMessage };
 }
