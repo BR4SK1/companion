@@ -12,6 +12,8 @@ import type {
   SelectedInitiativeQuestion,
 } from "./types.ts";
 import {
+  baseTierIndex,
+  familiarityForAnsweredSlots,
   selectInitiativeQuestions,
   selectUnansweredQuestionsForExtraction,
   summarizeRelationship,
@@ -194,6 +196,7 @@ export async function loadRelationshipConfiguration(
 }
 
 export interface RelationshipStore {
+  readonly getBaseTier: (client?: PostgresPoolClient) => Promise<RelationshipTier>;
   readonly getSummary: (now: Date) => Promise<RelationshipSummary>;
   readonly getInitiativeQuestions: (input: {
     readonly recentText: string;
@@ -291,6 +294,18 @@ export function createRelationshipStore(input: {
   readonly configuration: RelationshipConfiguration;
 }): RelationshipStore {
   const { pool, configuration } = input;
+
+  async function getBaseTier(client?: PostgresPoolClient): Promise<RelationshipTier> {
+    const { rows: [row] } = await (client ?? pool).query<{ answered: number }>(
+      `SELECT count(*)::integer AS answered
+       FROM relationship_answer a
+       JOIN relationship_question q ON q.id = a.question_id
+       WHERE q.enabled = true`,
+    );
+    if (row === undefined) throw new Error("Relationship familiarity is unavailable");
+    const familiarity = familiarityForAnsweredSlots(row.answered, configuration.questions.length);
+    return configuration.tiers[baseTierIndex(familiarity, configuration.tiers)]!;
+  }
 
   async function getSummary(now: Date): Promise<RelationshipSummary> {
     const [firstMessage, activityDays, answersResult] = await Promise.all([
@@ -444,5 +459,5 @@ export function createRelationshipStore(input: {
     }
   }
 
-  return { getSummary, getInitiativeQuestions, extractAnswers, recordAnswers };
+  return { getBaseTier, getSummary, getInitiativeQuestions, extractAnswers, recordAnswers };
 }

@@ -44,6 +44,8 @@ export interface ImageConfig {
    * advances the same schedule/clothing/roleplay state the chat turn read.
    */
   readonly userId: string;
+  readonly outfitTierKey: string | null;
+  readonly sequenceTierKey: string | null;
   readonly patternIds: readonly string[];
   readonly timeoutMs: number;
   readonly pollMs: number;
@@ -55,6 +57,8 @@ const DISABLED: ImageConfig = {
   implementationUrl: "",
   imageServiceUrl: "",
   userId: "",
+  outfitTierKey: null,
+  sequenceTierKey: null,
   patternIds: DEFAULT_IMAGE_PATTERN_IDS,
   timeoutMs: 180_000,
   pollMs: 5_000,
@@ -134,6 +138,8 @@ export function loadImageConfig(
     implementationUrl: implementationUrl!,
     imageServiceUrl: imageServiceUrl!,
     userId: userId!,
+    outfitTierKey: env.WORKER_IMAGE_OUTFIT_TIER_KEY?.trim() || null,
+    sequenceTierKey: env.WORKER_IMAGE_SEQUENCE_TIER_KEY?.trim() || null,
     patternIds,
     timeoutMs: optionalPositiveInt(env, "WORKER_IMAGE_TIMEOUT_MS", 180_000),
     pollMs: optionalPositiveInt(env, "WORKER_IMAGE_POLL_MS", 5_000),

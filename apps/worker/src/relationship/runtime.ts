@@ -9,6 +9,7 @@ import type {
   RelationshipParticipant,
   RelationshipQuestion,
   RelationshipSummary,
+  RelationshipTier,
   SelectedInitiativeQuestion,
 } from "./types.ts";
 
@@ -125,6 +126,21 @@ export function mainReplyMaxTokensForSummary(
   return mainReplyMaxTokensForBaseTierOrdinal(summary.baseTierOrdinal);
 }
 
+export function baseTierIndex(
+  familiarity: number,
+  tiers: readonly RelationshipTier[],
+): number {
+  let index = 0;
+  for (let i = 0; i < tiers.length; i++) {
+    if (tiers[i]!.minimumFamiliarity <= familiarity) index = i;
+  }
+  return index;
+}
+
+export function familiarityForAnsweredSlots(answeredSlots: number, questionCount: number): number {
+  return questionCount === 0 ? 0 : answeredSlots / (2 * questionCount);
+}
+
 export function selectRelationshipTiers(input: {
   readonly familiarity: number;
   readonly timeKnownDays: number;
@@ -136,10 +152,7 @@ export function selectRelationshipTiers(input: {
   "baseTier" | "baseTierOrdinal" | "effectiveTier" | "tierMovement"
 > {
   const tiers = input.configuration.tiers;
-  let baseIndex = 0;
-  for (let i = 0; i < tiers.length; i += 1) {
-    if (tiers[i]!.minimumFamiliarity <= input.familiarity) baseIndex = i;
-  }
+  const baseIndex = baseTierIndex(input.familiarity, tiers);
   const baseTier = tiers[baseIndex]!;
   let effectiveIndex = baseIndex;
   const movement = input.configuration.tierMovement;
@@ -201,7 +214,7 @@ export function summarizeRelationship(input: {
   const assistantAnsweredSlots = input.answers.filter((answer) => answer.participant === "assistant").length;
   const eligibleSlotsPerParticipant = input.configuration.questions.length;
   const eligibleSlots = eligibleSlotsPerParticipant * 2;
-  const familiarity = eligibleSlots === 0 ? 0 : answeredSlots / eligibleSlots;
+  const familiarity = familiarityForAnsweredSlots(answeredSlots, eligibleSlotsPerParticipant);
   const tiers = selectRelationshipTiers({
     familiarity,
     timeKnownDays,

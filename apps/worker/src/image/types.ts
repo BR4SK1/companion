@@ -7,6 +7,8 @@
  * typed copy of the module contracts it consumes.
  */
 
+import type { PhotoAccess } from "./photo-access.ts";
+
 export interface ImageScheduleSnapshot {
   readonly date: string;
   readonly block: string;
@@ -90,6 +92,7 @@ export interface ImageJob {
   readonly turnId: string;
   readonly status: ImageJobStatus;
   readonly attempts: number;
+  readonly photoAccess: Exclude<PhotoAccess, 0> | null;
   readonly patternId: string | null;
   readonly userText: string;
   readonly companionResponse: string;
@@ -105,7 +108,7 @@ export interface ImageJob {
 /** One published photo in the current session, for LLM prompt awareness. */
 export interface RecentSentImage {
   readonly jobId: string;
-  readonly turnId: string;
+  readonly turnId: string | null;
   readonly messageId: string;
   readonly publishedAt: string;
   readonly threadOrder: number;
