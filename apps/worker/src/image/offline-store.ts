@@ -1,10 +1,11 @@
+import { randomInt } from "node:crypto";
 import {
   withTransaction,
   type PostgresPool,
   type PostgresPoolClient,
 } from "@companion/postgres";
 
-import type { OfflinePhotoEvent } from "./offline-plan.ts";
+import { offlineShotAccess, type OfflinePhotoEvent } from "./offline-plan.ts";
 import type { PhotoAccess } from "./photo-access.ts";
 import type { ImageStore } from "./store.ts";
 
@@ -12,6 +13,7 @@ interface OfflineShotClaim {
   readonly id: string;
   readonly position: number;
   readonly token: string;
+  readonly requiredAccess: PhotoAccess;
 }
 
 export interface ReadyAlbum {
@@ -63,7 +65,7 @@ export function createOfflineImageStore(
         );
         if (result.rowCount !== 1) return;
         for (const shot of event.shots) {
-          const requiredAccess = shot.kind === "outfit" ? 1 : 3;
+          const requiredAccess = offlineShotAccess(shot);
           if (access < requiredAccess) continue;
           await client.query(
             `INSERT INTO image_job (user_text, companion_response, local_date_time, photo_access,
@@ -99,6 +101,7 @@ export function createOfflineImageStore(
       const result = await pool.query<{
         id: string;
         offline_position: number;
+        photo_access: PhotoAccess;
         offline_lease_token: string;
       }>(
         `WITH candidate AS (
@@ -117,7 +120,7 @@ export function createOfflineImageStore(
              offline_lease_token = gen_random_uuid(),
              offline_lease_until = clock_timestamp() + ($3::bigint * interval '1 millisecond')
          FROM candidate WHERE job.id = candidate.id
-         RETURNING job.id, job.offline_position, job.offline_lease_token`,
+         RETURNING job.id, job.offline_position, job.photo_access, job.offline_lease_token`,
         [eventId, access, leaseMs, maxAttempts],
       );
       const row = result.rows[0];
@@ -126,6 +129,7 @@ export function createOfflineImageStore(
         : {
             id: row.id,
             position: row.offline_position,
+            requiredAccess: row.photo_access,
             token: row.offline_lease_token,
           };
     },
@@ -189,22 +193,29 @@ export function createOfflineImageStore(
         await closeAlbum(client, id, null);
         return null;
       }
-      const { rows } = await client.query<{ id: string }>(
-        `SELECT id FROM (
-           SELECT id, photo_access, row_number() OVER (PARTITION BY photo_access ORDER BY offline_rank) AS rank
-           FROM image_job
-           WHERE offline_event_id = $1 AND status = 'rendered' AND photo_access <= $2
-         ) AS candidates
-         WHERE (photo_access = 1 AND rank = 1) OR (photo_access = 3 AND rank <= 2)`,
+      const { rows } = await client.query<{ id: string; photo_access: number }>(
+        `SELECT id, photo_access FROM image_job
+         WHERE offline_event_id = $1 AND status = 'rendered' AND photo_access <= $2
+         ORDER BY offline_rank`,
         [id, allowed],
       );
-      return rows.length === 0
-        ? null
-        : {
-            id,
-            publishBy: event.publish_by,
-            jobIds: rows.map(({ id: jobId }) => jobId),
-          };
+      if (rows.length === 0) return null;
+
+      // Recipe ranks are randomized per event. Reserve the best-ranked shot
+      // in each ready category before drawing how many extras to include.
+      const categories = new Set<number>();
+      const required: string[] = [];
+      const extras: string[] = [];
+      for (const shot of rows) {
+        if (categories.has(shot.photo_access)) {
+          extras.push(shot.id);
+        } else {
+          categories.add(shot.photo_access);
+          required.push(shot.id);
+        }
+      }
+      const extraCount = randomInt(extras.length + 1);
+      return { id, publishBy: event.publish_by, jobIds: required.concat(extras.slice(0, extraCount)) };
     },
 
     cancelAlbum: (client: PostgresPoolClient, id: string) =>

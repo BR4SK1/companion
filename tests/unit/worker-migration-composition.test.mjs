@@ -45,6 +45,7 @@ test("worker startup and migration-only command share the complete ordered schem
       "0032_image_generation",
       "0033_image_scene_description",
       "0034_image_offline_photos",
+      "0035_offline_photo_access",
     ],
   );
   assert.equal(new Set(workerMigrations.map(({ id }) => id)).size, workerMigrations.length);

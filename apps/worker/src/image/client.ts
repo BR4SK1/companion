@@ -52,7 +52,6 @@ export interface ImageServiceClients {
     readonly localDateTime: string;
     readonly snapshot: ReconciledSnapshot;
     readonly priorPose: PriorPose | null;
-    readonly outfitOnly?: boolean;
   }) => Promise<ImageRenderResult>;
   readonly renderOfflineShot: (eventId: string, shot: OfflineShot) => Promise<ImageRenderResult>;
 }
@@ -339,26 +338,6 @@ export function createImageServiceClients(deps: {
 
     render: (input) => {
       const { schedule, clothing, roleplay } = input.snapshot;
-      if (input.outfitOnly) {
-        const isBedroom = schedule.location === "bedroom";
-        const isInBed = isBedroom && (schedule.surface === "on bed" || schedule.surface === "in bed");
-        return renderRequest({
-          turnId: input.turnId,
-          localDateTime: input.localDateTime,
-          schedule,
-          clothing,
-          hints: {
-            ...(isInBed ? {} : {
-              poseVariantId: isBedroom ? "bed_standing_neutral" : "couch_standing_neutral",
-              poseCategory: "standing",
-              cameraAngle: "straight_on",
-            }),
-            expression: "relaxed",
-            handGesture: "none",
-            includeSelfieFraming: false,
-          },
-        });
-      }
       return renderRequest({
         turnId: input.turnId,
         localDateTime: input.localDateTime,

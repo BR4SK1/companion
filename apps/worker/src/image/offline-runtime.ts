@@ -1,6 +1,7 @@
 import { ImageClientError, type ImageServiceClients } from "./client.ts";
 import type { OfflineImageStore } from "./offline-store.ts";
 import {
+  offlineShotAccess,
   parseOfflinePhotoEvent,
   type OfflinePhotoEvent,
 } from "./offline-plan.ts";
@@ -71,6 +72,10 @@ export function createOfflinePhotoRuntime(input: {
           (candidate) => candidate.position === claim.position,
         );
         if (shot === undefined) throw new Error("Missing offline recipe");
+        if (offlineShotAccess(shot) > claim.requiredAccess) {
+          await input.store.failShot(claim, "offline_recipe_access_changed", 1);
+          return true;
+        }
         const rendered = await input.clients.renderOfflineShot(event.id, shot);
         await input.images.saveRendered(claim.id, {
           ...rendered,
