@@ -301,6 +301,7 @@ export interface TurnProcessorDeps {
     | {
         readonly context: string | null;
         readonly baseTierOrdinal: number;
+        readonly baseTierKey?: string | null;
       }
   >;
   /** Optional configured scheduled/applied routine state; failures degrade to no context. */
@@ -859,6 +860,7 @@ export async function processTurnWork(
   // output budget below; a legacy string/null return carries no ordinal.
   let relationshipChunk: string | null = null;
   let relationshipBaseTierOrdinal: number | undefined;
+  let relationshipBaseTierKey: string | null = null;
   if (deps.loadRelationshipContext !== undefined) {
     try {
       const loaded = await deps.loadRelationshipContext(work.turn.id, attemptReferenceTime);
@@ -867,6 +869,7 @@ export async function processTurnWork(
       } else {
         relationshipChunk = loaded.context;
         relationshipBaseTierOrdinal = loaded.baseTierOrdinal;
+        relationshipBaseTierKey = loaded.baseTierKey ?? null;
       }
     } catch {
       console.warn(
@@ -951,6 +954,7 @@ export async function processTurnWork(
             engagementState,
             publishedRoutineMessageKey,
             patternId: selected?.id ?? null,
+            familiarityTier: relationshipBaseTierKey,
           },
           callDecisions: deps.callDecisions,
           execute: moduleServices.executePromptModule,

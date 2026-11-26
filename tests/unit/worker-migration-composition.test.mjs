@@ -41,6 +41,7 @@ test("worker startup and migration-only command share the complete ordered schem
       "0027_prompt_module_engagement_and_hold",
       "0029_prompt_module_routine_metadata",
       "0031_prompt_module_pattern_id",
+      "0036_prompt_module_familiarity_tier",
       "0025_time_chat_chunk",
       "0032_image_generation",
       "0033_image_scene_description",

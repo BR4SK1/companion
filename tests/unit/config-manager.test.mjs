@@ -45,6 +45,7 @@ function mockSnapshot() {
         execution_mode: "function", http_endpoint_setting: null, http_scope_setting: null, http_scope_field: null,
         http_turn_id_field: null, http_local_datetime_field: null, http_engagement_state_field: null,
         http_published_routine_message_key_field: null, http_pattern_id_field: null,
+        http_familiarity_tier_field: null,
         http_previous_assistant_field: null, http_user_message_field: null,
         http_prior_conversation_field: null, http_response_text_field: null, http_unavailable_until_field: null,
         http_availability_revision_field: null,

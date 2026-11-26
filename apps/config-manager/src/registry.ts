@@ -206,6 +206,7 @@ export const TABLE_REGISTRY: readonly TableDef[] = [
       nullableText("http_engagement_state_field", { pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$" }),
       nullableText("http_published_routine_message_key_field", { pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$" }),
       nullableText("http_pattern_id_field", { pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$" }),
+      nullableText("http_familiarity_tier_field", { pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$" }),
       nullableText("http_previous_assistant_field", { pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$" }),
       nullableText("http_user_message_field", { pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$" }),
       nullableText("http_prior_conversation_field", { pattern: "^[A-Za-z][A-Za-z0-9_]{0,63}$" }),
