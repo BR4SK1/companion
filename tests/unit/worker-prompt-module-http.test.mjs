@@ -576,6 +576,7 @@ describe("declarative HTTP prompt modules", () => {
       http_engagement_state_field: "engagementState",
       http_published_routine_message_key_field: "publishedQuestion",
       http_pattern_id_field: "patternId",
+      http_familiarity_tier_field: "familiarityTier",
       http_unavailable_until_field: "unavailableUntil",
       http_availability_revision_field: "availabilityRevision",
     })]);
@@ -639,6 +640,11 @@ describe("declarative HTTP prompt modules", () => {
           loadIdentity: async () => ({ content: "synthetic identity", revision: 1 }),
           loadContext: async () => [],
           loadPreviousPublishedAssistantReply: async () => "mind if i go change?",
+          loadRelationshipContext: async () => ({
+            context: "Stage: Comfortable",
+            baseTierOrdinal: 2,
+            baseTierKey: "comfortable",
+          }),
           loadEngagementState: async () => "lull",
           loadPublishedRoutineMessageKey: async (turnId) => {
             assert.equal(turnId, "turn-hold-1");
@@ -652,6 +658,7 @@ describe("declarative HTTP prompt modules", () => {
       assert.equal(received.engagementState, "lull");
       assert.equal(received.publishedQuestion, "schedule:2026-06-15:morning_change:ask:1");
       assert.equal(received.patternId, "cozy_roleplay");
+      assert.equal(received.familiarityTier, "comfortable");
       assert.equal(holds.length, 1);
       assert.equal(holds[0].moduleKey, "schedule_state");
       assert.equal(holds[0].unavailableUntil.toISOString(), "2026-06-15T15:10:00.000Z");

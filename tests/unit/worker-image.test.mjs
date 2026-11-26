@@ -199,10 +199,12 @@ describe("image service clients", () => {
       userText: "come here",
       companionResponse: "leaning in",
       localDateTime: "2026-11-17T12:00:00-05:00",
+      familiarityTier: "comfortable",
     });
     assert.equal(seen[0].url, "http://implementation:3014/v1/reconcile");
     assert.equal(seen[0].body.userId, "owner-scope");
     assert.equal(seen[0].body.companionResponse, "leaning in");
+    assert.equal(seen[0].body.familiarityTier, "comfortable");
     assert.equal(snapshot.schedule.location, "living room");
     assert.equal(snapshot.clothing.items[0].tags, "grey hoodie");
     assert.equal(snapshot.roleplay.inScene, true);

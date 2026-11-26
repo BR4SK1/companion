@@ -29,6 +29,7 @@ export function startImageRuntime(input: {
   readonly maxAttempts: number;
   readonly pollMs: number;
   readonly offline?: ReturnType<typeof createOfflinePhotoRuntime>;
+  readonly loadFamiliarityTier?: () => Promise<string | null>;
   /**
    * Publish one rendered job as a standalone assistant message through the
    * conversation domain's scheduled-message transaction. Resolves false
@@ -68,11 +69,16 @@ export function startImageRuntime(input: {
     }
 
     try {
+      const familiarityTier =
+        input.loadFamiliarityTier !== undefined
+          ? await input.loadFamiliarityTier().catch(() => null)
+          : undefined;
       const snapshot = await input.clients.reconcile({
         turnId: job.turnId,
         userText: job.userText,
         companionResponse: job.companionResponse,
         localDateTime: job.localDateTime,
+        ...(familiarityTier !== undefined ? { familiarityTier } : {}),
       });
 
       if (

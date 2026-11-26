@@ -33,6 +33,7 @@ export interface PromptModuleHttpPostConfig {
   readonly engagementStateField?: string | null;
   readonly publishedRoutineMessageKeyField?: string | null;
   readonly patternIdField?: string | null;
+  readonly familiarityTierField?: string | null;
   readonly previousAssistantResponseField: string | null;
   readonly userMessageField: string | null;
   readonly priorConversationField: string | null;
@@ -78,6 +79,8 @@ export interface PromptModuleContext {
   readonly publishedRoutineMessageKey?: string | null;
   /** Opaque selected response-pattern id from the turn's pattern decision, or null when none was selected. */
   readonly patternId?: string | null;
+  /** Opaque base familiarity tier key from the worker's relationship domain, or null when unprovisioned. */
+  readonly familiarityTier?: string | null;
   /** Only explicitly configured prompt-module credentials are passed here. */
   readonly credentials: Readonly<Record<string, string>>;
 }

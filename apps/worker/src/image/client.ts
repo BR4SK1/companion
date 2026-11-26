@@ -44,6 +44,7 @@ export interface ImageServiceClients {
     readonly userText: string;
     readonly companionResponse: string;
     readonly localDateTime: string;
+    readonly familiarityTier?: string | null;
   }) => Promise<ReconciledSnapshot>;
   readonly render: (input: {
     readonly turnId: string;
@@ -321,6 +322,9 @@ export function createImageServiceClients(deps: {
           userMessage: input.userText,
           companionResponse: input.companionResponse,
           conversation: [],
+          ...(input.familiarityTier !== undefined
+            ? { familiarityTier: input.familiarityTier }
+            : {}),
         },
         deps.timeoutMs,
         {

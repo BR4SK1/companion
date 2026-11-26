@@ -654,6 +654,11 @@ async function main(): Promise<void> {
         maxAttempts: imageConfig.maxAttempts,
         pollMs: imageConfig.pollMs,
         offline,
+        loadFamiliarityTier: async () => {
+          if (related === undefined) return null;
+          const baseTier = await related.getBaseTier().catch(() => null);
+          return baseTier?.key ?? null;
+        },
         publishImageMessage: (job) =>
           store.publishScheduledAssistantMessage({
             prepare: async (client) => {
@@ -901,13 +906,14 @@ async function main(): Promise<void> {
             // store and its LLM caller being provisioned.
             loadRelationshipContext: async (_turnId, referenceTime) => {
               if (provisionedRelationshipStore === undefined) {
-                return { context: null, baseTierOrdinal: 0 };
+                return { context: null, baseTierOrdinal: 0, baseTierKey: null };
               }
               const summary =
                 await provisionedRelationshipStore.getSummary(referenceTime);
               return {
                 context: renderRelationshipContext(summary),
                 baseTierOrdinal: summary.baseTierOrdinal,
+                baseTierKey: summary.baseTier.key,
               };
             },
             ...(provisionedRelationshipStore !== undefined
