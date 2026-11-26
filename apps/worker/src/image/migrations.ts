@@ -113,4 +113,13 @@ export const imageMigrations: readonly Migration[] = [
     sql: ADD_IMAGE_SCENE_DESCRIPTION_AND_CHAT_CHUNK,
   },
   { id: "0034_image_offline_photos", sql: ADD_OFFLINE_PHOTOS },
+  {
+    id: "0035_offline_photo_access",
+    sql: `
+ALTER TABLE image_offline_event DROP CONSTRAINT image_offline_event_photo_access_check,
+  ADD CHECK (photo_access IN (0, 1, 2, 3));
+ALTER TABLE image_job DROP CONSTRAINT image_job_photo_access_check,
+  ADD CHECK (photo_access IN (1, 2, 3));
+`,
+  },
 ];

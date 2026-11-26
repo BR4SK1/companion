@@ -612,7 +612,7 @@ async function main(): Promise<void> {
         const baseTier = await related.getBaseTier(client).catch(() => null);
         return baseTier === null
           ? 0
-          : photoAccessForTier(baseTier, tiers, imageConfig.outfitTierKey, imageConfig.sequenceTierKey);
+          : photoAccessForTier(baseTier, tiers, imageConfig.outfitTierKey, imageConfig.teasingTierKey, imageConfig.sequenceTierKey);
       };
 
       const clients = createImageServiceClients({
@@ -653,17 +653,11 @@ async function main(): Promise<void> {
         patternIds: imageConfig.patternIds,
         maxAttempts: imageConfig.maxAttempts,
         pollMs: imageConfig.pollMs,
-        loadPhotoAccess,
         offline,
         publishImageMessage: (job) =>
           store.publishScheduledAssistantMessage({
             prepare: async (client) => {
               if (!(await images.isRendered(client, job.id))) return null;
-              // Rendered jobs from before the gate were unrestricted.
-              if (await loadPhotoAccess(client) < (job.photoAccess ?? 3)) {
-                await images.discardRendered(client, job.id);
-                return null;
-              }
               return {
                 content: IMAGE_MESSAGE_MARKER,
                 validUntil: null,

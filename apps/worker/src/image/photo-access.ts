@@ -1,13 +1,14 @@
 import type { RelationshipTier } from "../relationship/types.ts";
 import type { ImageClothingSnapshot } from "./types.ts";
 
-/** The allowed ordinary photo class and the maximum offline album size. */
-export type PhotoAccess = 0 | 1 | 3;
+/** Ordered offline recipe access levels. */
+export type PhotoAccess = 0 | 1 | 2 | 3;
 
 export function photoAccessForTier(
   tier: RelationshipTier,
   tiers: readonly RelationshipTier[],
   outfitTierKey: string | null,
+  teasingTierKey: string | null,
   sequenceTierKey: string | null,
 ): PhotoAccess {
   const outfit = tiers.find((entry) => entry.key === outfitTierKey);
@@ -17,12 +18,18 @@ export function photoAccessForTier(
     tier.position < outfit.position
   )
     return 0;
+  const teasing = tiers.find((entry) => entry.key === teasingTierKey);
+  if (
+    teasing === undefined ||
+    teasing.position <= outfit.position ||
+    tier.position < teasing.position
+  ) return 1;
   const sequence = tiers.find((entry) => entry.key === sequenceTierKey);
   return sequence !== undefined &&
-    sequence.position > outfit.position &&
+    sequence.position > teasing.position &&
     tier.position >= sequence.position
     ? 3
-    : 1;
+    : 2;
 }
 
 export function isFullyDressed(

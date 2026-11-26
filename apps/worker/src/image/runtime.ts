@@ -8,7 +8,6 @@
 
 import { ImageClientError } from "./client.ts";
 import type { createOfflinePhotoRuntime } from "./offline-runtime.ts";
-import { isFullyDressed, type PhotoAccess } from "./photo-access.ts";
 import { isPhotoWorthy } from "./gate.ts";
 import { IMAGE_MESSAGE_MARKER, type ImageJob } from "./types.ts";
 import type { ImageServiceClients } from "./client.ts";
@@ -29,7 +28,6 @@ export function startImageRuntime(input: {
   readonly patternIds: readonly string[];
   readonly maxAttempts: number;
   readonly pollMs: number;
-  readonly loadPhotoAccess: () => Promise<PhotoAccess>;
   readonly offline?: ReturnType<typeof createOfflinePhotoRuntime>;
   /**
    * Publish one rendered job as a standalone assistant message through the
@@ -70,10 +68,6 @@ export function startImageRuntime(input: {
     }
 
     try {
-      if (await input.loadPhotoAccess() === 0) {
-        await input.store.markSkipped(job.id, "familiarity");
-        return;
-      }
       const snapshot = await input.clients.reconcile({
         turnId: job.turnId,
         userText: job.userText,
@@ -93,22 +87,15 @@ export function startImageRuntime(input: {
         return;
       }
 
-      const photoAccess = await input.loadPhotoAccess();
-      if (photoAccess === 0 || (photoAccess === 1 && !isFullyDressed(snapshot.clothing))) {
-        await input.store.markSkipped(job.id, "familiarity");
-        return;
-      }
-      const priorPose = photoAccess === 3 ? await input.store.loadPriorPose() : null;
       const rendered = await input.clients.render({
         turnId: job.turnId,
         userText: job.userText,
         companionResponse: job.companionResponse,
         localDateTime: job.localDateTime,
         snapshot,
-        priorPose,
-        outfitOnly: photoAccess === 1,
+        priorPose: await input.store.loadPriorPose(),
       });
-      await input.store.saveRendered(job.id, { ...rendered, photoAccess });
+      await input.store.saveRendered(job.id, rendered);
       log(
         `[IMAGE] rendered turn ${job.turnId} prompt=${rendered.promptId} images=${String(rendered.images.length)}`,
       );

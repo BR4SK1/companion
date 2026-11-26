@@ -71,13 +71,14 @@ describe("image configuration", () => {
 describe("image familiarity and return", () => {
   it("maps base tiers by configured key, defaults to no photos, and requires a higher sequence tier", () => {
     const tiers = ["new", "acquaintance", "comfortable", "relationship"].map((key, position) => ({ key, position }));
-    const access = (tier, outfit = "comfortable", sequence = "relationship") =>
-      photoAccessForTier(tiers[tier], tiers, outfit, sequence);
+    const access = (tier, outfit = "acquaintance", teasing = "comfortable", sequence = "relationship") =>
+      photoAccessForTier(tiers[tier], tiers, outfit, teasing, sequence);
     assert.equal(access(0), 0);
-    assert.equal(access(1), 0);
-    assert.equal(access(2), 1);
+    assert.equal(access(1), 1);
+    assert.equal(access(2), 2);
     assert.equal(access(3), 3);
     assert.equal(access(3, null), 0);
+    assert.equal(access(3, "acquaintance", "comfortable", null), 2);
     assert.equal(access(3, "new"), 0);
     assert.equal(access(3, "comfortable", "acquaintance"), 1);
   });
@@ -247,7 +248,7 @@ describe("image service clients", () => {
     assert.equal(result.images[0].height, 1344);
   });
 
-  it("lets the image service choose a bed pose for fully dressed outfit photos", async () => {
+  it("lets the image service choose a bed pose for ordinary bedtime photos", async () => {
     for (const [block, surface] of [["evening", "on bed"], ["late_night", "in bed"]]) {
       const schedule = {
         date: "2026-11-25", block, location: "bedroom", surface, activity: "resting", balconyDay: false,
@@ -276,7 +277,6 @@ describe("image service clients", () => {
         localDateTime: "2026-11-25T22:17:00-05:00",
         snapshot: { schedule, clothing, roleplay: null },
         priorPose: { poseCategory: "standing" },
-        outfitOnly: true,
       });
       assert.deepEqual(request, {
         userId: "owner-scope",
@@ -284,7 +284,10 @@ describe("image service clients", () => {
         localDateTime: "2026-11-25T22:17:00-05:00",
         schedule,
         clothing,
-        hints: { expression: "relaxed", handGesture: "none", includeSelfieFraming: false },
+        userMessage: "show me a photo",
+        companionResponse: "I'm in bed",
+        roleplay: null,
+        priorPose: { poseCategory: "standing" },
       });
     }
   });
@@ -317,7 +320,7 @@ describe("image service clients", () => {
 
 describe("image migrations", () => {
   it("creates typed relational job and asset tables without a JSONB payload", () => {
-    assert.equal(imageMigrations.length, 3);
+    assert.equal(imageMigrations.length, 4);
     assert.equal(imageMigrations[0].id, "0032_image_generation");
     assert.match(imageMigrations[0].sql, /CREATE TABLE image_job/);
     assert.match(imageMigrations[0].sql, /CREATE TABLE image_asset/);

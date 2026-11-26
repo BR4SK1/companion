@@ -24,6 +24,10 @@ function fixture(id) {
     shots: ranks.map((rank, position) => ({
       position,
       rank,
+      clothing: { items: [
+        { slot: "top", state: ["undressing_top", "off", "off", "dressing_top", "on", "on"][position] },
+        { slot: "underwear", state: "on" },
+      ] },
       kind: position === 5 ? "outfit" : "sequence",
       localDateTime: time(0),
     })),
@@ -104,7 +108,7 @@ describe("offline photo jobs (PostgreSQL)", { skip: !databaseUrl }, () => {
     });
   }
 
-  it("renders six candidates, keeps them private until return, and atomically shares three in order", async () => {
+  it("renders six candidates, keeps them private until return, and atomically shares every ready category in order", async () => {
     const event = fixture("worker-album-sequence-test");
     await Promise.all([offline.register(event, 3), offline.register(event, 3)]);
     for (const position of [5, 1, 3, 0, 2, 4]) {
@@ -150,15 +154,12 @@ describe("offline photo jobs (PostgreSQL)", { skip: !databaseUrl }, () => {
     const published = (await images.getImagesForMessages([messageId])).get(
       messageId,
     );
-    assert.deepEqual(
-      published.map((asset) => asset.alt),
-      [
-        "Photo of the companion wearing outfit-1",
-        "Photo of the companion wearing outfit-3",
-        "Photo of the companion wearing outfit-5",
-      ],
-    );
-    assert.equal((await images.getImage(published[0].id)).data[0], 1);
+    const positions = await Promise.all(published.map(async (asset) =>
+      (await images.getImage(asset.id)).data[0]
+    ));
+    assert.ok(positions.length >= 3 && positions.length <= 6);
+    assert.deepEqual(positions, [...new Set(positions)].sort((a, b) => a - b));
+    for (const required of [1, 3, 5]) assert.ok(positions.includes(required));
     const {
       rows: [{ count }],
     } = await pool.query(
@@ -166,7 +167,27 @@ describe("offline photo jobs (PostgreSQL)", { skip: !databaseUrl }, () => {
        WHERE job.offline_event_id = $1`,
       [event.id],
     );
-    assert.equal(count, 3);
+    assert.equal(count, positions.length);
+  });
+
+  it("only claims covered sequence stages at intermediate access", async () => {
+    const event = fixture("worker-album-intermediate-test");
+    await offline.register(event, 2);
+    for (const position of [5, 3, 0, 4]) {
+      const claim = await offline.claimShot(event.id, 3, 60_000, 2);
+      assert.equal(claim.position, position);
+      await images.saveRendered(claim.id, render(position, event.id, claim.token));
+    }
+    assert.equal(await offline.claimShot(event.id, 3, 60_000, 2), null);
+    await finish(event);
+    assert.equal(await publish(event.id, 2), true);
+    const result = await pool.query(
+      "SELECT offline_position FROM image_job WHERE offline_event_id = $1 AND status = 'succeeded' ORDER BY offline_position",
+      [event.id],
+    );
+    const positions = result.rows.map(row => row.offline_position);
+    assert.ok(positions.includes(3) && positions.includes(5));
+    assert.ok(positions.every(position => [0, 3, 4, 5].includes(position)));
   });
 
   it("rechecks tiers at delivery and preserves departure limits across retries", async () => {

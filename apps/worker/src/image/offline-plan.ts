@@ -25,6 +25,20 @@ export interface OfflineShot {
   readonly seed: number;
 }
 
+/** The morning-change recipe fixes stage positions and randomizes only rank. */
+export function offlineShotAccess(shot: OfflineShot): 1 | 2 | 3 {
+  if (shot.kind === "outfit") return 1;
+  if (shot.position === 1 || shot.position === 2) return 3;
+  const items = shot.clothing.items;
+  const coveredBelow = items.some((item) =>
+    (item.slot === "bottom" || item.slot === "underwear") && item.state === "on"
+  );
+  const expectedTop = shot.position === 0 ? "undressing_top" :
+    shot.position === 3 ? "dressing_top" : "on";
+  return coveredBelow && items.some((item) => item.slot === "top" && item.state === expectedTop)
+    ? 2 : 3;
+}
+
 export interface OfflinePhotoEvent {
   readonly id: string;
   readonly startedAt: string;

@@ -100,7 +100,6 @@ export interface ImageStore {
       readonly plan: ImagePlanSummary;
       readonly sceneDescription?: string | null;
       readonly images: readonly RenderedImage[];
-      readonly photoAccess?: Exclude<ImageJob["photoAccess"], null>;
       readonly offlineLease?: { readonly eventId: string; readonly token: string };
     },
   ) => Promise<void>;
@@ -119,7 +118,6 @@ export interface ImageStore {
   ) => Promise<void>;
   /** Release a rendered job whose publication was refused (e.g. a turn is in flight). */
   readonly isRendered: (client: PostgresPoolClient, jobId: string) => Promise<boolean>;
-  readonly discardRendered: (client: PostgresPoolClient, jobId: string) => Promise<void>;
   readonly releaseRendered: (jobId: string) => Promise<void>;
   readonly loadPriorPose: () => Promise<PriorPose | null>;
   readonly getImage: (
@@ -220,11 +218,10 @@ export function createImageStore(pool: PostgresPool): ImageStore {
                plan_camera_angle = $9, plan_intimacy = $10,
                plan_clothing_summary = $11, scene_description = $12,
                error_category = NULL, updated_at = now(),
-               photo_access = COALESCE($13, photo_access),
                offline_lease_token = NULL, offline_lease_until = NULL
            WHERE id = $1 AND status = 'running'
-             AND ((turn_id IS NOT NULL AND $14::uuid IS NULL)
-               OR (offline_event_id = $15 AND offline_lease_token = $14
+             AND ((turn_id IS NOT NULL AND $13::uuid IS NULL)
+               OR (offline_event_id = $14 AND offline_lease_token = $13
                  AND offline_lease_until > clock_timestamp()))`,
           [
             jobId,
@@ -239,7 +236,6 @@ export function createImageStore(pool: PostgresPool): ImageStore {
             input.plan.intimacy,
             input.plan.clothingSummary,
             input.sceneDescription ?? null,
-            input.photoAccess ?? null,
             input.offlineLease?.token ?? null,
             input.offlineLease?.eventId ?? null,
           ],
@@ -307,18 +303,6 @@ export function createImageStore(pool: PostgresPool): ImageStore {
         [jobId],
       );
       return result.rows.length === 1;
-    },
-
-    discardRendered: async (client, jobId) => {
-      await client.query(
-        `DELETE FROM image_asset WHERE job_id = $1 AND message_id IS NULL`,
-        [jobId],
-      );
-      await client.query(
-        `UPDATE image_job SET status = 'skipped', skip_reason = 'familiarity', finished_at = now(), updated_at = now()
-         WHERE id = $1 AND status = 'rendered'`,
-        [jobId],
-      );
     },
 
     releaseRendered: async (jobId) => {
