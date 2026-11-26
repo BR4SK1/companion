@@ -247,6 +247,48 @@ describe("image service clients", () => {
     assert.equal(result.images[0].height, 1344);
   });
 
+  it("lets the image service choose a bed pose for fully dressed outfit photos", async () => {
+    for (const [block, surface] of [["evening", "on bed"], ["late_night", "in bed"]]) {
+      const schedule = {
+        date: "2026-11-25", block, location: "bedroom", surface, activity: "resting", balconyDay: false,
+      };
+      const clothing = {
+        occasion: "pajamas",
+        items: [
+          { slot: "top", tags: "pajama shirt", state: "on" },
+          { slot: "bottom", tags: "pajama shorts", state: "on" },
+        ],
+      };
+      const webp = webpVp8x(768, 1344);
+      let request;
+      await clients(async (_url, init) => {
+        request = JSON.parse(init.body);
+        return Response.json({
+          success: true,
+          promptId: "bedtime-photo",
+          plan: { poseCategory: "lying" },
+          images: [{ filename: "bed.webp", mimeType: "image/webp", dataBase64: webp.toString("base64") }],
+        });
+      }).render({
+        turnId: "bedtime-turn",
+        userText: "show me a photo",
+        companionResponse: "I'm in bed",
+        localDateTime: "2026-11-25T22:17:00-05:00",
+        snapshot: { schedule, clothing, roleplay: null },
+        priorPose: { poseCategory: "standing" },
+        outfitOnly: true,
+      });
+      assert.deepEqual(request, {
+        userId: "owner-scope",
+        turnId: "bedtime-turn",
+        localDateTime: "2026-11-25T22:17:00-05:00",
+        schedule,
+        clothing,
+        hints: { expression: "relaxed", handGesture: "none", includeSelfieFraming: false },
+      });
+    }
+  });
+
   it("maps failures to fixed categories without upstream text", async () => {
     await assert.rejects(
       clients(async () =>

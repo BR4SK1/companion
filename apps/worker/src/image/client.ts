@@ -341,17 +341,20 @@ export function createImageServiceClients(deps: {
       const { schedule, clothing, roleplay } = input.snapshot;
       if (input.outfitOnly) {
         const isBedroom = schedule.location === "bedroom";
+        const isInBed = isBedroom && (schedule.surface === "on bed" || schedule.surface === "in bed");
         return renderRequest({
           turnId: input.turnId,
           localDateTime: input.localDateTime,
           schedule,
           clothing,
           hints: {
-            poseVariantId: isBedroom ? "bed_standing_neutral" : "couch_standing_neutral",
-            poseCategory: "standing",
+            ...(isInBed ? {} : {
+              poseVariantId: isBedroom ? "bed_standing_neutral" : "couch_standing_neutral",
+              poseCategory: "standing",
+              cameraAngle: "straight_on",
+            }),
             expression: "relaxed",
             handGesture: "none",
-            cameraAngle: "straight_on",
             includeSelfieFraming: false,
           },
         });
