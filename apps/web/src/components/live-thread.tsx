@@ -12,6 +12,11 @@ import { Composer } from "@/components/composer";
 import { AppHeader } from "@/components/app-header";
 import { MessageImageLightbox } from "@/components/message-images";
 import { Thread } from "@/components/thread";
+import { useImageDisplayMode } from "@/components/use-image-display-mode";
+import {
+  filterMessagesForImageDisplay,
+  type ImageDisplayMode,
+} from "@/lib/image-display";
 import type { Message, MessageImage } from "@/lib/messages";
 import {
   appendPending,
@@ -57,6 +62,7 @@ export function LiveThread() {
   );
   const [sessionEnded, setSessionEnded] = useState(false);
   const [pending, setPending] = useState<readonly PendingSend[]>([]);
+  const [imageDisplayMode, setImageDisplayMode] = useImageDisplayMode();
   const [lightboxImage, setLightboxImage] = useState<MessageImage | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [loadingEarlier, setLoadingEarlier] = useState(false);
@@ -333,6 +339,16 @@ export function LiveThread() {
     );
   }, []);
 
+  const handleImageDisplayModeChange = useCallback(
+    (next: ImageDisplayMode) => {
+      if (next === "none") {
+        setLightboxImage(null);
+      }
+      setImageDisplayMode(next);
+    },
+    [setImageDisplayMode],
+  );
+
   const uiMessages = useMemo(() => {
     const durable = messages.map(toUiMessage);
     const inFlight = pending.map(
@@ -343,8 +359,8 @@ export function LiveThread() {
         sentAt: entry.sentAt,
       }),
     );
-    return [...durable, ...inFlight];
-  }, [messages, pending]);
+    return filterMessagesForImageDisplay([...durable, ...inFlight], imageDisplayMode);
+  }, [messages, pending, imageDisplayMode]);
 
   const failedSends = pending.filter((entry) => entry.kind === "failed");
   const composing = status.generating || status.queued > 0;
@@ -374,6 +390,8 @@ export function LiveThread() {
   return (
     <Box sx={{ display: "flex", flexDirection: "column", flexGrow: 1, minHeight: 0 }}>
       <AppHeader
+        imageDisplayMode={imageDisplayMode}
+        onImageDisplayModeChange={handleImageDisplayModeChange}
         onSignOut={() => {
           void (async () => {
             try {
@@ -415,7 +433,12 @@ export function LiveThread() {
           </Typography>
         </Box>
       ) : (
-        <Thread messages={uiMessages} timezone={timezone} onOpenImage={setLightboxImage} />
+        <Thread
+          messages={uiMessages}
+          timezone={timezone}
+          imageDisplayMode={imageDisplayMode}
+          onOpenImage={setLightboxImage}
+        />
       )}
       {connection === "live" && composing && (
         <Box sx={{ px: 2, pb: 0.5 }}>

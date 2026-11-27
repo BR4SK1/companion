@@ -1,6 +1,7 @@
 "use client";
 
 import CloseIcon from "@mui/icons-material/Close";
+import ImageOutlinedIcon from "@mui/icons-material/ImageOutlined";
 import Box from "@mui/material/Box";
 import Dialog from "@mui/material/Dialog";
 import IconButton from "@mui/material/IconButton";
@@ -127,6 +128,44 @@ export function MessageImageThumb({ image, onOpen }: MessageImageThumbProps) {
         }}
       />
     </Box>
+  );
+}
+
+interface MessageImageIconProps {
+  image: MessageImage;
+  onOpen: (image: MessageImage) => void;
+  /** Inherit surrounding bubble text color when rendered inside a text bubble. */
+  inheritColor?: boolean;
+}
+
+/**
+ * Bare clickable generic image icon for `"icon"` display mode. Renders no
+ * `<img>` element so the asset is only fetched when opened in the lightbox.
+ */
+export function MessageImageIcon({
+  image,
+  onOpen,
+  inheritColor = false,
+}: MessageImageIconProps) {
+  return (
+    <IconButton
+      type="button"
+      onClick={() => onOpen(image)}
+      aria-label="Open image"
+      sx={{
+        color: inheritColor ? "inherit" : "text.secondary",
+        width: 44,
+        height: 44,
+        borderRadius: 2,
+        cursor: "zoom-in",
+        "&:hover": {
+          color: inheritColor ? "inherit" : "text.primary",
+          bgcolor: "action.hover",
+        },
+      }}
+    >
+      <ImageOutlinedIcon fontSize="medium" />
+    </IconButton>
   );
 }
 
