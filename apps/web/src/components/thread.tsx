@@ -9,6 +9,7 @@ import Stack from "@mui/material/Stack";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import { groupThread } from "@/lib/grouping";
+import type { ImageDisplayMode } from "@/lib/image-display";
 import type { Message, MessageImage } from "@/lib/messages";
 import { isFollowingBottom, type ScrollGeometry } from "@/lib/scroll";
 import { formatDayLabel } from "@/lib/time";
@@ -18,6 +19,7 @@ import { MessageClusterView } from "./message-cluster";
 interface ThreadProps {
   messages: readonly Message[];
   timezone: string | null;
+  imageDisplayMode: ImageDisplayMode;
   onOpenImage: (image: MessageImage) => void;
 }
 
@@ -37,7 +39,12 @@ function geometryOf(element: HTMLElement): ScrollGeometry {
  * is never pulled down — a "jump to latest" button appears instead. This is
  * the core "don't pull the owner away from older messages" behavior.
  */
-export function Thread({ messages, timezone, onOpenImage }: ThreadProps) {
+export function Thread({
+  messages,
+  timezone,
+  imageDisplayMode,
+  onOpenImage,
+}: ThreadProps) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const followRef = useRef(true);
   const [following, setFollowing] = useState(true);
@@ -140,6 +147,7 @@ export function Thread({ messages, timezone, onOpenImage }: ThreadProps) {
                 cluster={item}
                 timezone={timezone}
                 isThreadEnd={index === lastClusterIndex}
+                imageDisplayMode={imageDisplayMode}
                 onOpenImage={onOpenImage}
               />
             ),

@@ -5,16 +5,18 @@ import Box from "@mui/material/Box";
 import Stack from "@mui/material/Stack";
 import Typography from "@mui/material/Typography";
 
+import type { ImageDisplayMode } from "@/lib/image-display";
 import type { Message, MessageCluster, MessageImage } from "@/lib/messages";
 import { formatClockTime } from "@/lib/time";
 
-import { MessageImageThumb } from "./message-images";
+import { MessageImageIcon, MessageImageThumb } from "./message-images";
 
 interface MessageClusterViewProps {
   cluster: MessageCluster;
   timezone: string | null;
   /** True when this cluster contains the newest message of the thread. */
   isThreadEnd: boolean;
+  imageDisplayMode: ImageDisplayMode;
   onOpenImage: (image: MessageImage) => void;
 }
 
@@ -24,6 +26,7 @@ interface BubbleProps {
   isEnd: boolean;
   isUser: boolean;
   markAsThreadEnd: boolean;
+  imageDisplayMode: ImageDisplayMode;
   onOpenImage: (image: MessageImage) => void;
 }
 
@@ -41,21 +44,31 @@ function Bubble({
   isEnd,
   isUser,
   markAsThreadEnd,
+  imageDisplayMode,
   onOpenImage,
 }: BubbleProps) {
   const text = message.text ?? "";
-  const images = message.images ?? [];
+  const images = imageDisplayMode === "none" ? [] : (message.images ?? []);
 
   if (text.length === 0 && images.length > 0) {
     return (
       <Box
         data-last-bubble={markAsThreadEnd ? "" : undefined}
         tabIndex={markAsThreadEnd ? -1 : undefined}
-        sx={{ display: "flex", flexDirection: "column", gap: 0.5 }}
+        sx={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: isUser ? "flex-end" : "flex-start",
+          gap: 0.5,
+        }}
       >
-        {images.map((image) => (
-          <MessageImageThumb key={image.src} image={image} onOpen={onOpenImage} />
-        ))}
+        {images.map((image) =>
+          imageDisplayMode === "icon" ? (
+            <MessageImageIcon key={image.src} image={image} onOpen={onOpenImage} />
+          ) : (
+            <MessageImageThumb key={image.src} image={image} onOpen={onOpenImage} />
+          ),
+        )}
       </Box>
     );
   }
@@ -90,10 +103,25 @@ function Bubble({
         </Typography>
       )}
       {images.length > 0 && (
-        <Stack spacing={0.5} sx={{ mt: text.length > 0 ? 1 : 0 }}>
-          {images.map((image) => (
-            <MessageImageThumb key={image.src} image={image} onOpen={onOpenImage} />
-          ))}
+        <Stack
+          spacing={0.5}
+          sx={{
+            mt: text.length > 0 ? 1 : 0,
+            alignItems: imageDisplayMode === "icon" ? (isUser ? "flex-end" : "flex-start") : "stretch",
+          }}
+        >
+          {images.map((image) =>
+            imageDisplayMode === "icon" ? (
+              <MessageImageIcon
+                key={image.src}
+                image={image}
+                onOpen={onOpenImage}
+                inheritColor={isUser}
+              />
+            ) : (
+              <MessageImageThumb key={image.src} image={image} onOpen={onOpenImage} />
+            ),
+          )}
         </Stack>
       )}
     </Box>
@@ -110,6 +138,7 @@ export function MessageClusterView({
   cluster,
   timezone,
   isThreadEnd,
+  imageDisplayMode,
   onOpenImage,
 }: MessageClusterViewProps) {
   const isUser = cluster.role === "user";
@@ -149,6 +178,7 @@ export function MessageClusterView({
               isEnd={index === count - 1}
               isUser={isUser}
               markAsThreadEnd={isThreadEnd && index === count - 1}
+              imageDisplayMode={imageDisplayMode}
               onOpenImage={onOpenImage}
             />
             {index === count - 1 && (
